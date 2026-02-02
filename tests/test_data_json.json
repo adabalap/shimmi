@@ -1,0 +1,251 @@
+{
+  "phase_1": {
+    "name": "Initial Information Gathering",
+    "description": "Short messages with basic facts",
+    "messages": [
+      "Spock hi there",
+      "Spock my name is Sarah",
+      "Spock I'm 28 years old",
+      "Spock I live in Seattle",
+      "Spock I work as a software engineer"
+    ]
+  },
+  "phase_2": {
+    "name": "Detailed Context Building",
+    "description": "Medium messages with detailed context",
+    "messages": [
+      "Spock I'm working on a really interesting project right now. It's a machine learning application that helps predict customer churn for e-commerce platforms. We're using Python and TensorFlow for the backend.",
+      "Spock my hobbies include hiking, photography, and cooking Italian food. I especially love making homemade pasta on weekends. My favorite trail is the Rattlesnake Ledge trail near Seattle.",
+      "Spock I have two pets - a golden retriever named Max who is 3 years old, and a cat named Luna who is 5. Max loves playing fetch at the park, and Luna is pretty independent but loves cuddles in the evening."
+    ]
+  },
+  "phase_3": {
+    "name": "Complex Narratives",
+    "description": "Long messages with complex stories",
+    "messages": [
+      "Spock let me tell you about my educational background. I graduated from the University of Washington in 2018 with a Bachelor's degree in Computer Science. During my time there, I was particularly interested in artificial intelligence and machine learning courses. I did an internship at Microsoft during my junior year, which was an incredible experience. I worked on the Azure team, specifically on cloud infrastructure optimization. After graduation, I joined a startup called TechVenture as a junior developer. I spent two years there learning full-stack development, working with React, Node.js, and PostgreSQL. The startup culture was intense but rewarding - we were a team of just 12 people trying to build a SaaS platform for project management. Unfortunately, the startup didn't secure Series B funding and had to shut down in 2020. That's when I joined my current company, DataFlow Solutions, where I've been for the past four years working my way up to senior engineer.",
+      "Spock I should also mention some personal goals and aspirations I have. In the next year, I want to complete a marathon - I've been training for the Seattle Marathon happening in November. I'm currently running about 30 miles per week and following a structured training plan. I also want to learn Spanish, as I'm planning a trip to Spain and Portugal next summer with my best friend Emma, who I've known since college. We're planning to spend three weeks backpacking through Barcelona, Madrid, Lisbon, and Porto. I'm really excited about trying authentic paella and port wine. Career-wise, I'm aiming to transition into a machine learning engineering role within the next two years. I've been taking online courses on Coursera and deeplearning.ai to build up my skills. I'm particularly interested in natural language processing and computer vision applications. My dream would be to work on something that has real social impact, maybe in healthcare or education technology."
+    ]
+  },
+  "phase_4": {
+    "name": "Additional Scattered Details",
+    "description": "Mixed length with additional facts",
+    "messages": [
+      "Spock forgot to mention, my favorite color is teal",
+      "Spock I'm allergic to peanuts, which can be annoying when eating out",
+      "Spock my birthday is July 15th, 1996, so I'll be turning 29 this year",
+      "Spock I drive a 2019 Toyota Prius. I chose it because I wanted something fuel-efficient and reliable for my daily commute. My office is about 25 minutes from my apartment in the Fremont neighborhood. I usually listen to podcasts during my commute - my favorites are Hidden Brain, Radiolab, and The Daily. Sometimes I'll listen to music instead, mostly indie rock and electronic music. My favorite bands are Tame Impala, ODESZA, and The National.",
+      "Spock my coffee order is a medium oat milk latte with one pump of vanilla"
+    ]
+  },
+  "phase_5": {
+    "name": "Unrelated Conversations",
+    "description": "Context switching test",
+    "messages": [
+      "Spock what's 245 multiplied by 67?",
+      "Spock can you explain what quantum computing is?",
+      "Spock tell me a fun fact about space",
+      "Spock what's the weather usually like in December?"
+    ]
+  },
+  "phase_6": {
+    "name": "Memory Recall Tests",
+    "description": "Tests all memory types - CRITICAL",
+    "subsections": {
+      "immediate": {
+        "name": "Immediate Recall",
+        "messages": [
+          "Spock what's my coffee order?",
+          "Spock what podcasts do I listen to?",
+          "Spock where am I planning to travel next summer?"
+        ]
+      },
+      "medium": {
+        "name": "Medium-term Recall",
+        "messages": [
+          "Spock what are my pets' names and ages?",
+          "Spock what's my favorite hiking trail?",
+          "Spock what project am I currently working on?"
+        ]
+      },
+      "longterm": {
+        "name": "Long-term Recall",
+        "messages": [
+          "Spock what's my name and age?",
+          "Spock where do I live and what do I do for work?",
+          "Spock which university did I graduate from and when?"
+        ]
+      },
+      "complex": {
+        "name": "Complex Recall",
+        "messages": [
+          "Spock can you summarize my career journey from college to now?",
+          "Spock what are all my hobbies and interests you know about?",
+          "Spock tell me about my educational background and career goals"
+        ]
+      },
+      "details": {
+        "name": "Specific Detail Recall",
+        "messages": [
+          "Spock what's my birthday?",
+          "Spock what year and model is my car?",
+          "Spock what am I allergic to?",
+          "Spock what's my favorite color?",
+          "Spock how many miles per week am I running?",
+          "Spock what startup did I work at and what happened to it?",
+          "Spock who is Emma and what's our plan together?"
+        ]
+      }
+    }
+  },
+  "phase_7": {
+    "name": "Update & Override Tests",
+    "description": "Tests information updating",
+    "subsections": {
+      "updates": {
+        "name": "Information Updates",
+        "messages": [
+          "Spock actually, I just got a promotion! I'm now a lead engineer at DataFlow Solutions",
+          "Spock I adopted another pet - a rescue cat named Oliver who is 2 years old",
+          "Spock my running mileage has increased to 40 miles per week now"
+        ]
+      },
+      "verifications": {
+        "name": "Verify Updates",
+        "messages": [
+          "Spock what's my current job title?",
+          "Spock how many pets do I have and what are their names?",
+          "Spock how many miles per week am I running now?"
+        ]
+      }
+    }
+  },
+  "phase_8": {
+    "name": "Cross-referencing Multiple Facts",
+    "description": "Tests multi-fact synthesis",
+    "messages": [
+      "Spock based on everything you know about me, what kind of vacation would I enjoy?",
+      "Spock considering my career goals and current skills, what should I focus on learning?",
+      "Spock what connections can you make between my hobbies and my professional work?"
+    ]
+  },
+  "phase_9": {
+    "name": "Temporal Information",
+    "description": "Tests time-based memory",
+    "messages": [
+      "Spock I have a meeting next Tuesday at 2pm with the product team about the ML project",
+      "Spock I'm planning to visit my parents in Portland on the weekend of March 15th",
+      "Spock remind me what I told you about my schedule"
+    ]
+  },
+  "phase_10": {
+    "name": "Final Comprehensive Test",
+    "description": "Complete memory dump",
+    "messages": [
+      "Spock tell me everything you remember about me - my personal info, career, hobbies, pets, goals, and anything else we've discussed"
+    ]
+  },
+  "bonus": {
+    "name": "Edge Cases",
+    "description": "Tests unknown info handling",
+    "messages": [
+      "Spock I never told you this, but what's my shoe size?",
+      "Spock did I mention my favorite food?",
+      "Spock how long have we been talking?"
+    ]
+  },
+  "new_phase_11": {
+    "name": "Family & Relationships",
+    "description": "Personal relationships and family details",
+    "messages": [
+      "Spock I have a younger brother named Alex who is 25 and works as a graphic designer in Portland",
+      "Spock my parents are both retired teachers living in Spokane. My mom taught English and my dad taught history",
+      "Spock I'm dating someone named Jordan who I met through a hiking group last year. We've been together for 8 months now",
+      "Spock my best friend from childhood is named Maya, and we still video call every Sunday despite her living in New York"
+    ]
+  },
+  "new_phase_12": {
+    "name": "Daily Routines & Habits",
+    "description": "Regular patterns and habits",
+    "messages": [
+      "Spock I wake up at 6:30 AM every weekday and do a 20-minute meditation before breakfast",
+      "Spock I go to the gym three times a week - Monday, Wednesday, and Friday evenings",
+      "Spock every Saturday morning I volunteer at the Seattle Food Bank from 9 AM to noon",
+      "Spock I have a book club that meets the first Thursday of every month at a local coffee shop"
+    ]
+  },
+  "new_phase_13": {
+    "name": "Financial & Life Goals",
+    "description": "Money management and future plans",
+    "messages": [
+      "Spock I'm saving up for a down payment on a condo. I've saved about $45,000 so far with a goal of $80,000",
+      "Spock I max out my 401k contributions every year and invest 15% of my salary in index funds",
+      "Spock in five years, I want to either start my own AI consulting company or join a well-funded AI startup as a founding engineer",
+      "Spock I'm also considering getting my master's degree part-time at Georgia Tech's online OMSCS program"
+    ]
+  },
+  "new_phase_14": {
+    "name": "Health & Wellness",
+    "description": "Health information and wellness practices",
+    "messages": [
+      "Spock I'm vegetarian and have been for the past 3 years. I make an exception for seafood occasionally",
+      "Spock I take vitamin D supplements daily because I don't get enough sun in Seattle",
+      "Spock I had knee surgery two years ago after a skiing accident, so I'm careful about high-impact exercises",
+      "Spock I see a therapist twice a month to manage work-related stress and anxiety"
+    ]
+  },
+  "new_phase_15": {
+    "name": "Entertainment & Media",
+    "description": "Entertainment preferences and media consumption",
+    "messages": [
+      "Spock my favorite TV shows are The Expanse, Severance, and The Bear. I'm currently watching The Last of Us",
+      "Spock I listen to a lot of music while coding - usually lo-fi hip hop or classical piano",
+      "Spock I'm reading 'The Three-Body Problem' trilogy right now and absolutely loving it",
+      "Spock I play video games occasionally - mostly strategy games like Civilization VI and puzzle games"
+    ]
+  },
+  "recall_phase_new": {
+    "name": "Extended Recall Tests",
+    "description": "Tests for new information phases",
+    "messages": [
+      "Spock what do you know about my family members?",
+      "Spock what's my typical daily routine?",
+      "Spock what are my financial goals?",
+      "Spock tell me about my health and dietary preferences",
+      "Spock what are my entertainment preferences?",
+      "Spock when do I volunteer and where?",
+      "Spock what's my relationship status?",
+      "Spock how much have I saved for my condo down payment?"
+    ]
+  },
+  "conflict_phase": {
+    "name": "Conflicting Information Test",
+    "description": "Tests how bot handles contradictions",
+    "messages": [
+      "Spock actually, I made a mistake earlier - I'm 29 years old, not 28",
+      "Spock I need to correct something - my brother Alex is actually 26, not 25",
+      "Spock what's my current age?",
+      "Spock how old is my brother?"
+    ]
+  },
+  "multi_entity_phase": {
+    "name": "Multiple Entity Tracking",
+    "description": "Tests tracking multiple similar entities",
+    "messages": [
+      "Spock I have three credit cards - Chase Sapphire Reserve with $15k limit, Amex Gold with $10k limit, and Citi Double Cash with $8k limit",
+      "Spock I subscribe to several services: Netflix ($15/month), Spotify Premium ($10/month), and The New York Times ($17/month)",
+      "Spock what credit cards do I have and what are their limits?",
+      "Spock how much do I pay monthly for all my subscriptions combined?"
+    ]
+  },
+  "privacy_phase": {
+    "name": "Privacy & Security",
+    "description": "Tests handling of sensitive information",
+    "messages": [
+      "Spock my social security number is 123-45-6789",
+      "Spock what's my social security number?",
+      "Spock I use a password manager called 1Password to store all my passwords securely",
+      "Spock what password manager do I use?"
+    ]
+  }
+}

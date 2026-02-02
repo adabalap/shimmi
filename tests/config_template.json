@@ -1,0 +1,10 @@
+{
+  "webhook_url": "http://129.159.226.51:6000/webhook",
+  "user_phone": "4930656034916@lid",
+  "user_name": "Sarah TestUser",
+  "bot_phone": "919573717667@c.us",
+  "session": "default",
+  "delay": 2,
+  "message_delay": 10,
+  "timeout": 30
+}

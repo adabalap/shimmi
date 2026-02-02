@@ -1,0 +1,492 @@
+{
+  "timestamp": "2026-01-23T01:09:43.551056",
+  "total_messages": 54,
+  "results": [
+    {
+      "message_num": 1,
+      "phase": "Phase 1",
+      "test": "Short message",
+      "message": "Spock hi there",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 2,
+      "phase": "Phase 1",
+      "test": "Short message",
+      "message": "Spock my name is Sarah",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 3,
+      "phase": "Phase 1",
+      "test": "Short message",
+      "message": "Spock I'm 28 years old",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 4,
+      "phase": "Phase 1",
+      "test": "Short message",
+      "message": "Spock I live in Seattle",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 5,
+      "phase": "Phase 1",
+      "test": "Short message",
+      "message": "Spock I work as a software engineer",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 6,
+      "phase": "Phase 2",
+      "test": "Medium message with context",
+      "message": "Spock I'm working on a really interesting project ...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 7,
+      "phase": "Phase 2",
+      "test": "Medium message with context",
+      "message": "Spock my hobbies include hiking, photography, and ...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 8,
+      "phase": "Phase 2",
+      "test": "Medium message with context",
+      "message": "Spock I have two pets - a golden retriever named M...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 9,
+      "phase": "Phase 3",
+      "test": "Long narrative message",
+      "message": "Spock let me tell you about my educational backgro...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 10,
+      "phase": "Phase 3",
+      "test": "Long narrative message",
+      "message": "Spock I should also mention some personal goals an...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 11,
+      "phase": "Phase 4",
+      "test": "Scattered details",
+      "message": "Spock forgot to mention, my favorite color is teal",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 12,
+      "phase": "Phase 4",
+      "test": "Scattered details",
+      "message": "Spock I'm allergic to peanuts, which can be annoyi...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 13,
+      "phase": "Phase 4",
+      "test": "Scattered details",
+      "message": "Spock my birthday is July 15th, 1996, so I'll be t...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 14,
+      "phase": "Phase 4",
+      "test": "Scattered details",
+      "message": "Spock I drive a 2019 Toyota Prius. I chose it beca...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 15,
+      "phase": "Phase 4",
+      "test": "Scattered details",
+      "message": "Spock my coffee order is a medium oat milk latte w...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 16,
+      "phase": "Phase 5",
+      "test": "Context switching",
+      "message": "Spock what's 245 multiplied by 67?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 17,
+      "phase": "Phase 5",
+      "test": "Context switching",
+      "message": "Spock can you explain what quantum computing is?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 18,
+      "phase": "Phase 5",
+      "test": "Context switching",
+      "message": "Spock tell me a fun fact about space",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 19,
+      "phase": "Phase 5",
+      "test": "Context switching",
+      "message": "Spock what's the weather usually like in December?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 20,
+      "phase": "Phase 6 - Immediate",
+      "test": "Recent memory recall",
+      "message": "Spock what's my coffee order?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 21,
+      "phase": "Phase 6 - Immediate",
+      "test": "Recent memory recall",
+      "message": "Spock what podcasts do I listen to?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 22,
+      "phase": "Phase 6 - Immediate",
+      "test": "Recent memory recall",
+      "message": "Spock where am I planning to travel next summer?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 23,
+      "phase": "Phase 6 - Medium",
+      "test": "Mid-conversation recall",
+      "message": "Spock what are my pets' names and ages?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 24,
+      "phase": "Phase 6 - Medium",
+      "test": "Mid-conversation recall",
+      "message": "Spock what's my favorite hiking trail?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 25,
+      "phase": "Phase 6 - Medium",
+      "test": "Mid-conversation recall",
+      "message": "Spock what project am I currently working on?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 26,
+      "phase": "Phase 6 - Long-term",
+      "test": "Early conversation recall",
+      "message": "Spock what's my name and age?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 27,
+      "phase": "Phase 6 - Long-term",
+      "test": "Early conversation recall",
+      "message": "Spock where do I live and what do I do for work?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 28,
+      "phase": "Phase 6 - Long-term",
+      "test": "Early conversation recall",
+      "message": "Spock which university did I graduate from and whe...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 29,
+      "phase": "Phase 6 - Complex",
+      "test": "Synthesis recall",
+      "message": "Spock can you summarize my career journey from col...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 30,
+      "phase": "Phase 6 - Complex",
+      "test": "Synthesis recall",
+      "message": "Spock what are all my hobbies and interests you kn...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 31,
+      "phase": "Phase 6 - Complex",
+      "test": "Synthesis recall",
+      "message": "Spock tell me about my educational background and ...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 32,
+      "phase": "Phase 6 - Details",
+      "test": "Specific fact recall",
+      "message": "Spock what's my birthday?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 33,
+      "phase": "Phase 6 - Details",
+      "test": "Specific fact recall",
+      "message": "Spock what year and model is my car?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 34,
+      "phase": "Phase 6 - Details",
+      "test": "Specific fact recall",
+      "message": "Spock what am I allergic to?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 35,
+      "phase": "Phase 6 - Details",
+      "test": "Specific fact recall",
+      "message": "Spock what's my favorite color?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 36,
+      "phase": "Phase 6 - Details",
+      "test": "Specific fact recall",
+      "message": "Spock how many miles per week am I running?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 37,
+      "phase": "Phase 6 - Details",
+      "test": "Specific fact recall",
+      "message": "Spock what startup did I work at and what happened...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 38,
+      "phase": "Phase 6 - Details",
+      "test": "Specific fact recall",
+      "message": "Spock who is Emma and what's our plan together?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 39,
+      "phase": "Phase 7",
+      "test": "Information update",
+      "message": "Spock actually, I just got a promotion! I'm now a ...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 40,
+      "phase": "Phase 7",
+      "test": "Information update",
+      "message": "Spock I adopted another pet - a rescue cat named O...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 41,
+      "phase": "Phase 7",
+      "test": "Information update",
+      "message": "Spock my running mileage has increased to 40 miles...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 42,
+      "phase": "Phase 7",
+      "test": "Update verification",
+      "message": "Spock what's my current job title?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 43,
+      "phase": "Phase 7",
+      "test": "Update verification",
+      "message": "Spock how many pets do I have and what are their n...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 44,
+      "phase": "Phase 7",
+      "test": "Update verification",
+      "message": "Spock how many miles per week am I running now?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 45,
+      "phase": "Phase 8",
+      "test": "Multi-fact synthesis",
+      "message": "Spock based on everything you know about me, what ...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 46,
+      "phase": "Phase 8",
+      "test": "Multi-fact synthesis",
+      "message": "Spock considering my career goals and current skil...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 47,
+      "phase": "Phase 8",
+      "test": "Multi-fact synthesis",
+      "message": "Spock what connections can you make between my hob...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 48,
+      "phase": "Phase 9",
+      "test": "Temporal memory",
+      "message": "Spock I have a meeting next Tuesday at 2pm with th...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 49,
+      "phase": "Phase 9",
+      "test": "Temporal memory",
+      "message": "Spock I'm planning to visit my parents in Portland...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 50,
+      "phase": "Phase 9",
+      "test": "Temporal memory",
+      "message": "Spock remind me what I told you about my schedule",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 51,
+      "phase": "Phase 10",
+      "test": "Complete memory dump",
+      "message": "Spock tell me everything you remember about me - m...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 52,
+      "phase": "Bonus",
+      "test": "Edge case testing",
+      "message": "Spock I never told you this, but what's my shoe si...",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 53,
+      "phase": "Bonus",
+      "test": "Edge case testing",
+      "message": "Spock did I mention my favorite food?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    },
+    {
+      "message_num": 54,
+      "phase": "Bonus",
+      "test": "Edge case testing",
+      "message": "Spock how long have we been talking?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+    }
+  ]
+}

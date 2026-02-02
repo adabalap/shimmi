@@ -1,0 +1,54 @@
+{
+  "timestamp": "2026-01-29T12:54:19.086987",
+  "config": {
+    "webhook_url": "http://129.159.226.51:6000/webhook",
+    "user_phone": "4930656034916@lid",
+    "user_name": "Sarah TestUser",
+    "bot_phone": "919573717667@c.us",
+    "session": "default",
+    "delay": 2,
+    "message_delay": 10,
+    "timeout": 30
+  },
+  "total_messages": 3,
+  "successful": 3,
+  "failed": 0,
+  "results": [
+    {
+      "message_num": 1,
+      "phase": "Temporal Information",
+      "test": "Tests time-based memory",
+      "message": "Spock I have a meeting next Tuesday at 2pm with th...",
+      "full_message": "Spock I have a meeting next Tuesday at 2pm with the product team about the ML project",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+      "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+      "timestamp": "2026-01-29T12:53:43.069289"
+    },
+    {
+      "message_num": 2,
+      "phase": "Temporal Information",
+      "test": "Tests time-based memory",
+      "message": "Spock I'm planning to visit my parents in Portland...",
+      "full_message": "Spock I'm planning to visit my parents in Portland on the weekend of March 15th",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+      "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+      "timestamp": "2026-01-29T12:53:55.080060"
+    },
+    {
+      "message_num": 3,
+      "phase": "Temporal Information",
+      "test": "Tests time-based memory",
+      "message": "Spock remind me what I told you about my schedule",
+      "full_message": "Spock remind me what I told you about my schedule",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+      "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+      "timestamp": "2026-01-29T12:54:07.086420"
+    }
+  ]
+}
