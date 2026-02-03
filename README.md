@@ -15,8 +15,6 @@ Shimmi is a production‑lean, privacy‑aware WhatsApp assistant with **durable
 
 ## Architecture Overview
 
-Below is a **GitHub‑friendly ASCII diagram** (no Mermaid):
-
 ```
  WhatsApp User
        |
