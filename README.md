@@ -64,9 +64,10 @@ Shimmi is a production‑lean, privacy‑aware WhatsApp assistant with **durable
 
 ### Ambient Observation (Opt-in)
 ```
- Group Message ---> [Observe Enabled?] --no--> ignore
-                                                                 yes
-                                                                     v
+ Group Message ---> [Observe Enabled?] --[no]--> ignore
+                                 [yes]
+                                   |
+                                   v
                               [Redaction]
                                    |
                                    v
