@@ -1,6 +1,6 @@
 # Shimmi – Stateful WhatsApp Assistant
 
-Shimmi is a production-lean, privacy-aware WhatsApp assistant with **durable memory**, **time‑windowed RAG**, and **WhatsApp‑friendly responses**. It supports **strict prefix gating** in groups/DMs, **emoji branding**, **profile snapshot recall**, and **skinny retries** on provider hiccups. Optional **ambient observation** (opt‑in) captures meaningful group chatter for later catch‑ups and suggestions—**without** background LLM cost.
+Shimmi is a production‑lean, privacy‑aware WhatsApp assistant with **durable memory**, **time‑windowed RAG**, and **WhatsApp‑friendly responses**. It supports **strict prefix gating** in groups/DMs, **emoji branding**, **profile snapshot recall**, and **skinny retries** on provider hiccups. Optional **ambient observation** (opt‑in) captures meaningful group chatter for later catch‑ups and suggestions—**without** background LLM cost.
 
 > **Highlights**
 > - Fast startup: embeddings pre‑warmed.
@@ -23,7 +23,7 @@ Shimmi is a production-lean, privacy-aware WhatsApp assistant with **durable mem
 ### System Overview (Mermaid)
 ```mermaid
 flowchart LR
-  U[WhatsApp User] -->|messages| W( WAHA API )
+  U[WhatsApp User] -->|messages| W(WAHA API)
   W -->|webhook| F[FastAPI Webhook]
   F --> G{Gatekeeping
 allowlist/prefix/echo}
@@ -58,12 +58,13 @@ MOVIES/TRIP/MUSIC]
 
 ## Quick Start
 
-1. **Prerequisites**
-   - Python 3.11+
-   - WAHA (WhatsApp host API) reachable from Shimmi
-   - API key & model access for your LLM provider
+### 1. Prerequisites
+- Python 3.11+
+- WAHA (WhatsApp host API) reachable from Shimmi
+- API key & model access for your LLM provider
 
-2. **Environment** (`.env` excerpt)
+### 2. Environment (`.env` excerpt)
+
 ```ini
 BOT_PERSONA_NAME=Shimmi
 BOT_COMMAND_PREFIX=@shimmi,shimmi,@spock,spock,చిట్టి,shichitti
@@ -84,12 +85,14 @@ FACTS_VERIFICATION=1
 FACTS_MIN_CONF=0.80
 ```
 
-3. **Run**
+### 3. Run
+
 ```bash
 uvicorn app.main:app --host 0.0.0.0 --port 6000
 ```
 
-4. **Health & Diagnostics**
+### 4. Health & Diagnostics
+
 ```bash
 curl -s http://localhost:6000/healthz
 curl -s http://localhost:6000/diag/rag | jq
@@ -101,18 +104,19 @@ curl -s "http://localhost:6000/diag/profile?sender_id=<id>" | jq
 ## Features
 
 - **Prefix Gating**: groups & DMs respect `BOT_COMMAND_PREFIX`; DMs can allow/deny non‑prefix via `ALLOW_NLP_WITHOUT_PREFIX`.
-- **Style Policy**: short paragraphs; minimal emojis (`EMOJI_POLICY`/`EMOJI_MAX_PER_MSG`); WhatsApp clean text.
-- **Durable Memory**: facts in `user_facts`; judge fallback for simple declaratives.
+- **Style Policy**: short paragraphs; minimal emojis; WhatsApp clean text.
+- **Durable Memory**: facts stored in `user_facts`; judge fallback for simple declaratives.
 - **Unified Recall**: `build_profile_snapshot_text()` → appended to RAG for holistic Q&A.
-- **Time‑Windowed RAG**: queries honor phrases like *today*, *yesterday*, *last 7 days*.
-- **Resilient LLM Calls**: skinny retry with trimmed context; planned rate‑limit header logging & backoff.
+- **Time‑Windowed RAG**: queries support “today”, “yesterday”, “last 7 days”, etc.
+- **Resilient LLM Calls**: skinny retry; future rate‑limit header logging.
 - **/diag**: quick counts and profile preview.
 
 ---
 
 ## Ambient Observation (Opt-in)
 
-- Disabled by default. Admin commands (group):
+- Disabled by default. Admin commands:
+
 ```text
 /observe on
 /observe off
@@ -120,30 +124,31 @@ curl -s "http://localhost:6000/diag/profile?sender_id=<id>" | jq
 /observe retention 30d
 /observe redaction on
 ```
-- Pipeline: **Redaction → Filters → Topic Tag → Embed** (no LLM).
-- Retention: configurable per chat (default: 30 days). `/forget me` and `/purge` supported if implemented.
+
+- Pipeline: **Redaction → Filters → Topic Tag → Embed** (no LLM)
+- Retention configurable per chat (default: 30 days).  
+  Supports `/forget me` and `/purge` (if implemented).
 
 ---
 
 ## Troubleshooting
 
 - **No replies in group** → missing prefix or not in `ALLOWED_GROUP_JIDS`.
-- **Emoji spam** → set `EMOJI_POLICY=none` or lower `EMOJI_MAX_PER_MSG`.
-- **Cold first query** → ensure warm‑up log `chroma.warmup dim=384` appears at startup.
-- **LLM failures** → check logs for `llm.reply.end ok=False` and (once instrumented) the **rate‑limit headers**. Backoff per `retry-after`.
-- **RAG empty** but DB growing** → vectors are stored in `bot_memory.db` (not in a `chromaDB/` dir). Use `/diag/rag` to confirm.
+- **Emoji spam** → set `EMOJI_POLICY=none` or reduce `EMOJI_MAX_PER_MSG`.
+- **Cold first query** → confirm warm‑up log `chroma.warmup dim=384`.
+- **LLM failures** → check logs for `llm.reply.end ok=False`.
+- **RAG appears empty** → vectors stored in `bot_memory.db`; use `/diag/rag`.
 
 ---
 
 ## Roadmap
 
-- Instrument and log `x-ratelimit-remaining-*` headers; implement exponential backoff + jitter on 429.
-- Optional **local TPM/RPM shaping** and global in‑flight semaphore.
-- Consent card for `/observe on` and FAQ for admins.
-- Optional ChromaDB persistent mode behind flag + one‑time migration.
+- Instrument & log `x-ratelimit-remaining-*` headers; adaptive backoff.
+- Optional **local TPM/RPM shaping** + global semaphore.
+- Consent card for `/observe on`; admin FAQ.
+- Optional ChromaDB persistent mode + migration.
 
 ---
 
 ## License
-MIT (or your org’s standard). Replace this section as needed.
-
+MIT (or your org’s standard). Replace as needed.
