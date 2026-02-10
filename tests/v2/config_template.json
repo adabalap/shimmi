@@ -4,7 +4,7 @@
   "user_name": "Sarah TestUser",
   "bot_phone": "919573717667@c.us",
   "session": "default",
-  "delay": 2,
-  "message_delay": 10,
+  "delay": 10,
+  "message_delay": 20,
   "timeout": 30
 }

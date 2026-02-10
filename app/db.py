@@ -1,5 +1,5 @@
-# app/db.py
 from __future__ import annotations
+
 import aiosqlite, json
 from typing import Optional, List, Tuple
 from datetime import datetime
@@ -9,33 +9,25 @@ from . import config
 TZ = ZoneInfo(config.APP_TIMEZONE)
 DB: Optional[aiosqlite.Connection] = None
 
-SCHEMA_SQL = '''
+SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
 PRAGMA synchronous=NORMAL;
 PRAGMA foreign_keys=ON;
+PRAGMA busy_timeout=3000;
 
 CREATE TABLE IF NOT EXISTS messages (
   id INTEGER PRIMARY KEY,
   chat_id TEXT,
   sender_id TEXT,
-  timestamp DATETIME,
+  timestamp TEXT,
   role TEXT,
   content TEXT,
   summary TEXT,
   event_id TEXT,
-  UNIQUE(chat_id, timestamp, role, content)
+  UNIQUE(chat_id, event_id)
 );
 CREATE INDEX IF NOT EXISTS idx_messages_chat_ts ON messages(chat_id, timestamp);
-CREATE INDEX IF NOT EXISTS idx_messages_chat_summary ON messages(chat_id, summary);
-
-CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY,
-  sender_id TEXT UNIQUE,
-  name TEXT,
-  city TEXT,
-  created_at DATETIME,
-  updated_at DATETIME
-);
+CREATE INDEX IF NOT EXISTS idx_messages_chat_event ON messages(chat_id, event_id);
 
 CREATE TABLE IF NOT EXISTS user_facts (
   id INTEGER PRIMARY KEY,
@@ -46,8 +38,8 @@ CREATE TABLE IF NOT EXISTS user_facts (
   value_type TEXT DEFAULT 'text',
   confidence REAL DEFAULT 0.95,
   source_msg_id INTEGER,
-  created_at DATETIME NOT NULL,
-  updated_at DATETIME NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
   UNIQUE(sender_id, namespace, attr_key)
 );
 CREATE INDEX IF NOT EXISTS idx_user_facts_sender_ns_key ON user_facts(sender_id, namespace, attr_key);
@@ -56,8 +48,8 @@ CREATE TABLE IF NOT EXISTS user_collections (
   id INTEGER PRIMARY KEY,
   sender_id TEXT NOT NULL,
   name TEXT NOT NULL,
-  created_at DATETIME NOT NULL,
-  updated_at DATETIME NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
   UNIQUE(sender_id, name)
 );
 
@@ -70,8 +62,8 @@ CREATE TABLE IF NOT EXISTS collection_items (
   unit TEXT,
   meta_json TEXT,
   source_msg_id INTEGER,
-  created_at DATETIME NOT NULL,
-  updated_at DATETIME NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
   FOREIGN KEY(collection_id) REFERENCES user_collections(id)
 );
 CREATE UNIQUE INDEX IF NOT EXISTS ux_collection_items_unique_open ON collection_items(collection_id, item_text, status);
@@ -89,23 +81,34 @@ CREATE TABLE IF NOT EXISTS user_records (
   sender_id TEXT NOT NULL,
   record_type_id INTEGER NOT NULL,
   record_json TEXT NOT NULL,
-  occurred_at DATETIME,
+  occurred_at TEXT,
   source_msg_id INTEGER,
-  created_at DATETIME NOT NULL,
-  updated_at DATETIME NOT NULL,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
   FOREIGN KEY(record_type_id) REFERENCES record_types(id)
 );
 CREATE INDEX IF NOT EXISTS idx_user_records_sender_type ON user_records(sender_id, record_type_id);
 
+-- Daily aggregate usage ledger
 CREATE TABLE IF NOT EXISTS usage_ledger (
   date_pt TEXT NOT NULL,
   model TEXT NOT NULL,
   req INTEGER NOT NULL DEFAULT 0,
   tokens INTEGER NOT NULL DEFAULT 0,
-  updated_at DATETIME,
+  updated_at TEXT,
   PRIMARY KEY (date_pt, model)
 );
-'''
+
+-- Ambient observation preferences
+CREATE TABLE IF NOT EXISTS chat_prefs (
+  chat_id TEXT PRIMARY KEY,
+  observe_mode TEXT NOT NULL DEFAULT 'off', -- off|minimal|topics
+  retention_days INTEGER NOT NULL DEFAULT 30,
+  redaction_enabled INTEGER NOT NULL DEFAULT 1,
+  updated_at TEXT NOT NULL
+);
+"""
+
 
 async def init_db():
     global DB
@@ -113,44 +116,48 @@ async def init_db():
     await DB.executescript(SCHEMA_SQL)
     await DB.commit()
 
+
+async def close_db():
+    global DB
+    if DB:
+        await DB.close()
+        DB = None
+
+
 async def fetchall(query: str, params: Tuple = ()) -> List[Tuple]:
-    if not DB: return []
+    if not DB:
+        return []
     async with DB.execute(query, params) as cur:
         return await cur.fetchall()
 
+
 async def execute(query: str, params: Tuple = ()) -> None:
-    if not DB: return
+    if not DB:
+        return
     await DB.execute(query, params)
     await DB.commit()
 
+
 async def save_message(chat_id: str, sender_id: str, role: str, content: str,
                        summary: str | None = None, event_id: str | None = None) -> Optional[int]:
-    if not DB: return None
+    if not DB:
+        return None
     ts = datetime.now(TZ).isoformat()
     try:
         cur = await DB.execute(
             "INSERT INTO messages (chat_id, sender_id, timestamp, role, content, summary, event_id) VALUES (?,?,?,?,?,?,?)",
-            (chat_id, sender_id, ts, role, content, summary, event_id)
+            (chat_id, sender_id, ts, role, content, summary, event_id or None)
         )
         await DB.commit()
         return cur.lastrowid
     except aiosqlite.IntegrityError:
         return None
 
-async def upsert_display_name(sender_id: str, name: str) -> None:
-    if not DB: return
-    now = datetime.now(TZ).isoformat()
-    await DB.execute(
-        """INSERT INTO users (sender_id, name, created_at, updated_at)
-           VALUES (?,?,?,?)
-           ON CONFLICT(sender_id) DO UPDATE SET name=excluded.name, updated_at=excluded.updated_at""",
-        (sender_id, name, now, now)
-    )
-    await DB.commit()
 
 async def upsert_fact(sender_id: str, key: str, value: str, value_type: str = 'text',
                       confidence: float = 0.95, namespace: str = 'default') -> None:
-    if not DB or not key: return
+    if not DB or not key:
+        return
     now = datetime.now(TZ).isoformat()
     await DB.execute(
         """INSERT INTO user_facts (sender_id, namespace, attr_key, attr_value, value_type, confidence, created_at, updated_at)
@@ -158,14 +165,16 @@ async def upsert_fact(sender_id: str, key: str, value: str, value_type: str = 't
            ON CONFLICT(sender_id, namespace, attr_key) DO UPDATE SET
              attr_value=excluded.attr_value,
              value_type=excluded.value_type,
-             confidence=min(?, 1.0),
+             confidence=MIN(excluded.confidence, 1.0),
              updated_at=excluded.updated_at""",
-        (sender_id, namespace, key, value, value_type, confidence, now, now, confidence)
+        (sender_id, namespace, key, value, value_type, confidence, now, now)
     )
     await DB.commit()
 
+
 async def ensure_collection(sender_id: str, name: str) -> Optional[int]:
-    if not DB: return None
+    if not DB:
+        return None
     now = datetime.now(TZ).isoformat()
     await DB.execute(
         """INSERT INTO user_collections (sender_id, name, created_at, updated_at)
@@ -175,6 +184,7 @@ async def ensure_collection(sender_id: str, name: str) -> Optional[int]:
     await DB.commit()
     rows = await fetchall("SELECT id FROM user_collections WHERE sender_id=? AND name=?", (sender_id, name))
     return int(rows[0][0]) if rows else None
+
 
 async def add_collection_items(sender_id: str, name: str, items: list[dict]) -> int:
     coll_id = await ensure_collection(sender_id, name)
@@ -206,27 +216,34 @@ async def add_collection_items(sender_id: str, name: str, items: list[dict]) -> 
         await DB.execute("ROLLBACK")
         return 0
 
+
 async def mark_collection_item(sender_id: str, name: str, item_text: str, status: str = 'done') -> bool:
     coll_id = await ensure_collection(sender_id, name)
     if not DB or not coll_id:
         return False
     now = datetime.now(TZ).isoformat()
-    await DB.execute("UPDATE collection_items SET status=?, updated_at=? WHERE collection_id=? AND item_text=? AND status='open'",
-                     (status, now, coll_id, item_text))
+    await DB.execute(
+        "UPDATE collection_items SET status=?, updated_at=? WHERE collection_id=? AND item_text=? AND status='open'",
+        (status, now, coll_id, item_text)
+    )
     await DB.commit()
     rows = await fetchall("SELECT changes()")
     return bool(int(rows[0][0]) if rows else 0)
 
+
 async def clear_done(sender_id: str, name: str) -> int:
     coll_id = await ensure_collection(sender_id, name)
-    if not coll_id: return 0
+    if not coll_id:
+        return 0
     await DB.execute("DELETE FROM collection_items WHERE collection_id=? AND status='done'", (coll_id,))
     await DB.commit()
     rows = await fetchall("SELECT changes()")
     return int(rows[0][0]) if rows else 0
 
+
 async def ensure_record_type(name: str, schema_json: str) -> Optional[int]:
-    if not DB: return None
+    if not DB:
+        return None
     await DB.execute(
         """INSERT INTO record_types (name, schema_json) VALUES (?,?)
             ON CONFLICT(name) DO UPDATE SET schema_json=excluded.schema_json""",
@@ -236,11 +253,13 @@ async def ensure_record_type(name: str, schema_json: str) -> Optional[int]:
     rows = await fetchall("SELECT id FROM record_types WHERE name=?", (name,))
     return int(rows[0][0]) if rows else None
 
+
 async def insert_user_record(sender_id: str, record_type: str, obj: dict,
                              occurred_at_iso: str | None = None,
                              source_msg_id: int | None = None) -> Optional[int]:
-    type_id = await ensure_record_type(record_type, json.dumps({"type":"object"}))
-    if not DB or not type_id: return None
+    type_id = await ensure_record_type(record_type, json.dumps({"type": "object"}))
+    if not DB or not type_id:
+        return None
     now = datetime.now(TZ).isoformat()
     cur = await DB.execute(
         """INSERT INTO user_records (sender_id, record_type_id, record_json, occurred_at, source_msg_id, created_at, updated_at)
@@ -250,20 +269,49 @@ async def insert_user_record(sender_id: str, record_type: str, obj: dict,
     await DB.commit()
     return int(cur.lastrowid)
 
-async def list_records(sender_id: str, record_type: str) -> list[dict]:
-    rows = await fetchall("""SELECT ur.record_json FROM user_records ur
-                             JOIN record_types rt ON rt.id=ur.record_type_id
-                             WHERE ur.sender_id=? AND rt.name=?
-                             ORDER BY ur.updated_at DESC""", (sender_id, record_type))
-    return [json.loads(r[0]) for r in rows]
 
-# simple usage ledger (optional)
+# chat prefs helpers for /observe
+async def get_chat_prefs(chat_id: str) -> dict:
+    if not DB:
+        return {"observe_mode": "off", "retention_days": 30, "redaction_enabled": 1}
+    rows = await fetchall("SELECT observe_mode, retention_days, redaction_enabled FROM chat_prefs WHERE chat_id=?", (chat_id,))
+    if not rows:
+        return {"observe_mode": "off", "retention_days": 30, "redaction_enabled": 1}
+    return {"observe_mode": rows[0][0], "retention_days": int(rows[0][1]), "redaction_enabled": int(rows[0][2])}
+
+
+async def set_chat_prefs(chat_id: str, *, observe_mode: Optional[str] = None,
+                         retention_days: Optional[int] = None,
+                         redaction_enabled: Optional[int] = None) -> None:
+    if not DB:
+        return
+    now = datetime.now(TZ).isoformat()
+    cur = await get_chat_prefs(chat_id)
+    om = observe_mode if observe_mode is not None else cur["observe_mode"]
+    rd = int(retention_days) if retention_days is not None else int(cur["retention_days"])
+    re_ = int(redaction_enabled) if redaction_enabled is not None else int(cur["redaction_enabled"])
+    await DB.execute(
+        """INSERT INTO chat_prefs (chat_id, observe_mode, retention_days, redaction_enabled, updated_at)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(chat_id) DO UPDATE SET
+             observe_mode=excluded.observe_mode,
+             retention_days=excluded.retention_days,
+             redaction_enabled=excluded.redaction_enabled,
+             updated_at=excluded.updated_at""",
+        (chat_id, om, rd, re_, now)
+    )
+    await DB.commit()
+
+
+# usage aggregate ledger
 USAGE_LEDGER: dict[str, dict[str, int]] = {}
 LEDGER_DATE_PT: str = ''
 from datetime import datetime as _dt
 
+
 def _pt_today() -> str:
     return _dt.now(TZ).strftime('%Y-%m-%d')
+
 
 async def inc_usage(model: str, tokens: int):
     global LEDGER_DATE_PT, USAGE_LEDGER
@@ -271,15 +319,16 @@ async def inc_usage(model: str, tokens: int):
     if LEDGER_DATE_PT != today:
         USAGE_LEDGER = {}
         LEDGER_DATE_PT = today
-    m = USAGE_LEDGER.setdefault(model, {"req":0,"tokens":0})
+    m = USAGE_LEDGER.setdefault(model, {"req": 0, "tokens": 0})
     m["req"] += 1
     m["tokens"] += max(0, int(tokens or 0))
     now = _dt.now(TZ).isoformat()
-    await execute("""INSERT INTO usage_ledger (date_pt, model, req, tokens, updated_at)
-                     VALUES (?,?,?,?,?)
-                     ON CONFLICT(date_pt,model) DO UPDATE SET
-                       req = usage_ledger.req + excluded.req,
-                       tokens = usage_ledger.tokens + excluded.tokens,
-                       updated_at = excluded.updated_at""",
-                  (today, model, 1, max(0, int(tokens or 0)), now))
-
+    await execute(
+        """INSERT INTO usage_ledger (date_pt, model, req, tokens, updated_at)
+           VALUES (?,?,?,?,?)
+           ON CONFLICT(date_pt,model) DO UPDATE SET
+             req = usage_ledger.req + excluded.req,
+             tokens = usage_ledger.tokens + excluded.tokens,
+             updated_at = excluded.updated_at""",
+        (today, model, 1, max(0, int(tokens or 0)), now)
+    )
