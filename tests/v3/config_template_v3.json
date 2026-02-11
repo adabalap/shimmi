@@ -1,0 +1,37 @@
+{
+  "webhook_url": "http://127.0.0.1:6000/webhook",
+  "user_phone": "4930656034916@lid",
+  "user_name": "Sarah TestUser",
+  "bot_phone": "919573717667@c.us",
+  "session": "default",
+  "delay": 1,
+  "message_delay": 3,
+  "timeout": 30,
+  "capture": {
+    "mode": "waha_api",
+    "waha_base_url": "http://127.0.0.1:3000",
+    "waha_api_key": "",
+    "chat_id": "4930656034916@c.us",
+    "poll_timeout_sec": 40,
+    "poll_interval_sec": 1
+  },
+  "db_validation": {
+    "sqlite_db_path": "./data/bot.sqlite3",
+    "sqlite_tables_hint": [
+      "memories",
+      "conversations",
+      "users"
+    ],
+    "chroma_persist_dir": "./data/chroma",
+    "chroma_collections_hint": [
+      "memories"
+    ],
+    "pii_patterns": [
+      "\\b\\d{3}-\\d{2}-\\d{4}\\b"
+    ],
+    "enable": false
+  },
+  "simulation": {
+    "incoming_fromMe": false
+  }
+}

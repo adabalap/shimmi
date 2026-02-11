@@ -1,31 +1,34 @@
 from __future__ import annotations
 
-import os, re, time, logging
+import logging
+import os
+import re
+import time
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from .db import get_chat_prefs, set_chat_prefs
 from .utils import canonical_text
+from .db import get_chat_prefs, set_chat_prefs
 
 logger = logging.getLogger("app.observe")
 
 OBSERVE_MIN_TEXT_LEN = int(os.getenv("OBSERVE_MIN_TEXT_LEN", "60"))
 OBSERVE_MAX_EMBED_PER_MIN = int(os.getenv("OBSERVE_MAX_EMBED_PER_MIN", "10"))
 
-EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-PHONE_RE = re.compile(r"(?:\+?\d[\d \-]{7,}\d)")
-URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
+EMAIL_RE = re.compile(r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")
+PHONE_RE = re.compile(r"\b(?:\+?\d[\d \-]{7,}\d)\b")
+URL_RE = re.compile(r"\bhttps?://\S+\b", re.IGNORECASE)
 LINK_ONLY_RE = re.compile(r"^\s*(https?://\S+\s*)+$", re.IGNORECASE)
 
 TOPIC_RULES = [
-    ("MOVIES", re.compile(r"(movie|watch|stream|trailer|imax|netflix|prime|hotstar)", re.I)),
-    ("TRIP",   re.compile(r"(trip|travel|itinerary|hotel|flight|booking|visa)", re.I)),
-    ("MUSIC",  re.compile(r"(music|album|playlist|song|band|spotify)", re.I)),
-    ("MEETUP", re.compile(r"(weekend|plan|meetup|dinner|lunch|party)", re.I)),
-    ("PUZZLE", re.compile(r"(puzzle|riddle|quiz|trivia|game)", re.I)),
+    ("MOVIES", re.compile(r"\b(movie|watch|stream|trailer|imax|netflix|prime|hotstar)\b", re.I)),
+    ("TRIP",   re.compile(r"\b(trip|travel|itinerary|hotel|flight|booking|visa)\b", re.I)),
+    ("MUSIC",  re.compile(r"\b(music|album|playlist|song|band|spotify)\b", re.I)),
+    ("SPORT",  re.compile(r"\b(cricket|football|soccer|nba|ipl|match|score)\b", re.I)),
+    ("WORK",   re.compile(r"\b(meeting|jira|release|deployment|incident|prod)\b", re.I)),
 ]
 
-_BUCKET: dict[str, tuple[int,int]] = {}  # chat_id -> (minute_epoch, count)
+_BUCKET: dict[str, tuple[int, int]] = {}
 
 
 def redact(text: str) -> str:
@@ -68,8 +71,7 @@ def _allow_embed(chat_id: str) -> bool:
 
 async def enforce_retention(chat_id: str, retention_days: int, *, db_exec):
     cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
-    cutoff_iso = cutoff.isoformat()
-    await db_exec("DELETE FROM rag_chunks WHERE chat_id=? AND created_at < ?", (chat_id, cutoff_iso))
+    await db_exec("DELETE FROM rag_chunks WHERE chat_id=? AND created_at < ?", (chat_id, cutoff.isoformat()))
 
 
 async def observe_ingest(chat_id: str, sender_id: str, text: str, *, chroma_add_text, db_exec) -> bool:
@@ -82,7 +84,7 @@ async def observe_ingest(chat_id: str, sender_id: str, text: str, *, chroma_add_
         return False
 
     if not _allow_embed(chat_id):
-        logger.info("observe.rate_limited chat_id=%s", chat_id)
+        logger.info("👁️ observe.rate_limit chat_id=%s", chat_id)
         return False
 
     msg = canonical_text(text)
@@ -91,21 +93,20 @@ async def observe_ingest(chat_id: str, sender_id: str, text: str, *, chroma_add_
 
     tag = topic_tag(msg) if mode == "topics" else None
     if tag:
-        msg = f"TOPIC: {tag} {msg}"
+        msg = f"TOPIC: {tag}\n{msg}"
 
     try:
         await chroma_add_text(chat_id=chat_id, sender_id=sender_id, text=msg)
         await enforce_retention(chat_id, int(prefs.get("retention_days", 30)), db_exec=db_exec)
-        logger.info("observe.add chat_id=%s mode=%s tag=%s", chat_id, mode, tag or "")
+        logger.info("👁️ observe.add chat_id=%s mode=%s tag=%s", chat_id, mode, tag or "")
         return True
     except Exception as e:
-        logger.warning("observe.add_failed chat_id=%s err=%s", chat_id, str(e)[:160])
+        logger.warning("👁️ observe.fail chat_id=%s err=%s", chat_id, str(e)[:160])
         return False
 
 
 async def handle_observe_command(chat_id: str, sender_id: str, raw_text: str) -> Optional[str]:
-    t = (raw_text or "").strip()
-    tl = t.lower()
+    tl = (raw_text or "").strip().lower()
     if not tl.startswith("/observe"):
         return None
 
@@ -118,16 +119,13 @@ async def handle_observe_command(chat_id: str, sender_id: str, raw_text: str) ->
         )
 
     cmd = parts[1]
-    if cmd in ("on", "off"):
-        if cmd == "on":
+    if cmd in ("on", "off", "topics"):
+        if cmd in ("on", "topics"):
             await set_chat_prefs(chat_id, observe_mode="topics", redaction_enabled=1)
             prefs = await get_chat_prefs(chat_id)
-            return (
-                "✅ Ambient observe ON (topics + redaction). I’ll silently index meaningful messages for later catch-ups — no auto replies. "
-                f"Retention: {prefs.get('retention_days',30)}d. Use /observe off anytime."
-            )
+            return f"✅ Ambient observe ON. Retention: {prefs.get('retention_days',30)}d."
         await set_chat_prefs(chat_id, observe_mode="off")
-        return "✅ Ambient observe OFF. I won’t index non-prefixed chatter."
+        return "✅ Ambient observe OFF."
 
     if cmd == "retention" and len(parts) >= 3:
         m = re.match(r"^(\d+)\s*d?$", parts[2])

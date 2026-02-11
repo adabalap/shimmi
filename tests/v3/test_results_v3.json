@@ -1,0 +1,331 @@
+{
+  "timestamp": "2026-02-11T10:48:29.670352",
+  "config": {
+    "webhook_url": "http://127.0.0.1:6000/webhook",
+    "user_phone": "4930656034916@lid",
+    "user_name": "Sarah TestUser",
+    "bot_phone": "919573717667@c.us",
+    "session": "default",
+    "delay": 1,
+    "message_delay": 3,
+    "timeout": 30,
+    "capture": {
+      "mode": "none"
+    },
+    "db_validation": {
+      "enable": false
+    },
+    "simulation": {
+      "incoming_fromMe": false
+    }
+  },
+  "summary": {
+    "total": 7,
+    "passed": 0,
+    "failed": 7,
+    "pass_rate": 0.0
+  },
+  "results": [
+    {
+      "type": "step",
+      "message_num": 1,
+      "phase": "Health & Plumbing",
+      "step_id": "health_ping",
+      "full_message": "Spock ping",
+      "inbound": {
+        "id": "true_4930656034916_1770787081_25A6FB58",
+        "timestamp": 1770787081
+      },
+      "webhook": {
+        "status_code": 200,
+        "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+        "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+      },
+      "outbound": null,
+      "expectation": {
+        "pass": false,
+        "details": [
+          "Expected a reply, got none"
+        ],
+        "expect": {
+          "reply_any": true,
+          "db": {
+            "sqlite": [
+              {
+                "id": "sqlite_open",
+                "type": "health",
+                "min_tables": 1
+              },
+              {
+                "id": "sqlite_no_ssn",
+                "type": "pii_scan",
+                "patterns": [
+                  "123-45-6789"
+                ]
+              }
+            ],
+            "chroma": [
+              {
+                "id": "chroma_open",
+                "type": "health",
+                "min_collections": 1
+              }
+            ]
+          }
+        }
+      },
+      "db": {
+        "enabled": false
+      },
+      "overall_pass": false,
+      "timestamp": "2026-02-11T10:48:05.643258"
+    },
+    {
+      "type": "step",
+      "message_num": 2,
+      "phase": "Memory Basics + Retrieval",
+      "step_id": "set_name",
+      "full_message": "Spock my name is Sarah",
+      "inbound": {
+        "id": "true_4930656034916_1770787085_2998E63D",
+        "timestamp": 1770787085
+      },
+      "webhook": {
+        "status_code": 200,
+        "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+        "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+      },
+      "outbound": null,
+      "expectation": {
+        "pass": false,
+        "details": [
+          "Expected a reply, got none"
+        ],
+        "expect": {
+          "reply_any": true
+        }
+      },
+      "db": {
+        "enabled": false
+      },
+      "overall_pass": false,
+      "timestamp": "2026-02-11T10:48:09.647566"
+    },
+    {
+      "type": "step",
+      "message_num": 3,
+      "phase": "Memory Basics + Retrieval",
+      "step_id": "set_age",
+      "full_message": "Spock I'm 28 years old",
+      "inbound": {
+        "id": "true_4930656034916_1770787089_0FAC85CB",
+        "timestamp": 1770787089
+      },
+      "webhook": {
+        "status_code": 200,
+        "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+        "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+      },
+      "outbound": null,
+      "expectation": {
+        "pass": false,
+        "details": [
+          "Expected a reply, got none"
+        ],
+        "expect": {
+          "reply_any": true
+        }
+      },
+      "db": {
+        "enabled": false
+      },
+      "overall_pass": false,
+      "timestamp": "2026-02-11T10:48:13.651580"
+    },
+    {
+      "type": "step",
+      "message_num": 4,
+      "phase": "Memory Basics + Retrieval",
+      "step_id": "set_coffee",
+      "full_message": "Spock my coffee order is a medium oat milk latte with one pump of vanilla",
+      "inbound": {
+        "id": "true_4930656034916_1770787093_58C4BC87",
+        "timestamp": 1770787093
+      },
+      "webhook": {
+        "status_code": 200,
+        "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+        "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+      },
+      "outbound": null,
+      "expectation": {
+        "pass": false,
+        "details": [
+          "Expected a reply, got none"
+        ],
+        "expect": {
+          "reply_any": true
+        }
+      },
+      "db": {
+        "enabled": false
+      },
+      "overall_pass": false,
+      "timestamp": "2026-02-11T10:48:17.656952"
+    },
+    {
+      "type": "step",
+      "message_num": 5,
+      "phase": "Memory Basics + Retrieval",
+      "step_id": "recall_coffee",
+      "full_message": "Spock what's my coffee order?",
+      "inbound": {
+        "id": "true_4930656034916_1770787097_538C542E",
+        "timestamp": 1770787097
+      },
+      "webhook": {
+        "status_code": 200,
+        "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+        "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+      },
+      "outbound": null,
+      "expectation": {
+        "pass": false,
+        "details": [
+          "Missing expected token: oat",
+          "Missing expected token: latte"
+        ],
+        "expect": {
+          "reply_contains": [
+            "oat",
+            "latte"
+          ],
+          "reply_not_contains": [
+            "I don't know",
+            "not sure"
+          ],
+          "db": {
+            "sqlite": [
+              {
+                "id": "sqlite_fact_count_growth",
+                "type": "delta_rows",
+                "table": "memories",
+                "min_increase": 1
+              }
+            ],
+            "chroma": [
+              {
+                "id": "chroma_embeddings_growth",
+                "type": "delta_count",
+                "collection": "memories",
+                "min_increase": 1
+              },
+              {
+                "id": "chroma_query_coffee",
+                "type": "query",
+                "collection": "memories",
+                "query_text": "coffee order",
+                "top_k": 3,
+                "expect_top_contains": [
+                  "oat milk latte"
+                ]
+              }
+            ]
+          }
+        }
+      },
+      "db": {
+        "enabled": false
+      },
+      "overall_pass": false,
+      "timestamp": "2026-02-11T10:48:21.660922"
+    },
+    {
+      "type": "step",
+      "message_num": 6,
+      "phase": "Memory Basics + Retrieval",
+      "step_id": "override_age",
+      "full_message": "Spock actually, I made a mistake earlier - I'm 29 years old, not 28",
+      "inbound": {
+        "id": "true_4930656034916_1770787101_D847532B",
+        "timestamp": 1770787101
+      },
+      "webhook": {
+        "status_code": 200,
+        "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+        "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+      },
+      "outbound": null,
+      "expectation": {
+        "pass": false,
+        "details": [
+          "Expected a reply, got none"
+        ],
+        "expect": {
+          "reply_any": true
+        }
+      },
+      "db": {
+        "enabled": false
+      },
+      "overall_pass": false,
+      "timestamp": "2026-02-11T10:48:25.666253"
+    },
+    {
+      "type": "step",
+      "message_num": 7,
+      "phase": "Memory Basics + Retrieval",
+      "step_id": "verify_age_override",
+      "full_message": "Spock what's my current age?",
+      "inbound": {
+        "id": "true_4930656034916_1770787105_297664CB",
+        "timestamp": 1770787105
+      },
+      "webhook": {
+        "status_code": 200,
+        "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+        "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}"
+      },
+      "outbound": null,
+      "expectation": {
+        "pass": false,
+        "details": [
+          "Missing expected token: 29"
+        ],
+        "expect": {
+          "reply_contains": [
+            "29"
+          ],
+          "reply_not_contains": [
+            "28"
+          ],
+          "db": {
+            "sqlite": [
+              {
+                "id": "sqlite_no_old_age",
+                "type": "sql",
+                "query": "SELECT * FROM memories WHERE value LIKE '%28%' AND key LIKE '%age%';",
+                "expect": {
+                  "max_rows": 0
+                }
+              },
+              {
+                "id": "sqlite_has_new_age",
+                "type": "sql",
+                "query": "SELECT * FROM memories WHERE value LIKE '%29%' AND key LIKE '%age%';",
+                "expect": {
+                  "min_rows": 1
+                }
+              }
+            ]
+          }
+        }
+      },
+      "db": {
+        "enabled": false
+      },
+      "overall_pass": false,
+      "timestamp": "2026-02-11T10:48:29.669833"
+    }
+  ]
+}
