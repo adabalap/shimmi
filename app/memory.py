@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-import re, json
+import json
+import re
 from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime, timezone
 
@@ -9,10 +10,7 @@ from .db import fetchall, execute, insert_user_record as db_insert_user_record
 
 async def get_user_facts(sender_id: str, namespace: str = "default") -> List[Tuple[str, str]]:
     rows = await fetchall(
-        """SELECT attr_key, attr_value
-             FROM user_facts
-            WHERE sender_id=? AND namespace=?
-            ORDER BY updated_at DESC""",
+        "SELECT attr_key, attr_value FROM user_facts WHERE sender_id=? AND namespace=? ORDER BY updated_at DESC",
         (sender_id, namespace),
     )
     return [(r[0], r[1]) for r in rows]
@@ -30,15 +28,11 @@ async def upsert_user_fact(sender_id: str, key: str, value: str, *,
 
     now_iso = datetime.now(timezone.utc).isoformat()
     await execute(
-        """INSERT INTO user_facts
-           (sender_id, namespace, attr_key, attr_value, value_type, confidence, source_msg_id, created_at, updated_at)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-           ON CONFLICT(sender_id, namespace, attr_key) DO UPDATE SET
-             attr_value=excluded.attr_value,
-             value_type=excluded.value_type,
-             confidence=MIN(excluded.confidence, 1.0),
-             source_msg_id=COALESCE(excluded.source_msg_id, user_facts.source_msg_id),
-             updated_at=excluded.updated_at""",
+        "INSERT INTO user_facts (sender_id, namespace, attr_key, attr_value, value_type, confidence, source_msg_id, created_at, updated_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
+        "ON CONFLICT(sender_id, namespace, attr_key) DO UPDATE SET "
+        "attr_value=excluded.attr_value, value_type=excluded.value_type, confidence=MIN(excluded.confidence, 1.0), "
+        "source_msg_id=COALESCE(excluded.source_msg_id, user_facts.source_msg_id), updated_at=excluded.updated_at",
         (sender_id, namespace, key, value, value_type, confidence, source_msg_id, now_iso, now_iso),
     )
     return True
@@ -54,11 +48,10 @@ async def insert_user_record(sender_id: str, record_type: str, data: Dict[str, A
     return bool(rid)
 
 
-_CITY_PAT = re.compile(r"(?:my\s+)?city\s*(?:is|=|:)?\s*([A-Za-z][A-Za-z .,'-]{1,48})", re.IGNORECASE)
-_COUNTRY_PAT = re.compile(r"my\s+country\s*(?:is|=|:)?\s*(India|United\s+States|United\s+Kingdom|UK|USA|Canada|Australia)", re.IGNORECASE)
+_CITY_PAT = re.compile(r"\b(?:i\s+live\s+in|my\s+city\s+is)\s+([A-Za-z][A-Za-z .,'-]{1,48})", re.IGNORECASE)
 
 
-def _clean_value(s: str) -> str:
+def _clean(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip())
 
 
@@ -66,33 +59,20 @@ def extract_personal_facts(text: str) -> Dict[str, str]:
     facts: Dict[str, str] = {}
     if not text:
         return facts
-    t = text.strip()
-    mc = _CITY_PAT.search(t)
-    if mc:
-        facts["city"] = _clean_value(mc.group(1))
-    mco = _COUNTRY_PAT.search(t)
-    if mco:
-        country = mco.group(1)
-        if re.fullmatch(r"UK|United\s+Kingdom", country, re.IGNORECASE):
-            country = "United Kingdom"
-        elif re.fullmatch(r"USA|United\s+States", country, re.IGNORECASE):
-            country = "United States"
-        facts["country"] = _clean_value(country)
+    m = _CITY_PAT.search(text)
+    if m:
+        facts["city"] = _clean(m.group(1))
     return facts
 
 
 async def classify_and_persist(chat_id: str, sender_id: str, text: str) -> Dict[str, int]:
     summary = {"facts": 0, "records": 0}
-    if not sender_id or not text:
-        return summary
     facts = extract_personal_facts(text)
     persisted = 0
-    for k in ("city", "country"):
-        v = facts.get(k)
-        if v:
-            ok = await upsert_user_fact(sender_id, k, v, namespace="default", value_type="text", confidence=0.75)
-            if ok:
-                persisted += 1
+    for k, v in facts.items():
+        ok = await upsert_user_fact(sender_id, k, v, confidence=0.75)
+        if ok:
+            persisted += 1
     summary["facts"] = persisted
     return summary
 
@@ -138,18 +118,8 @@ async def build_profile_snapshot_text(sender_id: str) -> str:
         lines.append("PROFILE")
         lines.extend(core)
 
-    work = []
-    _add_if(work, "occupation", "OCCUPATION", facts)
-    _add_if(work, "current_company", "CURRENT COMPANY", facts)
-    _add_if(work, "current_job_role", "CURRENT ROLE", facts)
-    _add_if(work, "career_goal", "CAREER GOAL", facts)
-    if work:
-        lines.append("WORK")
-        lines.extend(work)
-
     pref = []
     _add_if(pref, "hobbies", "HOBBIES", facts, _fmt_listish)
-    _add_if(pref, "favorite_podcasts", "PODCASTS", facts, _fmt_listish)
     _add_if(pref, "coffee_order", "COFFEE", facts)
     if pref:
         lines.append("PREFERENCES")
@@ -163,4 +133,4 @@ async def build_profile_snapshot_text(sender_id: str) -> str:
         lines.append("PERSONAL")
         lines.extend(personal)
 
-    return " ".join(lines).strip()
+    return "\n".join(lines).strip()

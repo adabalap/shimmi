@@ -1,4 +1,3 @@
-# app/chroma.py
 from __future__ import annotations
 
 import asyncio
@@ -6,7 +5,7 @@ import logging
 import os
 import time
 from datetime import datetime, timezone
-from typing import List, Optional
+from typing import List
 
 import aiosqlite
 import faiss
@@ -50,7 +49,6 @@ CREATE TABLE IF NOT EXISTS rag_vecs (
     FOREIGN KEY(chunk_id) REFERENCES rag_chunks(id) ON DELETE CASCADE
 );
 CREATE INDEX IF NOT EXISTS idx_rag_vecs_chat ON rag_vecs(chat_id, id DESC);
-CREATE INDEX IF NOT EXISTS idx_rag_vecs_chat_dim ON rag_vecs(chat_id, dim, id DESC);
 """
 
 
@@ -60,8 +58,8 @@ def _load_model():
         t0 = time.perf_counter()
         _model = SentenceTransformer(EMBED_MODEL_NAME, device="cpu")
         _dim = _model.get_sentence_embedding_dimension()
-        dt = int((time.perf_counter() - t0) * 1000)
-        logger.info("model_loaded name=%s dim=%s load_ms=%s", EMBED_MODEL_NAME, _dim, dt)
+        ms = int((time.perf_counter() - t0) * 1000)
+        logger.info("🧠 embed.model_loaded name=%s dim=%s ms=%s", EMBED_MODEL_NAME, _dim, ms)
 
 
 async def _ensure_init():
@@ -92,7 +90,6 @@ def _embed_sync(texts: List[str]) -> np.ndarray:
 
 async def _embed(texts: List[str]) -> np.ndarray:
     await _ensure_init()
-    # Offload CPU embedding to thread
     return await asyncio.to_thread(_embed_sync, texts)
 
 
@@ -106,12 +103,10 @@ def _from_blob(blob: bytes, dim: int) -> np.ndarray:
 
 
 def _cosine_index(dim: int):
-    # cosine similarity via inner product on normalized vectors
     return faiss.IndexFlatIP(dim)
 
 
 def _snippet(s: str) -> str:
-    # ✅ FIXED: safe newline replacement, no broken string literals
     txt = (s or "").replace("\n", " ").strip()
     if len(txt) > SNIPPET_CHARS:
         txt = txt[:SNIPPET_CHARS] + "…"
@@ -124,7 +119,6 @@ async def add_text(chat_id: str, sender_id: str, text: str):
     await _ensure_init()
     now = datetime.now(timezone.utc).isoformat()
 
-    # Insert chunk first
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("PRAGMA busy_timeout=3000")
         cur = await db.execute(
@@ -134,62 +128,31 @@ async def add_text(chat_id: str, sender_id: str, text: str):
         await db.commit()
         chunk_id = cur.lastrowid
 
-    # Embed (thread) and store vector
-    try:
-        t0 = time.perf_counter()
-        vec = (await _embed([text]))[0]
-        dt = int((time.perf_counter() - t0) * 1000)
+    t0 = time.perf_counter()
+    vec = (await _embed([text]))[0]
+    embed_ms = int((time.perf_counter() - t0) * 1000)
 
-        async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute("PRAGMA busy_timeout=3000")
-            await db.execute(
-                "INSERT INTO rag_vecs (chunk_id, chat_id, dim, vec) VALUES (?, ?, ?, ?)",
-                (chunk_id, chat_id, _dim, _to_blob(vec)),
-            )
-            await db.commit()
+    async with aiosqlite.connect(DB_FILE) as db:
+        await db.execute("PRAGMA busy_timeout=3000")
+        await db.execute(
+            "INSERT INTO rag_vecs (chunk_id, chat_id, dim, vec) VALUES (?, ?, ?, ?)",
+            (chunk_id, chat_id, _dim, _to_blob(vec)),
+        )
+        await db.commit()
 
-        logger.info("📚 chroma_add id=%s sender_id=%s chat_id=%s embed_ms=%s", chunk_id, sender_id, chat_id, dt)
-
-    except Exception:
-        # Cleanup orphan chunk if embedding fails
-        async with aiosqlite.connect(DB_FILE) as db:
-            await db.execute("PRAGMA busy_timeout=3000")
-            await db.execute("DELETE FROM rag_chunks WHERE id=?", (chunk_id,))
-            await db.commit()
-        raise
+    logger.info("📚 rag.add chat_id=%s chunk_id=%s embed_ms=%s", chat_id, chunk_id, embed_ms)
 
 
-async def add_profile_snapshot(chat_id: str, sender_id: str, text: str):
-    if not text:
-        return
-    await add_text(chat_id, sender_id, f"PROFILE_FACTS:\n{text}")
-
-
-async def query(
-    chat_id: str,
-    text: str,
-    k: int = 3,
-    *,
-    since_iso: Optional[str] = None,
-    until_iso: Optional[str] = None,
-) -> str:
+async def query(chat_id: str, text: str, k: int = 3) -> str:
     await _ensure_init()
     if not (chat_id and (text or "").strip()):
         return ""
 
-    where = "WHERE v.chat_id=? AND v.dim=?"
-    args: list = [chat_id, _dim]
-    if since_iso and until_iso:
-        where += " AND c.created_at BETWEEN ? AND ?"
-        args.extend([since_iso, until_iso])
-
     async with aiosqlite.connect(DB_FILE) as db:
         await db.execute("PRAGMA busy_timeout=3000")
         cur = await db.execute(
-            f"SELECT v.dim, v.vec, c.text "
-            f"FROM rag_vecs v JOIN rag_chunks c ON c.id=v.chunk_id "
-            f"{where} ORDER BY v.id DESC LIMIT ?",
-            (*args, MAX_ROWS),
+            "SELECT dim, vec, text FROM rag_vecs v JOIN rag_chunks c ON c.id=v.chunk_id WHERE v.chat_id=? ORDER BY v.id DESC LIMIT ?",
+            (chat_id, MAX_ROWS),
         )
         data = await cur.fetchall()
 
@@ -204,11 +167,13 @@ async def query(
     def _search():
         index = _cosine_index(dim0)
         index.add(X)
-        q = _embed_sync([text])
-        _, I = index.search(q, max(1, min(k, n)))
+        qv = _embed_sync([text])
+        _, I = index.search(qv, max(1, min(k, n)))
         return I
 
+    t0 = time.perf_counter()
     I = await asyncio.to_thread(_search)
+    ms = int((time.perf_counter() - t0) * 1000)
 
     out: List[str] = []
     seen = set()
@@ -221,6 +186,7 @@ async def query(
         seen.add(t)
         out.append(_snippet(t))
 
+    logger.info("📚 rag.query chat_id=%s k=%s rows=%s ms=%s", chat_id, k, n, ms)
     return "\n".join(out)
 
 
