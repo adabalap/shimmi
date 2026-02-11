@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import aiosqlite
-import json
 import logging
 import os
 from datetime import datetime
@@ -10,11 +9,10 @@ from zoneinfo import ZoneInfo
 
 from . import config
 
-logger = logging.getLogger("app.db")
+logger = logging.getLogger('app.db')
 TZ = ZoneInfo(config.APP_TIMEZONE)
 DB: Optional[aiosqlite.Connection] = None
-
-DB_TRACE = os.getenv("DB_TRACE", "0").lower() in ("1", "true", "yes", "on")
+DB_TRACE = os.getenv('DB_TRACE', '0').lower() in ('1','true','yes','on')
 
 SCHEMA_SQL = """
 PRAGMA journal_mode=WAL;
@@ -29,7 +27,7 @@ CREATE TABLE IF NOT EXISTS messages (
   timestamp TEXT,
   role TEXT,
   content TEXT,
-  summary TEXT,
+  meta_json TEXT,
   event_id TEXT,
   UNIQUE(chat_id, event_id)
 );
@@ -59,21 +57,46 @@ CREATE TABLE IF NOT EXISTS chat_prefs (
 """
 
 
-def _trace(sql: str, params: Tuple):
-    if DB_TRACE:
-        logger.info("🗄️ db.sql %s params=%s", sql.replace("\n", " ")[:220], params)
-
-
 def _now_iso() -> str:
     return datetime.now(TZ).isoformat()
+
+
+def _trace(sql: str, params: Tuple):
+    if DB_TRACE:
+        logger.info('🗄️ db.sql %s params=%s', sql.replace('\n',' ')[:220], params)
+
+
+async def _table_columns(db: aiosqlite.Connection, table: str) -> set[str]:
+    cols = set()
+    async with db.execute(f'PRAGMA table_info({table})') as cur:
+        rows = await cur.fetchall()
+    for r in rows:
+        if r and len(r) >= 2:
+            cols.add(str(r[1]))
+    return cols
+
+
+async def _migrate_messages(db: aiosqlite.Connection) -> None:
+    cols = await _table_columns(db, 'messages')
+    if 'meta_json' not in cols:
+        await db.execute("ALTER TABLE messages ADD COLUMN meta_json TEXT DEFAULT ''")
+        logger.info('🧱 db.migrate messages.add_column name=meta_json')
+    if 'event_id' not in cols:
+        await db.execute("ALTER TABLE messages ADD COLUMN event_id TEXT")
+        logger.info('🧱 db.migrate messages.add_column name=event_id')
+    await db.commit()
 
 
 async def init_db():
     global DB
     DB = await aiosqlite.connect(config.DB_FILE)
     await DB.executescript(SCHEMA_SQL)
+    try:
+        await _migrate_messages(DB)
+    except Exception as e:
+        logger.warning('🧱 db.migrate.fail err=%s', str(e)[:180])
     await DB.commit()
-    logger.info("🗄️ db.ready file=%s", config.DB_FILE)
+    logger.info('🗄️ db.ready file=%s', config.DB_FILE)
 
 
 async def close_db():
@@ -81,7 +104,7 @@ async def close_db():
     if DB:
         await DB.close()
         DB = None
-        logger.info("🗄️ db.closed")
+        logger.info('🗄️ db.closed')
 
 
 async def fetchall(query: str, params: Tuple = ()) -> List[Tuple]:
@@ -100,48 +123,46 @@ async def execute(query: str, params: Tuple = ()) -> None:
     await DB.commit()
 
 
-async def save_message(chat_id: str, sender_id: str, role: str, content: str,
-                       summary: str | None = None, event_id: str | None = None) -> Optional[int]:
+async def save_message(chat_id: str, sender_id: str, role: str, content: str, *, event_id: str = '', meta_json: str = '') -> Optional[int]:
     if not DB:
         return None
     ts = _now_iso()
+    sql = 'INSERT INTO messages (chat_id, sender_id, timestamp, role, content, meta_json, event_id) VALUES (?,?,?,?,?,?,?)'
+    params = (chat_id, sender_id, ts, role, content, meta_json or '', event_id or None)
     try:
-        sql = "INSERT INTO messages (chat_id, sender_id, timestamp, role, content, summary, event_id) VALUES (?,?,?,?,?,?,?)"
-        params = (chat_id, sender_id, ts, role, content, summary, event_id or None)
-        _trace(sql, params)
         cur = await DB.execute(sql, params)
         await DB.commit()
         return cur.lastrowid
+    except aiosqlite.OperationalError as e:
+        if 'meta_json' in str(e):
+            sql2 = 'INSERT INTO messages (chat_id, sender_id, timestamp, role, content, event_id) VALUES (?,?,?,?,?,?)'
+            cur = await DB.execute(sql2, (chat_id, sender_id, ts, role, content, event_id or None))
+            await DB.commit()
+            return cur.lastrowid
+        raise
     except aiosqlite.IntegrityError:
         return None
 
 
 async def get_chat_prefs(chat_id: str) -> dict:
-    default_mode = os.getenv("OBSERVE_GROUPS_DEFAULT", str(getattr(config, 'OBSERVE_GROUPS_DEFAULT', 'off'))).strip().lower()
-    default_days = int(os.getenv("OBSERVE_RETENTION_DEFAULT_DAYS", str(getattr(config, 'OBSERVE_RETENTION_DEFAULT_DAYS', 30))))
-    default_red = 1 if os.getenv("OBSERVE_REDACTION_DEFAULT", str(getattr(config, 'OBSERVE_REDACTION_DEFAULT', 'on'))).strip().lower() in ("1","true","yes","on") else 0
-
-    if not DB:
-        return {"observe_mode": default_mode, "retention_days": default_days, "redaction_enabled": default_red}
-    rows = await fetchall("SELECT observe_mode, retention_days, redaction_enabled FROM chat_prefs WHERE chat_id=?", (chat_id,))
+    default_mode = (config.OBSERVE_GROUPS_DEFAULT or 'off').strip().lower()
+    default_days = int(config.OBSERVE_RETENTION_DEFAULT_DAYS)
+    default_red = 1 if str(config.OBSERVE_REDACTION_DEFAULT).strip().lower() in ('1','true','yes','on') else 0
+    rows = await fetchall('SELECT observe_mode, retention_days, redaction_enabled FROM chat_prefs WHERE chat_id=?', (chat_id,))
     if not rows:
-        return {"observe_mode": default_mode, "retention_days": default_days, "redaction_enabled": default_red}
-    return {"observe_mode": rows[0][0], "retention_days": int(rows[0][1]), "redaction_enabled": int(rows[0][2])}
+        return {'observe_mode': default_mode, 'retention_days': default_days, 'redaction_enabled': default_red}
+    return {'observe_mode': rows[0][0], 'retention_days': int(rows[0][1]), 'redaction_enabled': int(rows[0][2])}
 
 
 async def set_chat_prefs(chat_id: str, *, observe_mode=None, retention_days=None, redaction_enabled=None) -> None:
-    if not DB:
-        return
     now = _now_iso()
     cur = await get_chat_prefs(chat_id)
-    om = observe_mode if observe_mode is not None else cur["observe_mode"]
-    rd = int(retention_days) if retention_days is not None else int(cur["retention_days"])
-    re_ = int(redaction_enabled) if redaction_enabled is not None else int(cur["redaction_enabled"])
+    om = observe_mode if observe_mode is not None else cur['observe_mode']
+    rd = int(retention_days) if retention_days is not None else int(cur['retention_days'])
+    re_ = int(redaction_enabled) if redaction_enabled is not None else int(cur['redaction_enabled'])
     sql = (
-        "INSERT INTO chat_prefs (chat_id, observe_mode, retention_days, redaction_enabled, updated_at) VALUES (?,?,?,?,?) "
-        "ON CONFLICT(chat_id) DO UPDATE SET observe_mode=excluded.observe_mode, retention_days=excluded.retention_days, "
-        "redaction_enabled=excluded.redaction_enabled, updated_at=excluded.updated_at"
+        'INSERT INTO chat_prefs (chat_id, observe_mode, retention_days, redaction_enabled, updated_at) VALUES (?,?,?,?,?) '
+        'ON CONFLICT(chat_id) DO UPDATE SET observe_mode=excluded.observe_mode, retention_days=excluded.retention_days, '
+        'redaction_enabled=excluded.redaction_enabled, updated_at=excluded.updated_at'
     )
-    _trace(sql, (chat_id, om, rd, re_, now))
-    await DB.execute(sql, (chat_id, om, rd, re_, now))
-    await DB.commit()
+    await execute(sql, (chat_id, om, rd, re_, now))

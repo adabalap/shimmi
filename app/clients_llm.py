@@ -10,14 +10,14 @@ from groq import Groq
 
 from . import config
 
-logger = logging.getLogger("app.llm")
+logger = logging.getLogger('app.llm')
 
 GROQ_CLIENT: Optional[Groq] = None
 MODEL_CIRCUIT: Dict[str, float] = {}
 STICKY_MODEL: Dict[str, Tuple[str, float]] = {}
 STICKY_TTL_SEC = 600
 _circuit_lock = asyncio.Lock()
-GROQ_INFLIGHT = asyncio.Semaphore(int(getattr(config, "GROQ_MAX_INFLIGHT", 5) or 5))
+GROQ_INFLIGHT = asyncio.Semaphore(int(config.GROQ_MAX_INFLIGHT or 5))
 
 
 def _model_open(model: str) -> bool:
@@ -30,7 +30,7 @@ async def _open_circuit(model: str, cooldown: float):
 
 
 def _sticky_or_healthy(chat_id: str, pool: list[str]) -> str:
-    key = f"groq:{chat_id}"
+    key = f'groq:{chat_id}'
     sticky = STICKY_MODEL.get(key)
     if sticky and (time.monotonic() - sticky[1]) < STICKY_TTL_SEC and _model_open(sticky[0]):
         return sticky[0]
@@ -46,82 +46,84 @@ async def init_clients():
     global GROQ_CLIENT
     if GROQ_CLIENT:
         return
-    if not config.GROQ_API_KEY:
-        logger.warning("🧠 llm.init groq_enabled=0 (missing GROQ_API_KEY)")
+    if not (config.GROQ_API_KEY or '').strip():
+        logger.warning('🧠 llm.init groq_enabled=0 (missing GROQ_API_KEY)')
         return
-    # Groq SDK supports passing api_key explicitly.
     GROQ_CLIENT = Groq(api_key=config.GROQ_API_KEY, timeout=config.GROQ_TIMEOUT)
-    logger.info("🧠 llm.init groq_enabled=1 models=%s", ",".join(config.GROQ_MODEL_POOL))
+    logger.info('🧠 llm.init groq_enabled=1 models=%s', ','.join(config.GROQ_MODEL_POOL))
 
 
 async def close_clients():
-    # Groq client doesn't require close
     pass
 
 
-async def groq_chat(chat_id: str, system_text: str, user_text: str, *, temperature: float = 0.3, max_tokens: int = 700) -> tuple[str, bool, dict]:
-    if not GROQ_CLIENT or not config.GROQ_API_KEY:
-        return "Sorry, AI unavailable.", False, {}
+def _usage_dict(resp) -> dict:
+    try:
+        u = getattr(resp, 'usage', None)
+        if not u:
+            return {}
+        if hasattr(u, 'model_dump'):
+            return u.model_dump()
+        if isinstance(u, dict):
+            return u
+    except Exception:
+        pass
+    return {}
+
+
+async def groq_chat(chat_id: str, *, system: str, user: str, temperature: float = 0.3, max_tokens: int = 700) -> tuple[str, bool, dict, str]:
+    if not GROQ_CLIENT:
+        return 'Sorry, AI unavailable.', False, {}, ''
 
     model = _sticky_or_healthy(chat_id, list(config.GROQ_MODEL_POOL))
-
     payload = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": user_text},
-        ],
-        "temperature": float(max(0.0, min(temperature, 1.5))),
-        "max_tokens": int(max_tokens),
+        'model': model,
+        'messages': [{'role':'system','content':system},{'role':'user','content':user}],
+        'temperature': float(max(0.0, min(temperature, 1.5))),
+        'max_tokens': int(max_tokens),
     }
 
     async with GROQ_INFLIGHT:
+        t0 = time.perf_counter()
         try:
             resp = await asyncio.to_thread(lambda: GROQ_CLIENT.chat.completions.create(**payload))
-            data = resp.model_dump() if hasattr(resp, 'model_dump') else {}
-            msg = resp.choices[0].message
-            txt = (msg.content or "").strip()
-            return txt, True, data
+            txt = (resp.choices[0].message.content or '').strip()
+            meta = {'ms': int((time.perf_counter()-t0)*1000), 'usage': _usage_dict(resp)}
+            return txt, True, meta, model
         except Exception as e:
-            # best-effort circuit open
-            await _open_circuit(model, 12.0 + random.random() * 3.0)
-            logger.warning("llm.error model=%s err=%s", model, str(e)[:200])
-            return "", False, {}
+            await _open_circuit(model, 12.0 + random.random()*3.0)
+            meta = {'ms': int((time.perf_counter()-t0)*1000), 'err': str(e)[:180]}
+            return '', False, meta, model
 
 
-async def groq_live_search(chat_id: str, user_text: str, *, max_tokens: int = 900) -> tuple[str, bool, dict]:
-    """Answer using Groq Compound built-in web_search when enabled."""
-    if not GROQ_CLIENT or not config.GROQ_API_KEY:
-        return "Sorry, AI unavailable.", False, {}
+async def groq_live_search(chat_id: str, *, user: str, max_tokens: int = 900) -> tuple[str, bool, dict, str]:
+    if not GROQ_CLIENT:
+        return 'Sorry, AI unavailable.', False, {}, ''
 
-    model = getattr(config, "LIVE_SEARCH_MODEL", "groq/compound-mini")
-
-    # Enable only web_search tool on Compound systems.
+    model = (config.LIVE_SEARCH_MODEL or 'groq/compound-mini').strip()
     payload: Dict[str, Any] = {
-        "model": model,
-        "messages": [
-            {"role": "system", "content": "You may use web search to answer with up-to-date information. Include sources when relevant."},
-            {"role": "user", "content": user_text},
+        'model': model,
+        'messages': [
+            {'role':'system','content':'Use web search to answer with up-to-date information. Include source links when relevant.'},
+            {'role':'user','content':user},
         ],
-        "max_tokens": int(max_tokens),
-        "temperature": 0.2,
-        "compound_custom": {"tools": {"enabled_tools": ["web_search"]}},
+        'temperature': 0.2,
+        'max_tokens': int(max_tokens),
+        'compound_custom': {'tools': {'enabled_tools': ['web_search']}},
     }
 
     async with GROQ_INFLIGHT:
+        t0 = time.perf_counter()
         try:
             resp = await asyncio.to_thread(lambda: GROQ_CLIENT.chat.completions.create(**payload))
-            data = resp.model_dump() if hasattr(resp, 'model_dump') else {}
-            msg = resp.choices[0].message
-            txt = (msg.content or "").strip()
-            # executed_tools may exist for compound systems
+            txt = (resp.choices[0].message.content or '').strip()
+            meta = {'ms': int((time.perf_counter()-t0)*1000), 'usage': _usage_dict(resp)}
             try:
-                exec_tools = getattr(msg, "executed_tools", None)
-                if exec_tools:
-                    logger.info("🌐 live.executed_tools n=%s", len(exec_tools))
+                et = getattr(resp.choices[0].message, 'executed_tools', None)
+                meta['executed_tools_n'] = len(et) if et else 0
             except Exception:
-                pass
-            return txt, True, data
+                meta['executed_tools_n'] = 0
+            return txt, True, meta, model
         except Exception as e:
-            logger.warning("live_search.error model=%s err=%s", model, str(e)[:200])
-            return "", False, {}
+            meta = {'ms': int((time.perf_counter()-t0)*1000), 'err': str(e)[:180]}
+            return '', False, meta, model
