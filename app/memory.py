@@ -1,136 +1,61 @@
 from __future__ import annotations
 
-import json
-import re
-from typing import Dict, Any, List, Tuple, Optional
 from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Optional
 
-from .db import fetchall, execute, insert_user_record as db_insert_user_record
+from zoneinfo import ZoneInfo
+
+from . import config
+from .db import fetchall, execute
 
 
-async def get_user_facts(sender_id: str, namespace: str = "default") -> List[Tuple[str, str]]:
+def _now_iso_utc() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+async def get_recent_messages(chat_id: str, limit: int = 12) -> List[Tuple[str, str, str]]:
+    rows = await fetchall('SELECT timestamp, role, content FROM messages WHERE chat_id=? ORDER BY timestamp DESC LIMIT ?', (chat_id, int(limit)))
+    rows = list(reversed(rows))
+    return [(str(r[0]), str(r[1]), str(r[2])) for r in rows]
+
+
+async def get_messages_in_window(chat_id: str, *, start_iso: str, end_iso: str, role: str = 'user', limit: int = 200) -> List[Tuple[str, str, str]]:
     rows = await fetchall(
-        "SELECT attr_key, attr_value FROM user_facts WHERE sender_id=? AND namespace=? ORDER BY updated_at DESC",
-        (sender_id, namespace),
+        'SELECT timestamp, role, content FROM messages WHERE chat_id=? AND role=? AND timestamp>=? AND timestamp<? ORDER BY timestamp ASC LIMIT ?',
+        (chat_id, role, start_iso, end_iso, int(limit)),
     )
-    return [(r[0], r[1]) for r in rows]
+    return [(str(r[0]), str(r[1]), str(r[2])) for r in rows]
 
 
-async def upsert_user_fact(sender_id: str, key: str, value: str, *,
-                           namespace: str = "default", value_type: str = "text",
-                           confidence: float = 0.95, source_msg_id: Optional[int] = None) -> bool:
-    rows = await fetchall(
-        "SELECT attr_value FROM user_facts WHERE sender_id=? AND namespace=? AND attr_key=?",
-        (sender_id, namespace, key),
-    )
-    if rows and str(rows[0][0]) == str(value):
+def day_window_iso(*, tz_name: str) -> tuple[str, str]:
+    tz = ZoneInfo(tz_name)
+    now = datetime.now(tz)
+    start = datetime(now.year, now.month, now.day, tzinfo=tz)
+    end = start.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return start.isoformat(), end.isoformat()
+
+
+async def get_user_facts(sender_id: str, namespace: str = 'default') -> List[Tuple[str, str, float]]:
+    rows = await fetchall('SELECT attr_key, attr_value, confidence FROM user_facts WHERE sender_id=? AND namespace=? ORDER BY updated_at DESC', (sender_id, namespace))
+    return [(str(r[0]), str(r[1]), float(r[2] or 0.0)) for r in rows]
+
+
+async def upsert_user_fact(sender_id: str, key: str, value: str, *, namespace: str = 'default', value_type: str = 'text', confidence: float = 0.9, source_msg_id: Optional[int] = None) -> bool:
+    existing = await fetchall('SELECT attr_value FROM user_facts WHERE sender_id=? AND namespace=? AND attr_key=?', (sender_id, namespace, key))
+    if existing and str(existing[0][0]) == str(value):
         return False
 
-    now_iso = datetime.now(timezone.utc).isoformat()
-    await execute(
-        "INSERT INTO user_facts (sender_id, namespace, attr_key, attr_value, value_type, confidence, source_msg_id, created_at, updated_at) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) "
-        "ON CONFLICT(sender_id, namespace, attr_key) DO UPDATE SET "
-        "attr_value=excluded.attr_value, value_type=excluded.value_type, confidence=MIN(excluded.confidence, 1.0), "
-        "source_msg_id=COALESCE(excluded.source_msg_id, user_facts.source_msg_id), updated_at=excluded.updated_at",
-        (sender_id, namespace, key, value, value_type, confidence, source_msg_id, now_iso, now_iso),
+    now = _now_iso_utc()
+    sql = (
+        'INSERT INTO user_facts (sender_id, namespace, attr_key, attr_value, value_type, confidence, source_msg_id, created_at, updated_at) '
+        'VALUES (?,?,?,?,?,?,?,?,?) '
+        'ON CONFLICT(sender_id, namespace, attr_key) DO UPDATE SET '
+        'attr_value=excluded.attr_value, value_type=excluded.value_type, confidence=excluded.confidence, '
+        'source_msg_id=COALESCE(excluded.source_msg_id, user_facts.source_msg_id), updated_at=excluded.updated_at'
     )
+    await execute(sql, (sender_id, namespace, key, value, value_type, float(confidence), source_msg_id, now, now))
     return True
 
 
-async def insert_user_record(sender_id: str, record_type: str, data: Dict[str, Any], *,
-                             confidence: float = 0.9,
-                             occurred_at_iso: str | None = None,
-                             source_msg_id: int | None = None) -> bool:
-    obj = dict(data or {})
-    obj["_confidence"] = float(confidence)
-    rid = await db_insert_user_record(sender_id, record_type, obj, occurred_at_iso=occurred_at_iso, source_msg_id=source_msg_id)
-    return bool(rid)
-
-
-_CITY_PAT = re.compile(r"\b(?:i\s+live\s+in|my\s+city\s+is)\s+([A-Za-z][A-Za-z .,'-]{1,48})", re.IGNORECASE)
-
-
-def _clean(s: str) -> str:
-    return re.sub(r"\s+", " ", (s or "").strip())
-
-
-def extract_personal_facts(text: str) -> Dict[str, str]:
-    facts: Dict[str, str] = {}
-    if not text:
-        return facts
-    m = _CITY_PAT.search(text)
-    if m:
-        facts["city"] = _clean(m.group(1))
-    return facts
-
-
-async def classify_and_persist(chat_id: str, sender_id: str, text: str) -> Dict[str, int]:
-    summary = {"facts": 0, "records": 0}
-    facts = extract_personal_facts(text)
-    persisted = 0
-    for k, v in facts.items():
-        ok = await upsert_user_fact(sender_id, k, v, confidence=0.75)
-        if ok:
-            persisted += 1
-    summary["facts"] = persisted
-    return summary
-
-
-def _fmt_listish(value: str) -> str:
-    s = (value or "").strip()
-    try:
-        obj = json.loads(s)
-        if isinstance(obj, (list, tuple)):
-            return "; ".join(str(x) for x in obj)
-    except Exception:
-        pass
-    return s
-
-
-def _add_if(lines: List[str], key: str, label: str, facts: Dict[str, str], transform=None):
-    if key in facts:
-        val = facts[key]
-        if transform:
-            val = transform(val)
-        lines.append(f"{label}: {val}")
-
-
-async def build_profile_snapshot_text(sender_id: str) -> str:
-    merged: Dict[str, str] = {}
-    for ns in ("default", "prefs", "location", "work", "family", "contact", "custom"):
-        rows = await get_user_facts(sender_id, namespace=ns)
-        for k, v in rows:
-            if k not in merged:
-                merged[k] = v
-
-    facts = merged
-    lines: List[str] = []
-
-    core = []
-    _add_if(core, "name", "NAME", facts)
-    city, state, country = facts.get("city"), facts.get("state"), facts.get("country")
-    if city or state or country:
-        loc = ", ".join([x for x in [city, state, country] if x])
-        core.append(f"LOCATION: {loc}")
-    _add_if(core, "favorite_color", "FAVORITE COLOR", facts)
-    if core:
-        lines.append("PROFILE")
-        lines.extend(core)
-
-    pref = []
-    _add_if(pref, "hobbies", "HOBBIES", facts, _fmt_listish)
-    _add_if(pref, "coffee_order", "COFFEE", facts)
-    if pref:
-        lines.append("PREFERENCES")
-        lines.extend(pref)
-
-    personal = []
-    _add_if(personal, "birthdate", "BIRTHDATE", facts)
-    _add_if(personal, "age", "AGE", facts)
-    _add_if(personal, "allergy", "ALLERGY", facts)
-    if personal:
-        lines.append("PERSONAL")
-        lines.extend(personal)
-
-    return "\n".join(lines).strip()
+async def clear_user_memory(sender_id: str) -> None:
+    await execute('DELETE FROM user_facts WHERE sender_id=?', (sender_id,))
