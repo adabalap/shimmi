@@ -50,40 +50,46 @@ def prefixes() -> List[str]:
     return [p.strip() for p in str(raw).split(",") if p.strip()]
 
 
-_PREFIX_RE: Optional[re.Pattern] = None
+def _compile_prefix_alternation() -> str:
+    alts = [re.escape(p.lstrip("@")) for p in prefixes()]
+    return "|".join(alts) if alts else ""
+
+
+_PREFIX_ANY_RE: Optional[re.Pattern] = None
+_PREFIX_TOKEN_RE: Optional[re.Pattern] = None
 
 
 def compile_prefix_re() -> None:
-    global _PREFIX_RE
-    alts = [re.escape(p.lstrip("@")) for p in prefixes()]
-    if not alts:
-        _PREFIX_RE = re.compile(r"a^")
+    global _PREFIX_ANY_RE, _PREFIX_TOKEN_RE
+    alt = _compile_prefix_alternation()
+    if not alt:
+        _PREFIX_ANY_RE = re.compile(r"a^")
+        _PREFIX_TOKEN_RE = re.compile(r"a^")
         return
-    _PREFIX_RE = re.compile(r"(?i)(?:^|\s)@?(%s)\b" % "|".join(alts))
+
+    _PREFIX_ANY_RE = re.compile(r"(?i)@?(?:%s)\b" % alt)
+    _PREFIX_TOKEN_RE = re.compile(r"(?i)(?:^|[\s,;:–—-]+)@?(?:%s)\b[\s,;:!?\.]*" % alt)
 
 
 def has_prefix(text: Optional[str]) -> bool:
     if not text:
         return False
-    if _PREFIX_RE is None:
+    if _PREFIX_ANY_RE is None:
         compile_prefix_re()
-    return bool(_PREFIX_RE.search(text))
+    return bool(_PREFIX_ANY_RE.search(text))
 
 
-def strip_prefix(text: str) -> str:
-    if _PREFIX_RE is None:
+def strip_invocation(text: str) -> str:
+    if not text:
+        return ""
+    if _PREFIX_TOKEN_RE is None:
         compile_prefix_re()
-    s = text or ""
-    m = _PREFIX_RE.search(s)
-    if not m:
-        return s.strip()
-    start, end = m.span()
-    before = s[:start].strip()
-    after = s[end:].lstrip(" ,:;-\t")
-    if not before:
-        return after.strip()
-    joined = (before + " " + after).strip()
-    return re.sub(r"\s+", " ", joined)
+
+    out = _PREFIX_TOKEN_RE.sub(" ", text)
+    out = re.sub(r"\s+([,;:!?\.])", r"\1", out)
+    out = re.sub(r"([,;:!?\.])\s+", r"\1 ", out)
+    out = re.sub(r"\s{2,}", " ", out)
+    return out.strip()
 
 
 def chat_is_allowed(chat_id: Optional[str]) -> bool:
@@ -94,21 +100,28 @@ def chat_is_allowed(chat_id: Optional[str]) -> bool:
 
 
 def sanitize_for_whatsapp(text: str) -> str:
-    """Make output WhatsApp friendly: remove code fences, convert tables to bullets, keep concise."""
     if not text:
         return ""
 
     out = html.unescape(text).strip()
 
-    # Remove backticks/code fences
     out = out.replace("```", "")
     out = out.replace("`", "")
 
-    lines = out.splitlines()
+    # remove accidental escaping of asterisks from some sources
+    out = out.replace("\\*", "*")
 
+    # **text** -> *text*
+    out = re.sub(r"\*\*(.+?)\*\*", r"*\1*", out)
+
+    # bullet normalization
+    out = re.sub(r"(?m)^\s*[-*]\s+", "• ", out)
+
+    # table -> bullets
+    lines = out.splitlines()
     looks_like_table = any('|' in ln for ln in lines) and any(set(ln.strip()) <= set('|:- ') for ln in lines)
     if looks_like_table:
-        cleaned_lines: List[str] = []
+        cleaned: List[str] = []
         for ln in lines:
             s = ln.strip()
             if not s:
@@ -118,18 +131,17 @@ def sanitize_for_whatsapp(text: str) -> str:
             if '|' in s:
                 cells = [c.strip() for c in s.strip('|').split('|') if c.strip()]
                 if cells:
-                    cleaned_lines.append('• ' + ' — '.join(cells))
+                    cleaned.append('• ' + ' — '.join(cells))
             else:
-                cleaned_lines.append(s)
-        out = "\n".join(cleaned_lines)
+                cleaned.append(s)
+        out = "\n".join(cleaned)
 
-    # normalize whitespace
     out = re.sub(r"\n{3,}", "\n\n", out)
     out = re.sub(r"[ \t]{2,}", " ", out)
 
-    # Avoid starting with invocation tokens
+    # ensure not starting with invocation
     if has_prefix(out):
-        out = strip_prefix(out)
+        out = strip_invocation(out)
 
     if len(out) > 3800:
         out = out[:3800].rstrip() + "…"

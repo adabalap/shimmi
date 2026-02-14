@@ -4,14 +4,14 @@ import asyncio
 import logging
 import time
 from datetime import datetime, timezone
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from .logging_setup import setup_logging
 from .config import settings
-from .utils import verify_signature, canonical_text, has_prefix, strip_prefix, compile_prefix_re, chat_is_allowed
+from .utils import verify_signature, canonical_text, has_prefix, strip_invocation, compile_prefix_re, chat_is_allowed
 from .database import init_stores, sqlite_store, chroma_store
 from .waha_provider import init_waha, close_waha, send_text, typing_keepalive, OUTBOUND_CACHE_IDS, OUTBOUND_CACHE_TXT, OUTBOUND_TTL_SEC, outbound_hash
 from .agent_engine import init_llm, close_llm, run_agent
@@ -27,10 +27,10 @@ CHAT_WORKERS: Dict[str, asyncio.Task] = {}
 CHAT_LAST_MSG_TS: Dict[str, float] = {}
 
 
-def log_allowed(chat_id: Optional[str], msg: str, **kw):
+def log_allowed(chat_id: Optional[str], msg: str, **kw: Any) -> None:
     if not chat_is_allowed(chat_id):
         return
-    def _s(v):
+    def _s(v: Any) -> Any:
         if isinstance(v, str) and len(v) > 240:
             return v[:240] + "…"
         return v
@@ -78,11 +78,10 @@ def normalize_event(body: dict) -> Tuple[Optional[str], Optional[str], str, bool
 
 
 async def _ambient_store(*, chat_id: str, sender_id: str, text: str, event_id: str) -> None:
-    # Persist only for allowlisted chats
     if not chat_is_allowed(chat_id):
         return
 
-    cleaned = strip_prefix((text or "").strip())
+    cleaned = strip_invocation((text or "").strip())
     if not cleaned:
         return
 
@@ -104,7 +103,6 @@ def _purge_outbound_caches() -> None:
 
 
 def _is_echo(chat_id: str, text: str, event_id: str) -> bool:
-    # prevent loops using outbound id + outbound hash caches
     if event_id and event_id in OUTBOUND_CACHE_IDS:
         return True
     if chat_id and text:
@@ -114,17 +112,18 @@ def _is_echo(chat_id: str, text: str, event_id: str) -> bool:
     return False
 
 
-async def process_message(chat_id: str, sender_id: str, text: str, event_id: str) -> None:
+async def process_message(chat_id: str, sender_id: str, text: str, event_id: str, from_me: bool) -> None:
     stop_evt = asyncio.Event()
     keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
 
     try:
-        user_text = strip_prefix((text or "").strip())
-        log_allowed(chat_id, "🧠 flow.begin", chat=str(chat_id), sender=str(sender_id), fromMe=False, text=user_text)
+        user_text = strip_invocation((text or "").strip())
+        log_allowed(chat_id, "🧠 flow.begin", chat=str(chat_id), sender=str(sender_id), fromMe=from_me, text=user_text)
 
         facts = await sqlite_store.get_all_facts(sender_id) if sqlite_store else {}
+        log_allowed(chat_id, "🧠 facts.loaded", count=len(facts))
 
-        context_items = []
+        context_items: List[Dict[str, Any]] = []
         if chroma_store:
             rel = await chroma_store.search(chat_id=chat_id, query=user_text, k=settings.chroma_top_k)
             rec = await chroma_store.recent_window(chat_id=chat_id, k=settings.chroma_recent_k)
@@ -133,11 +132,9 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
 
         result = await run_agent(chat_id=chat_id, user_text=user_text, facts=facts, context=context_items)
 
-        # send reply
         send_res = await send_text(chat_id, result.reply.text)
         log_allowed(chat_id, "🧠 flow.action", sent=bool(send_res), id=str(send_res.get("id") or ""))
 
-        # persist outbound (allowlisted only)
         ts_out = datetime.now(UTC).isoformat()
         out_id = str(send_res.get("id") or (send_res.get("message") or {}).get("id") or ("out-" + event_id) or ("out-" + str(int(time.time()*1000))))
         if sqlite_store:
@@ -145,11 +142,13 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
         if chroma_store:
             await chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_id, direction="out", text=result.reply.text, ts=ts_out, message_id=out_id)
 
-        # save multiple memory updates
-        if sqlite_store and result.memory_updates:
-            for mu in result.memory_updates:
-                status = await sqlite_store.upsert_fact(sender_id, mu.key, mu.value)
-                log_allowed(chat_id, "🧠 memory", status=status, key=mu.key)
+        if sqlite_store:
+            if result.memory_updates:
+                for mu in result.memory_updates:
+                    status = await sqlite_store.upsert_fact(sender_id, mu.key, mu.value)
+                    log_allowed(chat_id, "🧠 memory", status=status, key=mu.key)
+            else:
+                log_allowed(chat_id, "🧠 memory", status="none")
 
         log_allowed(chat_id, "🧠 flow.end")
 
@@ -195,7 +194,6 @@ async def webhook(request: Request):
 
     sender_id, chat_id, text, from_me, event_id = normalize_event(body)
 
-    # strict allowlist: ignore silently (no logs, no persistence)
     if not chat_is_allowed(chat_id):
         return JSONResponse({"status": "ok", "message": "chat not allowed"})
 
@@ -207,25 +205,20 @@ async def webhook(request: Request):
 
     _purge_outbound_caches()
 
-    # echo ignore (prevents loops)
     if chat_id and _is_echo(chat_id, canonical_text(text or ""), event_id):
         log_allowed(chat_id, "↪️ webhook.ignore", reason="echo")
         return JSONResponse({"status": "ok", "message": "echo ignored"})
 
-    # persist inbound message (allowed only)
     await _ambient_store(chat_id=chat_id, sender_id=sender_id, text=text or "", event_id=event_id)
 
-    # fromMe gating: allow responding when enabled
     if from_me and not settings.allow_fromme:
         log_allowed(chat_id, "↪️ webhook.ignore", reason="fromMe_disabled")
         return JSONResponse({"status": "ok", "message": "fromMe ignored"})
 
-    # invocation gating (applies to both DM and group when ALLOW_NLP_WITHOUT_PREFIX is false)
     if (not settings.allow_nlp_without_prefix) and not has_prefix(text):
         log_allowed(chat_id, "↪️ webhook.ignore", reason="no_prefix")
         return JSONResponse({"status": "ok", "message": "no prefix"})
 
-    # debounce
     last = CHAT_LAST_MSG_TS.get(chat_id, 0.0)
     nowp = time.perf_counter()
     CHAT_LAST_MSG_TS[chat_id] = nowp
@@ -233,7 +226,6 @@ async def webhook(request: Request):
         log_allowed(chat_id, "↪️ webhook.ignore", reason="debounced")
         return JSONResponse({"status": "ok", "message": "debounced"})
 
-    # per-chat queue
     q = CHAT_QUEUES.get(chat_id)
     if not q:
         q = asyncio.Queue(maxsize=settings.llm_max_queue_per_chat)
@@ -245,7 +237,7 @@ async def webhook(request: Request):
                 while True:
                     item = await q.get()
                     try:
-                        await process_message(chat_id=chat_id, sender_id=item["sender_id"], text=item["text"], event_id=item["event_id"])
+                        await process_message(chat_id=chat_id, sender_id=item["sender_id"], text=item["text"], event_id=item["event_id"], from_me=item["from_me"])
                     except Exception:
                         logger.exception("worker.error chat=%s", chat_id)
                     finally:
@@ -256,7 +248,7 @@ async def webhook(request: Request):
         CHAT_WORKERS[chat_id] = asyncio.create_task(_worker())
 
     try:
-        await asyncio.wait_for(q.put({"text": text or "", "sender_id": sender_id, "event_id": event_id}), timeout=settings.llm_queue_wait_sec)
+        await asyncio.wait_for(q.put({"text": text or "", "sender_id": sender_id, "event_id": event_id, "from_me": from_me}), timeout=settings.llm_queue_wait_sec)
     except asyncio.TimeoutError:
         await send_text(chat_id, "I'm busy; try again in a few seconds.")
         log_allowed(chat_id, "⏳ queue.timeout")
