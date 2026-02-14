@@ -4,8 +4,7 @@ build/
 *.log
 .env
 .venv/
-__pycache__/
+app/__pycache__/
 *.pyc
 .idea/
 .vscode/
-bot_memory.db
