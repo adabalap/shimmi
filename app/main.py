@@ -11,8 +11,8 @@ from fastapi.responses import JSONResponse
 
 from .logging_setup import setup_logging
 from .config import settings
-from .utils import verify_signature, canonical_text, has_prefix, strip_invocation, compile_prefix_re, chat_is_allowed
-from .database import init_stores, sqlite_store, chroma_store
+from .utils import verify_signature, canonical_text, has_prefix, strip_invocation, compile_prefix_re, chat_is_allowed, canonical_user_key
+import app.database as database
 from .waha_provider import init_waha, close_waha, send_text, typing_keepalive, OUTBOUND_CACHE_IDS, OUTBOUND_CACHE_TXT, OUTBOUND_TTL_SEC, outbound_hash
 from .agent_engine import init_llm, close_llm, run_agent
 
@@ -67,6 +67,7 @@ def normalize_event(body: dict) -> Tuple[Optional[str], Optional[str], str, bool
     def _norm(j: Optional[str]) -> Optional[str]:
         if not j:
             return None
+        # normalize only s.whatsapp.net -> c.us
         if j.endswith("@s.whatsapp.net"):
             return j.replace("@s.whatsapp.net", "@c.us")
         return j
@@ -77,7 +78,7 @@ def normalize_event(body: dict) -> Tuple[Optional[str], Optional[str], str, bool
     return sender_id, chat_id, text, from_me, event_id
 
 
-async def _ambient_store(*, chat_id: str, sender_id: str, text: str, event_id: str) -> None:
+async def _ambient_store(*, chat_id: str, sender_key: str, text: str, event_id: str) -> None:
     if not chat_is_allowed(chat_id):
         return
 
@@ -86,10 +87,10 @@ async def _ambient_store(*, chat_id: str, sender_id: str, text: str, event_id: s
         return
 
     ts_in = datetime.now(UTC).isoformat()
-    if sqlite_store:
-        await sqlite_store.log_message(chat_id=chat_id, whatsapp_id=sender_id, direction="in", text=cleaned, ts=ts_in, event_id=event_id or None)
-    if chroma_store:
-        await chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_id, direction="in", text=cleaned, ts=ts_in, message_id=event_id or ("in-" + str(int(time.time()*1000))))
+    if database.sqlite_store:
+        await database.sqlite_store.log_message(chat_id=chat_id, whatsapp_id=sender_key, direction="in", text=cleaned, ts=ts_in, event_id=event_id or None)
+    if database.chroma_store:
+        await database.chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_key, direction="in", text=cleaned, ts=ts_in, message_id=event_id or ("in-" + str(int(time.time()*1000))))
 
 
 def _purge_outbound_caches() -> None:
@@ -116,17 +117,19 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
     stop_evt = asyncio.Event()
     keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
 
+    sender_key = canonical_user_key(sender_id) or (sender_id or "")
+
     try:
         user_text = strip_invocation((text or "").strip())
-        log_allowed(chat_id, "🧠 flow.begin", chat=str(chat_id), sender=str(sender_id), fromMe=from_me, text=user_text)
+        log_allowed(chat_id, "🧠 flow.begin", chat=str(chat_id), sender=str(sender_id), sender_key=str(sender_key), fromMe=from_me, text=user_text)
 
-        facts = await sqlite_store.get_all_facts(sender_id) if sqlite_store else {}
-        log_allowed(chat_id, "🧠 facts.loaded", count=len(facts))
+        facts = await database.sqlite_store.get_all_facts(sender_key) if database.sqlite_store else {}
+        log_allowed(chat_id, "🧠 facts.loaded", count=len(facts), keys=",".join(list(facts.keys())[:10]))
 
         context_items: List[Dict[str, Any]] = []
-        if chroma_store:
-            rel = await chroma_store.search(chat_id=chat_id, query=user_text, k=settings.chroma_top_k)
-            rec = await chroma_store.recent_window(chat_id=chat_id, k=settings.chroma_recent_k)
+        if database.chroma_store:
+            rel = await database.chroma_store.search(chat_id=chat_id, query=user_text, k=settings.chroma_top_k)
+            rec = await database.chroma_store.recent_window(chat_id=chat_id, k=settings.chroma_recent_k)
             merged = {c.id: c for c in (rel + rec)}
             context_items = [{"id": c.id, "text": c.text, "metadata": c.metadata, "distance": c.distance} for c in list(merged.values())[:10]]
 
@@ -137,15 +140,15 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
 
         ts_out = datetime.now(UTC).isoformat()
         out_id = str(send_res.get("id") or (send_res.get("message") or {}).get("id") or ("out-" + event_id) or ("out-" + str(int(time.time()*1000))))
-        if sqlite_store:
-            await sqlite_store.log_message(chat_id=chat_id, whatsapp_id=sender_id, direction="out", text=result.reply.text, ts=ts_out, event_id=out_id)
-        if chroma_store:
-            await chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_id, direction="out", text=result.reply.text, ts=ts_out, message_id=out_id)
+        if database.sqlite_store:
+            await database.sqlite_store.log_message(chat_id=chat_id, whatsapp_id=sender_key, direction="out", text=result.reply.text, ts=ts_out, event_id=out_id)
+        if database.chroma_store:
+            await database.chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_key, direction="out", text=result.reply.text, ts=ts_out, message_id=out_id)
 
-        if sqlite_store:
+        if database.sqlite_store:
             if result.memory_updates:
                 for mu in result.memory_updates:
-                    status = await sqlite_store.upsert_fact(sender_id, mu.key, mu.value)
+                    status = await database.sqlite_store.upsert_fact(sender_key, mu.key, mu.value)
                     log_allowed(chat_id, "🧠 memory", status=status, key=mu.key)
             else:
                 log_allowed(chat_id, "🧠 memory", status="none")
@@ -163,7 +166,7 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
 @app.on_event("startup")
 async def startup() -> None:
     compile_prefix_re()
-    init_stores()
+    database.init_stores()
     await init_waha()
     await init_llm()
     logger.info("startup.ready allowlist_count=%s", len(settings.allowed_chat_jids or []))
@@ -209,7 +212,8 @@ async def webhook(request: Request):
         log_allowed(chat_id, "↪️ webhook.ignore", reason="echo")
         return JSONResponse({"status": "ok", "message": "echo ignored"})
 
-    await _ambient_store(chat_id=chat_id, sender_id=sender_id, text=text or "", event_id=event_id)
+    sender_key = canonical_user_key(sender_id) or (sender_id or "")
+    await _ambient_store(chat_id=chat_id, sender_key=sender_key, text=text or "", event_id=event_id)
 
     if from_me and not settings.allow_fromme:
         log_allowed(chat_id, "↪️ webhook.ignore", reason="fromMe_disabled")

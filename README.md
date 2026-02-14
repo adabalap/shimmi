@@ -1,19 +1,16 @@
-# Shimmi / Spock — Production Grounded v3
+# Shimmi / Spock — Production Grounded v4
 
-## What v3 fixes (based on your attached logs)
-- **Memory not being persisted** after you provided Hyderabad/India/postal code.
-- **Live search ignoring locale facts**, leading to U.S./°F outputs.
-- **Invocation stripping artifacts** like `Ok, .` and `..., ?`.
+## Critical fix vs v3
+The logs showed `facts.loaded count=0` even after `memory.verified count=3`.
+Root cause: `from app.database import sqlite_store` imports a *stale* name binding (stays None),
+so the running code never used the initialized SQLite store for read/write.
 
-## Design alignment
-Implements the intended pipeline:
-1) Ingest (allowlist / echo / prefix gating)
-2) Extract deterministic facts (generic)
-3) Verify facts strictly against user text
-4) Persist facts (SQLite)
-5) Retrieve facts (SQLite) + context (Chroma)
-6) Plan action (answer vs live_search vs ask_facts)
-7) Live search uses facts to enforce locale units/currency
+v4 fixes this by importing the database module and referencing `database.sqlite_store` directly.
+
+## Also included
+- Canonical user id for memory keys: treats `...@c.us` and `...@lid` as the same identity.
+- Facts are always retrieved and passed into planner + live search.
+- WhatsApp-friendly formatting and invocation stripping remain.
 
 ## Run
 ```bash
