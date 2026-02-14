@@ -45,6 +45,19 @@ def verify_signature(raw: bytes, header_value: Optional[str]) -> bool:
     )
 
 
+def canonical_user_key(jid: Optional[str]) -> str:
+    """Normalize sender identity across @c.us, @lid, @s.whatsapp.net.
+
+    Returns a stable key like '919573717667'. If unknown, returns empty string.
+    """
+    if not jid:
+        return ""
+    # common formats: 919573717667@c.us, 4930656034916@lid
+    head = jid.split('@', 1)[0]
+    digits = re.sub(r"\D+", "", head)
+    return digits
+
+
 def prefixes() -> List[str]:
     raw = settings.bot_command_prefix or ""
     return [p.strip() for p in str(raw).split(",") if p.strip()]
@@ -108,16 +121,11 @@ def sanitize_for_whatsapp(text: str) -> str:
     out = out.replace("```", "")
     out = out.replace("`", "")
 
-    # remove accidental escaping of asterisks from some sources
     out = out.replace("\\*", "*")
 
-    # **text** -> *text*
     out = re.sub(r"\*\*(.+?)\*\*", r"*\1*", out)
-
-    # bullet normalization
     out = re.sub(r"(?m)^\s*[-*]\s+", "• ", out)
 
-    # table -> bullets
     lines = out.splitlines()
     looks_like_table = any('|' in ln for ln in lines) and any(set(ln.strip()) <= set('|:- ') for ln in lines)
     if looks_like_table:
@@ -139,7 +147,6 @@ def sanitize_for_whatsapp(text: str) -> str:
     out = re.sub(r"\n{3,}", "\n\n", out)
     out = re.sub(r"[ \t]{2,}", " ", out)
 
-    # ensure not starting with invocation
     if has_prefix(out):
         out = strip_invocation(out)
 
@@ -147,3 +154,7 @@ def sanitize_for_whatsapp(text: str) -> str:
         out = out[:3800].rstrip() + "…"
 
     return out.strip()
+
+
+# Backwards-compatible alias
+sanitize_for_whatsapp = sanitize_for_whatsapp

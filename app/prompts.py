@@ -29,8 +29,7 @@ Return JSON only:
 Rules:
 - live_search for current events: weather/news/stocks/prices/sports.
 - ask_facts if live_search would be ambiguous without facts.
-  Examples: city, country, postal_code, locale, currency_region, news_topics, watchlist.
-- If locale facts exist, incorporate them into search_query.
+- If locale facts exist (city/country/postal_code/locale/currency_region), include them in search_query.
 - Units/currency must follow locale facts (do not guess another locale).
 """.strip()
 
