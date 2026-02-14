@@ -43,6 +43,7 @@ class AgentResult(BaseModel):
 
 class PlannerResult(BaseModel):
     mode: str
+    requires_locale: bool = False
     missing_facts: List[str] = Field(default_factory=list)
     question: str = ""
     search_query: str = ""
@@ -187,12 +188,12 @@ async def groq_live_search(chat_id: str, query: str, facts: Dict[str, str]) -> s
 
 async def _plan(chat_id: str, user_text: str, facts: Dict[str, str], context: List[Dict[str, Any]]) -> PlannerResult:
     payload = {"user_message": user_text, "facts": facts, "context": context}
-    raw = await _groq_raw(chat_id, PLANNER_PROMPT, json.dumps(payload, ensure_ascii=False), temperature=0.0, max_tokens=450)
+    raw = await _groq_raw(chat_id, PLANNER_PROMPT, json.dumps(payload, ensure_ascii=False), temperature=0.0, max_tokens=520)
     try:
         data = _extract_json(raw)
         return PlannerResult.model_validate(data)
     except Exception:
-        return PlannerResult(mode="answer", missing_facts=[], question="", search_query="")
+        return PlannerResult(mode="answer", requires_locale=False, missing_facts=[], question="", search_query="")
 
 
 async def _extract_memory(chat_id: str, user_text: str) -> List[MemoryUpdate]:
@@ -230,6 +231,13 @@ async def _verify_updates(chat_id: str, user_text: str, proposed: List[MemoryUpd
     return keep
 
 
+def _locale_present(facts: Dict[str, str]) -> bool:
+    for k in ("city", "country", "postal_code", "locale"):
+        if (facts.get(k) or "").strip():
+            return True
+    return False
+
+
 async def run_agent(*, chat_id: str, user_text: str, facts: Dict[str, str], context: List[Dict[str, Any]]) -> AgentResult:
     proposed = await _extract_memory(chat_id, user_text)
     verified = await _verify_updates(chat_id, user_text, proposed)
@@ -239,12 +247,18 @@ async def run_agent(*, chat_id: str, user_text: str, facts: Dict[str, str], cont
 
     pr = await _plan(chat_id, user_text, facts, context)
 
+    # Deterministic enforcement: if locale is required but missing, ask for it.
+    if pr.requires_locale and not _locale_present(facts):
+        q = pr.question or "What city and country should I use?"
+        return AgentResult(reply=ReplyPayload(type="text", text=sanitize_for_whatsapp(q)), memory_updates=verified)
+
     if pr.mode == "ask_facts" and pr.question:
         return AgentResult(reply=ReplyPayload(type="text", text=sanitize_for_whatsapp(pr.question)), memory_updates=verified)
 
     if pr.mode == "live_search" and settings.live_search_enabled:
+        # If planner listed missing facts, ask instead of guessing
         if pr.missing_facts:
-            q = pr.question or "I need one detail to answer that. What should I use?"
+            q = pr.question or "What city and country should I use?"
             return AgentResult(reply=ReplyPayload(type="text", text=sanitize_for_whatsapp(q)), memory_updates=verified)
 
         query = pr.search_query.strip() if pr.search_query else user_text

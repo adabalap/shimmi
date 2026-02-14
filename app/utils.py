@@ -46,13 +46,8 @@ def verify_signature(raw: bytes, header_value: Optional[str]) -> bool:
 
 
 def canonical_user_key(jid: Optional[str]) -> str:
-    """Normalize sender identity across @c.us, @lid, @s.whatsapp.net.
-
-    Returns a stable key like '919573717667'. If unknown, returns empty string.
-    """
     if not jid:
         return ""
-    # common formats: 919573717667@c.us, 4930656034916@lid
     head = jid.split('@', 1)[0]
     digits = re.sub(r"\D+", "", head)
     return digits
@@ -117,10 +112,8 @@ def sanitize_for_whatsapp(text: str) -> str:
         return ""
 
     out = html.unescape(text).strip()
-
     out = out.replace("```", "")
     out = out.replace("`", "")
-
     out = out.replace("\\*", "*")
 
     out = re.sub(r"\*\*(.+?)\*\*", r"*\1*", out)
@@ -154,7 +147,3 @@ def sanitize_for_whatsapp(text: str) -> str:
         out = out[:3800].rstrip() + "…"
 
     return out.strip()
-
-
-# Backwards-compatible alias
-sanitize_for_whatsapp = sanitize_for_whatsapp

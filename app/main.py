@@ -67,7 +67,6 @@ def normalize_event(body: dict) -> Tuple[Optional[str], Optional[str], str, bool
     def _norm(j: Optional[str]) -> Optional[str]:
         if not j:
             return None
-        # normalize only s.whatsapp.net -> c.us
         if j.endswith("@s.whatsapp.net"):
             return j.replace("@s.whatsapp.net", "@c.us")
         return j

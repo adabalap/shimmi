@@ -1,16 +1,14 @@
-# Shimmi / Spock — Production Grounded v4
+# Shimmi / Spock — Production Grounded v5
 
-## Critical fix vs v3
-The logs showed `facts.loaded count=0` even after `memory.verified count=3`.
-Root cause: `from app.database import sqlite_store` imports a *stale* name binding (stays None),
-so the running code never used the initialized SQLite store for read/write.
+## What v5 fixes (based on your v4 logs)
+- Facts were saved later, but **planner still asked the wrong clarifying question** first (units instead of location).
+- Bot answered a personal fact (“I live in…”) even when **facts.loaded** did not contain those keys.
 
-v4 fixes this by importing the database module and referencing `database.sqlite_store` directly.
-
-## Also included
-- Canonical user id for memory keys: treats `...@c.us` and `...@lid` as the same identity.
-- Facts are always retrieved and passed into planner + live search.
-- WhatsApp-friendly formatting and invocation stripping remain.
+## v5 upgrades
+- Planner contract includes `requires_locale` boolean.
+- Code enforces: if `requires_locale=true` but locale facts are missing, it **must ask for location** (never guess).
+- System prompt clarifies: use FACTS as source-of-truth for user personal facts; do not claim personal facts unless present in FACTS.
+- Keeps v4 fixes: canonical identity key, database module references, allowlist/echo/fromMe.
 
 ## Run
 ```bash
