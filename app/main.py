@@ -3,257 +3,154 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
-import re
 import time
+from datetime import datetime, timezone
 from typing import Dict, Optional, Tuple
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
-from .logging_setup import setup_logging, log_startup_env, log_event
-from .utils import verify_signature, canonical_text
-from . import config
-
-from .db import init_db, close_db, save_message, execute, get_chat_prefs, set_chat_prefs
-from .memory import get_recent_messages, get_user_facts, upsert_user_fact, clear_user_memory, get_messages_in_window, day_window_iso
-from .memory_extractor import extract_facts
-from .prompting import format_history, format_facts, build_system, build_user_prompt
-from .response_guard import sanitize_reply
-from .clients_waha import init_client as init_waha, close_client as close_waha, send_message, typing_keepalive, OUTBOUND_CACHE_IDS, OUTBOUND_CACHE_TXT, OUTBOUND_TTL_SEC
-from .clients_llm import init_clients as init_llm, close_clients as close_llm, groq_chat, groq_live_search
-from .observe import observe_ingest_group, observe_ingest_dm, handle_observe_command
+from app.logging_setup import setup_logging, log_startup_env
+from app.config import settings
+from app.utils import (
+    verify_signature,
+    canonical_text,
+    normalize_jid,
+    looks_group,
+    looks_broadcast,
+    is_groupish,
+    group_allowed,
+    has_prefix,
+    strip_prefix,
+    compile_prefix_re,
+)
+import app.database as db
+from app.waha_provider import (
+    init_waha,
+    close_waha,
+    send_text,
+    send_buttons,
+    send_list,
+    typing_keepalive,
+    OUTBOUND_CACHE_IDS,
+    OUTBOUND_CACHE_TXT,
+    OUTBOUND_TTL_SEC,
+)
+from app.agent_engine import init_llm, close_llm, run_agent
 
 setup_logging()
-logger = logging.getLogger('app')
+logger = logging.getLogger("app")
+UTC = timezone.utc
 
-CHROMA_AVAILABLE = True
-try:
-    from .chroma import add_text as chroma_add_text, query as chroma_query, warmup as chroma_warmup
-except Exception:
-    CHROMA_AVAILABLE = False
-
-
-def chroma_enabled() -> bool:
-    return CHROMA_AVAILABLE and bool(config.CHROMA_ENABLED)
-
-
-def looks_group(j: Optional[str]) -> bool:
-    return bool(j and j.endswith('@g.us'))
-
-
-def looks_broadcast(j: Optional[str]) -> bool:
-    return bool(j and j.endswith('@broadcast'))
-
-
-def looks_channel(j: Optional[str]) -> bool:
-    return bool(j and j.endswith('@newsletter'))
-
-
-def is_groupish(j: Optional[str]) -> bool:
-    return looks_group(j) or looks_broadcast(j) or looks_channel(j)
-
-
-def group_allowed(chat_id: Optional[str]) -> bool:
-    if not chat_id:
-        return False
-    if looks_channel(chat_id):
-        return False
-    if not looks_group(chat_id):
-        return True
-    if not config.ALLOWED_GROUP_JIDS:
-        return True
-    return chat_id in config.ALLOWED_GROUP_JIDS
-
-
-def normalize_jid(jid: Optional[str]) -> Optional[str]:
-    if not jid:
-        return None
-    if jid.endswith('@s.whatsapp.net'):
-        return jid.replace('@s.whatsapp.net', '@c.us')
-    return jid
-
-
-_PREFIX_RE: Optional[re.Pattern] = None
-
-def _compile_prefix_re():
-    global _PREFIX_RE
-    alts = [re.escape(p.strip().lstrip('@')) for p in (config.BOT_COMMAND_PREFIX or '').split(',') if p.strip()]
-    _PREFIX_RE = re.compile(r'(?i)(?:^|\s)@?(%s)\b' % '|'.join(alts)) if alts else re.compile(r'a^')
-
-
-def has_prefix(text: Optional[str]) -> bool:
-    if not text:
-        return False
-    if _PREFIX_RE is None:
-        _compile_prefix_re()
-    return bool(_PREFIX_RE.search(text))
-
-
-def strip_prefix(text: str) -> str:
-    if _PREFIX_RE is None:
-        _compile_prefix_re()
-    s = text or ''
-    m = _PREFIX_RE.search(s)
-    if not m:
-        return s.strip()
-    start, end = m.span()
-    before = s[:start].strip()
-    after = s[end:].lstrip(' ,:;-\t')
-    if not before:
-        return after.strip()
-    return re.sub(r'\s+', ' ', (before + ' ' + after).strip())
-
-
-def needs_live_search(user_text: str) -> bool:
-    t = (user_text or '').lower()
-    return any(k in t for k in ('latest','current','news','updates','score','price','weather','trending'))
-
-
-def is_today_recap(user_text: str) -> bool:
-    t = (user_text or '').lower().strip()
-    return any(p in t for p in ('what did i do today','recap my day','today recap','summarize my day','what happened today'))
-
-
-def normalize_payload(body: dict) -> Tuple[Optional[str], Optional[str], str, bool, str, Optional[str]]:
-    root = body.get('payload') or body.get('data') or {}
-    data_obj = root.get('_data') or {}
-    key = data_obj.get('key') or {}
-
-    text = (
-        root.get('body')
-        or (root.get('message') or {}).get('text')
-        or (root.get('message') or {}).get('conversation')
-        or data_obj.get('body')
-        or ''
-    )
-
-    from_me = bool(root.get('fromMe') or root.get('from_me') or False)
-
-    me_obj = body.get('me') or root.get('me') or {}
-    me_id = me_obj.get('id') if isinstance(me_obj, dict) else None
-
-    remote_jid = (key.get('remoteJid') or root.get('remoteJid') or root.get('chatId') or root.get('chat_id') or root.get('from') or root.get('to'))
-    participant = root.get('participant') or data_obj.get('author')
-    sender_obj = root.get('sender') or {}
-    sender_id_raw = sender_obj.get('id') or participant or root.get('from') or remote_jid
-
-    event_id = (root.get('id') or body.get('id') or data_obj.get('id') or '')
-
-    return normalize_jid(sender_id_raw), normalize_jid(remote_jid), text, from_me, str(event_id or ''), normalize_jid(me_id)
-
-
-def _purge_echo_cache():
-    nowt = time.time()
-    for k, ts in list(OUTBOUND_CACHE_IDS.items()):
-        if nowt - ts > OUTBOUND_TTL_SEC:
-            OUTBOUND_CACHE_IDS.pop(k, None)
-    for k, ts in list(OUTBOUND_CACHE_TXT.items()):
-        if nowt - ts > OUTBOUND_TTL_SEC:
-            OUTBOUND_CACHE_TXT.pop(k, None)
-
-
-def is_echo(chat_id: str, text: str, event_id: str, *, from_me: bool, sender_id: Optional[str], me_id: Optional[str]) -> bool:
-    _purge_echo_cache()
-    if event_id and event_id in OUTBOUND_CACHE_IDS:
-        return True
-    if chat_id and text:
-        h = hashlib.sha1(f'{chat_id}\n{canonical_text(text)}'.encode('utf-8')).hexdigest()
-        if h in OUTBOUND_CACHE_TXT:
-            return True
-    if from_me and sender_id and me_id and sender_id == me_id:
-        return True
-    return False
-
-
-async def build_today_recap(chat_id: str) -> str:
-    start_iso, end_iso = day_window_iso(tz_name=config.APP_TIMEZONE)
-    msgs = await get_messages_in_window(chat_id, start_iso=start_iso, end_iso=end_iso, role='user', limit=200)
-    if not msgs:
-        return "I don't have any saved messages from today yet."
-    lines = [m[2] for m in msgs if m[2]]
-    if len(lines) <= 8:
-        return 'Today, you mentioned:\n' + '\n'.join([f'• {l}' for l in lines])
-    convo = '\n'.join([f'USER: {l}' for l in lines])
-    sys = 'Summarize ONLY the provided USER lines into 3-6 bullets. Do not add anything else.'
-    reply, ok, meta, model = await groq_chat(chat_id, system=sys, user=convo, temperature=0.0, max_tokens=250)
-    return reply.strip() if ok and reply else ('Today, you mentioned:\n' + '\n'.join([f'• {l}' for l in lines[:10]]))
-
+app = FastAPI()
 
 CHAT_QUEUES: Dict[str, asyncio.Queue] = {}
 CHAT_WORKERS: Dict[str, asyncio.Task] = {}
 CHAT_LAST_MSG_TS: Dict[str, float] = {}
 
-app = FastAPI()
+
+def trace(step: str, **kw):
+    parts = []
+    for k, v in kw.items():
+        if isinstance(v, str) and len(v) > 260:
+            v = v[:260] + "…"
+        parts.append(f"{k}={v}")
+    logger.info("🧭 %s | %s", step, " ".join(parts))
 
 
-async def process_message(chat_id: str, sender_id: str, raw_text: str, inbound_id: Optional[int]):
+def normalize_event(body: dict) -> Tuple[Optional[str], Optional[str], str, bool, str]:
+    root = body.get("payload") or body.get("data") or body
+    data_obj = root.get("_data") or {}
+    key = data_obj.get("key") or {}
+
+    text = (
+        root.get("body")
+        or (root.get("message") or {}).get("text")
+        or (root.get("message") or {}).get("conversation")
+        or data_obj.get("body")
+        or ""
+    )
+
+    from_me = bool(root.get("fromMe") or root.get("from_me") or False)
+
+    key_remote = key.get("remoteJid")
+    remote_jid = root.get("remoteJid") or root.get("chatId") or root.get("chat_id")
+
+    from_field = root.get("from")
+    to_field = root.get("to")
+    participant = root.get("participant") or data_obj.get("author")
+    sender_obj = root.get("sender") or {}
+
+    sender_raw = sender_obj.get("id") or participant or from_field or remote_jid
+    chat_raw = key_remote or remote_jid or from_field or to_field
+
+    sender_id = normalize_jid(sender_raw)
+    chat_id = normalize_jid(chat_raw)
+    event_id = str(root.get("id") or body.get("id") or data_obj.get("id") or "")
+
+    return sender_id, chat_id, text, from_me, event_id
+
+
+async def process_message(chat_id: str, sender_id: str, text: str, event_id: str):
     stop_evt = asyncio.Event()
     keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
+
     try:
-        user_text = strip_prefix((raw_text or '').strip())
-        log_event(logger, '💬 process.begin', chat_id=chat_id, sender_id=sender_id, text=user_text[:160])
+        user_text = strip_prefix((text or "").strip())
+        trace("BRAIN start", chat_id=chat_id, sender_id=sender_id, user_text=user_text)
 
-        tl = user_text.lower().strip()
-        if tl in ('/forget me','forget me'):
-            await clear_user_memory(sender_id)
-            out = '✅ Done. I have cleared your saved facts.'
-            ok, out_id = await send_message(chat_id, out)
-            log_event(logger, '📤 send.forget', chat_id=chat_id, ok=ok, msg_id=out_id or '')
-            await save_message(chat_id, sender_id, 'assistant', out, event_id=out_id or '')
-            return
+        facts = await db.sqlite_store.get_all_facts(sender_id) if db.sqlite_store else {}
+        trace("BRAIN retrieved facts", sender_id=sender_id, fact_keys=str(list(facts.keys())))
 
-        if is_today_recap(user_text):
-            out = await build_today_recap(chat_id)
-            ok, out_id = await send_message(chat_id, out)
-            log_event(logger, '📤 send.today', chat_id=chat_id, ok=ok, msg_id=out_id or '')
-            await save_message(chat_id, sender_id, 'assistant', out, event_id=out_id or '')
-            return
+        context_items = []
+        if db.chroma_store:
+            rel = await db.chroma_store.search(chat_id=chat_id, query=user_text, k=settings.chroma_top_k)
+            rec = await db.chroma_store.recent_window(chat_id=chat_id, k=settings.chroma_recent_k)
+            merged = {c.id: c for c in (rel + rec)}
+            context_items = [
+                {"id": c.id, "text": c.text, "metadata": c.metadata, "distance": c.distance}
+                for c in list(merged.values())[:10]
+            ]
+        trace("BRAIN searched context", chat_id=chat_id, snippets=str(len(context_items)), chroma=str(bool(db.chroma_store)))
 
-        history = await get_recent_messages(chat_id, limit=12)
-        facts = await get_user_facts(sender_id, namespace='default')
-        hist_block = format_history(history, max_turns=10)
-        facts_block = format_facts([(k, v, c) for k, v, c in facts], max_items=35)
+        trace("BRAIN calling LLM", context_snippets=str(len(context_items)))
+        result = await run_agent(chat_id=chat_id, user_text=user_text, facts=facts, context=context_items)
+        trace("BRAIN LLM returned", reply_type=result.reply.type, has_memory_update=str(bool(result.memory_update)))
 
-        snippets = ''
-        if chroma_enabled():
-            snippets = await chroma_query(chat_id=chat_id, text=user_text, k=3)
+        reply = result.reply
+        trace("ACTION sending", chat_id=chat_id, reply_type=reply.type, preview=reply.text[:140])
 
-        # Live web search when enabled
-        if config.LIVE_SEARCH_ENABLED and needs_live_search(user_text):
-            log_event(logger, '🧠 llm.live.start', chat_id=chat_id, model=config.LIVE_SEARCH_MODEL)
-            reply, ok, meta, model = await groq_live_search(chat_id, user=user_text)
-            log_event(logger, '🧠 llm.live.end', chat_id=chat_id, ok=ok, model=model, ms=meta.get('ms',''))
-            if ok and reply:
-                reply = sanitize_reply(reply, [(k, v, c) for k, v, c in facts])
-                ok2, out_id = await send_message(chat_id, reply)
-                log_event(logger, '📤 send.reply', chat_id=chat_id, ok=ok2, msg_id=out_id or '')
-                await save_message(chat_id, sender_id, 'assistant', reply, event_id=out_id or '')
-                return
+        send_res = {}
+        try:
+            if reply.type == "buttons" and getattr(reply, "buttons", None):
+                send_res = await send_buttons(chat_id, reply.text, reply.buttons)  # type: ignore
+                if not send_res:
+                    send_res = await send_text(chat_id, reply.text)
+            elif reply.type == "list" and getattr(reply, "list", None):
+                send_res = await send_list(chat_id, reply.text, reply.list)  # type: ignore
+                if not send_res:
+                    send_res = await send_text(chat_id, reply.text)
+            else:
+                send_res = await send_text(chat_id, reply.text)
+        except Exception as e:
+            trace("ACTION send fallback", err=str(e)[:160])
+            send_res = await send_text(chat_id, reply.text)
 
-        system = build_system(config.BOT_PERSONA_NAME)
-        prompt = build_user_prompt(user_text, facts_block=facts_block, snippets=snippets, history_block=hist_block)
-        log_event(logger, '🧠 llm.chat.start', chat_id=chat_id)
-        reply, ok, meta, model = await groq_chat(chat_id, system=system, user=prompt)
-        log_event(logger, '🧠 llm.chat.end', chat_id=chat_id, ok=ok, model=model, ms=meta.get('ms',''))
-        if not ok or not reply:
-            reply = 'Sorry, I had trouble responding. Please try again.'
+        allow_store = (not looks_group(chat_id)) or group_allowed(chat_id)
+        ts_out = datetime.now(UTC).isoformat()
+        out_id = str(send_res.get("id") or (send_res.get("message") or {}).get("id") or f"out-{event_id}" or f"out-{int(time.time()*1000)}")
+        trace("AMBIENT store outbound", allowed=str(allow_store), out_id=out_id)
 
-        reply = sanitize_reply(reply, [(k, v, c) for k, v, c in facts])
-        ok2, out_id = await send_message(chat_id, reply)
-        log_event(logger, '📤 send.reply', chat_id=chat_id, ok=ok2, msg_id=out_id or '')
-        await save_message(chat_id, sender_id, 'assistant', reply, event_id=out_id or '')
+        if allow_store and db.sqlite_store:
+            await db.sqlite_store.log_message(chat_id=chat_id, whatsapp_id=sender_id, direction="out", text=reply.text, ts=ts_out, event_id=out_id)
+        if allow_store and db.chroma_store:
+            await db.chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_id, direction="out", text=reply.text, ts=ts_out, message_id=out_id)
 
-        # Fact extraction
-        if (config.FACTS_EXTRACTION_MODE or 'off').lower() != 'off':
-            extracted = await extract_facts(chat_id, user_text)
-            persisted = []
-            for k, v, c in extracted:
-                if c < float(config.FACTS_MIN_CONF):
-                    continue
-                changed = await upsert_user_fact(sender_id, k, v, confidence=c, source_msg_id=inbound_id)
-                if changed:
-                    persisted.append(k)
-            log_event(logger, '🧠 memory.persist', chat_id=chat_id, n=len(persisted), keys=','.join(persisted)[:160])
+        if result.memory_update and db.sqlite_store:
+            status = await db.sqlite_store.upsert_fact(sender_id, result.memory_update.get("key", ""), result.memory_update.get("value", ""))
+            trace("MEMORY upsert", status=status, sender_id=sender_id, key=result.memory_update.get("key", ""))
+
+        trace("BRAIN end", chat_id=chat_id)
 
     finally:
         stop_evt.set()
@@ -261,34 +158,32 @@ async def process_message(chat_id: str, sender_id: str, raw_text: str, inbound_i
             await keepalive_task
         except Exception:
             pass
-        log_event(logger, '💬 process.end', chat_id=chat_id)
 
 
-@app.on_event('startup')
+@app.on_event("startup")
 async def startup():
-    _compile_prefix_re()
-    await init_db()
+    compile_prefix_re()
+    db.init_stores()
     await init_waha()
     await init_llm()
 
-    env_keys = [
-        'BOT_PERSONA_NAME','BOT_COMMAND_PREFIX','CHROMA_ENABLED','OBSERVE_DMS_DEFAULT',
-        'LOG_LEVEL','LOG_FORMAT','ACCESS_LOG_LEVEL',
-        'WAHA_API_URL','WAHA_SESSION',
-        'LIVE_SEARCH_ENABLED','LIVE_SEARCH_MODEL',
-        'FACTS_EXTRACTION_MODE','FACTS_MIN_CONF',
-    ]
-    log_startup_env(logger, keys=env_keys)
+    log_startup_env(
+        logger,
+        keys=[
+            "DATA_DIR",
+            "WAHA_API_URL",
+            "WAHA_SESSION",
+            "CHROMA_ENABLED",
+            "ALLOWED_GROUP_JIDS",
+            "ALLOW_FROM_ME_MESSAGES",
+            "ALLOW_NLP_WITHOUT_PREFIX",
+            "LIVE_SEARCH_ENABLED",
+        ],
+    )
+    trace("STARTUP complete", chroma_enabled=str(settings.chroma_enabled), allow_from_me=str(settings.allow_from_me_messages))
 
-    if chroma_enabled():
-        try:
-            dim = await chroma_warmup()
-            logger.info('📚 chroma.warmup dim=%s', dim)
-        except Exception:
-            pass
 
-
-@app.on_event('shutdown')
+@app.on_event("shutdown")
 async def shutdown():
     for _, t in list(CHAT_WORKERS.items()):
         try:
@@ -297,91 +192,120 @@ async def shutdown():
             pass
     await close_waha()
     await close_llm()
-    await close_db()
-    logger.info('🧹 shutdown.complete')
+    trace("SHUTDOWN complete")
 
 
-@app.post('/webhook')
+@app.post("/webhook")
 async def webhook(request: Request):
     raw = await request.body()
-    sig = request.headers.get('X-WAHA-HMAC') or request.headers.get('X-Webhook-Signature') or request.headers.get('X-Signature')
+    sig = request.headers.get("X-WAHA-HMAC") or request.headers.get("X-Webhook-Signature") or request.headers.get("X-Signature")
+
     if not verify_signature(raw, sig):
-        return JSONResponse({'status':'error','message':'Invalid signature'}, status_code=401)
+        trace("WEBHOOK rejected", reason="bad_signature")
+        return JSONResponse({"status": "error", "message": "Invalid signature"}, status_code=401)
 
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse({'status':'error','message':'Invalid JSON'}, status_code=400)
+        trace("WEBHOOK rejected", reason="bad_json")
+        return JSONResponse({"status": "error", "message": "Invalid JSON"}, status_code=400)
 
-    evt = (body.get('event') or '').lower()
-    if evt == 'message':
-        return JSONResponse({'status':'ok','message':'ignored'})
+    evt = str(body.get("event") or "").lower()
+    if evt == "message":
+        trace("WEBHOOK ignored", reason="duplicate_event_message")
+        return JSONResponse({"status": "ok", "message": "ignored"})
 
-    sender_id, chat_id, text, from_me, event_id, me_id = normalize_payload(body)
+    sender_id, chat_id, text, from_me, event_id = normalize_event(body)
 
-    # SILENT ignores (channels + non-allowed groups)
-    if looks_channel(chat_id):
-        return JSONResponse({'status':'ok','message':'ignored'})
+    trace(
+        "WEBHOOK normalized",
+        evt=evt,
+        from_me=str(from_me),
+        chat_id=str(chat_id),
+        sender_id=str(sender_id),
+        event_id=str(event_id),
+        text=(text or "")[:140],
+    )
+
+    if not chat_id or not sender_id:
+        trace("WEBHOOK ignored", reason="missing_ids")
+        return JSONResponse({"status": "ok", "message": "missing ids"})
+
+    # ✅ privacy boundary
     if looks_group(chat_id) and not group_allowed(chat_id):
-        return JSONResponse({'status':'ok','message':'ignored'})
+        trace("WEBHOOK ignored", reason="group_not_allowed", chat_id=chat_id)
+        return JSONResponse({"status": "ok", "message": "group not allowed"})
 
-    log_event(logger, '📩 webhook.recv', evt=evt, chat_id=chat_id, sender_id=sender_id, text=(text or '')[:120])
+    # --- strong echo protection ---
+    nowt = time.time()
+    for k, ts in list(OUTBOUND_CACHE_IDS.items()):
+        if nowt - ts > OUTBOUND_TTL_SEC:
+            OUTBOUND_CACHE_IDS.pop(k, None)
+    for k, ts in list(OUTBOUND_CACHE_TXT.items()):
+        if nowt - ts > OUTBOUND_TTL_SEC:
+            OUTBOUND_CACHE_TXT.pop(k, None)
 
-    if not chat_id:
-        return JSONResponse({'status':'ok','message':'no chat id'})
+    if event_id and event_id in OUTBOUND_CACHE_IDS:
+        trace("WEBHOOK ignored", reason="echo_cache_event_id", chat_id=chat_id, event_id=event_id)
+        return JSONResponse({"status": "ok", "message": "echo ignored"})
 
-    if is_echo(chat_id, text or '', event_id or '', from_me=from_me, sender_id=sender_id, me_id=me_id):
-        log_event(logger, '♻️ webhook.echo_ignored', chat_id=chat_id)
-        return JSONResponse({'status':'ok','message':'echo ignored'})
+    if chat_id and text:
+        h = hashlib.sha1(f"{chat_id}\n{canonical_text(text)}".encode("utf-8")).hexdigest()
+        if h in OUTBOUND_CACHE_TXT:
+            trace("WEBHOOK ignored", reason="echo_cache_text_hash", chat_id=chat_id)
+            return JSONResponse({"status": "ok", "message": "echo ignored"})
 
-    # Observe command only in groups
-    if looks_group(chat_id) and (text or '').strip().lower().startswith('/observe'):
-        msg = await handle_observe_command(chat_id, text, get_prefs=get_chat_prefs, set_prefs=set_chat_prefs)
-        if msg:
-            ok, out_id = await send_message(chat_id, msg)
-            log_event(logger, '📤 send.observe', chat_id=chat_id, ok=ok, msg_id=out_id or '')
-        return JSONResponse({'status':'ok','message':'observe handled'})
+    # fromMe handling (self-test mode)
+    if from_me and not settings.allow_from_me_messages:
+        trace("WEBHOOK ignored", reason="from_me_true and ALLOW_FROM_ME_MESSAGES=0", chat_id=chat_id)
+        return JSONResponse({"status": "ok", "message": "fromMe ignored"})
+    if from_me and settings.allow_from_me_messages:
+        trace("WEBHOOK allowed", reason="from_me_true self-test mode (not echo)", chat_id=chat_id)
 
-    # Always store inbound message (DM ingestion B depends on this)
-    inbound_id = await save_message(chat_id, sender_id or chat_id, 'user', strip_prefix(text or ''), event_id=event_id or '')
+    # Ambient store inbound (DMs + allowed groups)
+    cleaned_in = strip_prefix((text or "").strip())
+    ts_in = datetime.now(UTC).isoformat()
+    allow_store = (not looks_group(chat_id)) or group_allowed(chat_id)
+    trace("AMBIENT store inbound", allowed=str(allow_store), chat_id=chat_id, length=str(len(cleaned_in)))
 
-    # DM ingestion B: embed passively
-    if (not looks_group(chat_id)) and chroma_enabled():
-        await observe_ingest_dm(chat_id, sender_id or chat_id, text or '', chroma_add_text=chroma_add_text, db_exec=execute)
+    if allow_store and db.sqlite_store and cleaned_in:
+        await db.sqlite_store.log_message(chat_id=chat_id, whatsapp_id=sender_id, direction="in", text=cleaned_in, ts=ts_in, event_id=event_id or None)
+    if allow_store and db.chroma_store and cleaned_in:
+        await db.chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_id, direction="in", text=cleaned_in, ts=ts_in, message_id=event_id or f"in-{int(time.time()*1000)}")
 
-    # Group ambient observe if no prefix
-    if looks_group(chat_id) and (not has_prefix(text)) and chroma_enabled():
-        await observe_ingest_group(chat_id, sender_id or chat_id, text or '', chroma_add_text=chroma_add_text, db_exec=execute, get_prefs=get_chat_prefs)
-        log_event(logger, '👁️ webhook.observed', chat_id=chat_id)
-        return JSONResponse({'status':'ok','message':'observed'})
-
-    # Group/broadcast reply gating
+    # Group prefix gating
     if (looks_group(chat_id) or looks_broadcast(chat_id)) and not has_prefix(text):
-        return JSONResponse({'status':'ok','message':'no group prefix'})
+        trace("WEBHOOK gated", gate="group_prefix", chat_id=chat_id, text=(text or "")[:120])
+        return JSONResponse({"status": "ok", "message": "no group prefix"})
 
-    # DM reply gating: if strict prefix required, do not reply; still stored+embedded.
-    if (not is_groupish(chat_id)) and (not bool(config.ALLOW_NLP_WITHOUT_PREFIX)) and not has_prefix(text):
-        return JSONResponse({'status':'ok','message':'stored'})
+    # DM gating
+    if (not is_groupish(chat_id)) and (not settings.allow_nlp_without_prefix) and not has_prefix(text):
+        trace("WEBHOOK gated", gate="dm_prefix", chat_id=chat_id, text=(text or "")[:120])
+        return JSONResponse({"status": "ok", "message": "no dm prefix"})
 
-    # Debounce
+    # debounce
     last = CHAT_LAST_MSG_TS.get(chat_id, 0.0)
     nowp = time.perf_counter()
     CHAT_LAST_MSG_TS[chat_id] = nowp
-    if (nowp - last) * 1000.0 < int(config.MESSAGE_DEBOUNCE_MS):
-        return JSONResponse({'status':'ok','message':'debounced'})
+    if (nowp - last) * 1000.0 < settings.message_debounce_ms:
+        trace("WEBHOOK debounced", chat_id=chat_id, debounce_ms=str(settings.message_debounce_ms))
+        return JSONResponse({"status": "ok", "message": "debounced"})
 
+    # per-chat queue
     q = CHAT_QUEUES.get(chat_id)
     if not q:
-        q = asyncio.Queue(maxsize=int(config.LLM_MAX_QUEUE_PER_CHAT))
+        q = asyncio.Queue(maxsize=settings.llm_max_queue_per_chat)
         CHAT_QUEUES[chat_id] = q
 
         async def _worker():
-            log_event(logger, '🧵 worker.spawned', chat_id=chat_id)
+            trace("WORKER spawned", chat_id=chat_id)
             try:
                 while True:
                     item = await q.get()
                     try:
-                        await process_message(chat_id, item['sender_id'], item['text'], inbound_id=item.get('inbound_id'))
+                        await process_message(chat_id=chat_id, sender_id=item["sender_id"], text=item["text"], event_id=item["event_id"])
+                    except Exception:
+                        logger.exception("worker.process_error chat_id=%s", chat_id)
                     finally:
                         q.task_done()
             except asyncio.CancelledError:
@@ -390,16 +314,16 @@ async def webhook(request: Request):
         CHAT_WORKERS[chat_id] = asyncio.create_task(_worker())
 
     try:
-        await asyncio.wait_for(q.put({'text': text or '', 'sender_id': sender_id or chat_id, 'inbound_id': inbound_id}), timeout=int(config.LLM_QUEUE_WAIT_SEC))
+        await asyncio.wait_for(q.put({"text": text or "", "sender_id": sender_id, "event_id": event_id}), timeout=settings.llm_queue_wait_sec)
     except asyncio.TimeoutError:
-        ok, out_id = await send_message(chat_id, "I'm busy; try again in a few seconds.")
-        log_event(logger, '⏳ queue.timeout', chat_id=chat_id, ok=ok, msg_id=out_id or '')
-        return JSONResponse({'status':'ok','message':'queue timeout'})
+        await send_text(chat_id, "I'm busy; try again in a few seconds.")
+        trace("QUEUE timeout", chat_id=chat_id)
+        return JSONResponse({"status": "ok", "message": "queue timeout"})
 
-    log_event(logger, '✅ webhook.enqueued', chat_id=chat_id)
-    return JSONResponse({'status':'ok','message':'enqueued'})
+    trace("QUEUE enqueued", chat_id=chat_id, queue_size=str(q.qsize()))
+    return JSONResponse({"status": "ok", "message": "enqueued"})
 
 
-@app.get('/healthz')
-async def healthz():
-    return {'status':'ok'}
+@app.get("/healthz")
+async def health():
+    return {"status": "ok"}
