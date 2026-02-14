@@ -18,10 +18,16 @@ _init_lock = asyncio.Lock()
 
 OUTBOUND_CACHE_IDS: Dict[str, float] = {}
 OUTBOUND_CACHE_TXT: Dict[str, float] = {}
-OUTBOUND_TTL_SEC: float = float(300.0)
+OUTBOUND_TTL_SEC: float = 300.0
+
+_NEWLINE = chr(10)
 
 
-def _purge_outbound():
+def outbound_hash(chat_id: str, msg: str) -> str:
+    return sha1_hex(chat_id + _NEWLINE + canonical_text(msg))
+
+
+def _purge_outbound() -> None:
     now = time.time()
     cutoff = now - OUTBOUND_TTL_SEC
     for k, ts in list(OUTBOUND_CACHE_IDS.items()):
@@ -32,7 +38,7 @@ def _purge_outbound():
             OUTBOUND_CACHE_TXT.pop(k, None)
 
 
-async def init_waha():
+async def init_waha() -> None:
     global HTTPX_WAHA
     if HTTPX_WAHA:
         return
@@ -43,16 +49,14 @@ async def init_waha():
     async with _init_lock:
         if HTTPX_WAHA:
             return
-
-        headers = {"X-Api-Key": settings.waha_api_key} if settings.waha_api_key else None
         limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
+        headers = {"X-Api-Key": settings.waha_api_key} if settings.waha_api_key else None
         timeout = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
-
-        HTTPX_WAHA = httpx.AsyncClient(headers=headers, limits=limits, timeout=timeout)
+        HTTPX_WAHA = httpx.AsyncClient(limits=limits, timeout=timeout, headers=headers)
         logger.info("✅ waha.init url=%s session=%s", settings.waha_api_url, settings.waha_session)
 
 
-async def close_waha():
+async def close_waha() -> None:
     global HTTPX_WAHA
     if HTTPX_WAHA:
         try:
@@ -61,31 +65,25 @@ async def close_waha():
             HTTPX_WAHA = None
 
 
-async def start_typing(chat_id: str):
+async def start_typing(chat_id: str) -> None:
     if not HTTPX_WAHA:
         return
     try:
-        await HTTPX_WAHA.post(
-            f"{settings.waha_api_url}/startTyping",
-            json={"session": settings.waha_session, "chatId": chat_id},
-        )
+        await HTTPX_WAHA.post(f"{settings.waha_api_url}/startTyping", json={"session": settings.waha_session, "chatId": chat_id})
     except Exception:
         pass
 
 
-async def stop_typing(chat_id: str):
+async def stop_typing(chat_id: str) -> None:
     if not HTTPX_WAHA:
         return
     try:
-        await HTTPX_WAHA.post(
-            f"{settings.waha_api_url}/stopTyping",
-            json={"session": settings.waha_session, "chatId": chat_id},
-        )
+        await HTTPX_WAHA.post(f"{settings.waha_api_url}/stopTyping", json={"session": settings.waha_session, "chatId": chat_id})
     except Exception:
         pass
 
 
-async def typing_keepalive(chat_id: str, stop_event: asyncio.Event):
+async def typing_keepalive(chat_id: str, stop_event: asyncio.Event) -> None:
     try:
         await start_typing(chat_id)
         refresh = 4.0
@@ -100,12 +98,12 @@ async def typing_keepalive(chat_id: str, stop_event: asyncio.Event):
         await stop_typing(chat_id)
 
 
-async def _post(endpoint: str, payload: dict) -> dict:
+async def _post(path: str, payload: dict) -> dict:
     if not HTTPX_WAHA:
         raise RuntimeError("waha not initialized")
 
-    async def _do():
-        resp = await HTTPX_WAHA.post(f"{settings.waha_api_url}/{endpoint.lstrip('/')}", json=payload)
+    async def _do() -> dict:
+        resp = await HTTPX_WAHA.post(f"{settings.waha_api_url}/{path.lstrip('/')}", json=payload)
         resp.raise_for_status()
         try:
             return resp.json() or {}
@@ -126,60 +124,14 @@ async def send_text(chat_id: str, text: str) -> dict:
         return {}
 
     _purge_outbound()
-    key = sha1_hex(f"{chat_id}\n{canonical_text(msg)}")
-    ts = OUTBOUND_CACHE_TXT.get(key)
-    if ts and (time.time() - ts) < OUTBOUND_TTL_SEC:
-        logger.info("♻️ waha.dedup_skip chat_id=%s", chat_id)
-        return {"dedup": True}
 
+    h = outbound_hash(chat_id, msg)
     payload = {"session": settings.waha_session, "chatId": chat_id, "text": msg}
-    logger.info("📤 wa.out text chat_id=%s len=%s preview=%s", chat_id, len(msg), msg[:220])
-
     data = await _post("sendText", payload)
-    msg_id = data.get("id") or (data.get("message") or {}).get("id")
-    if msg_id:
-        OUTBOUND_CACHE_IDS[str(msg_id)] = time.time()
-    OUTBOUND_CACHE_TXT[key] = time.time()
-    return data
 
-
-async def send_buttons(chat_id: str, text: str, buttons: list[dict]) -> dict:
-    if not HTTPX_WAHA:
-        await init_waha()
-    if not HTTPX_WAHA:
-        return {}
-
-    msg = sanitize_for_whatsapp(text or "")
-    payload = {"session": settings.waha_session, "chatId": chat_id, "text": msg, "buttons": buttons}
-    logger.info("📤 wa.out buttons chat_id=%s buttons=%s preview=%s", chat_id, len(buttons or []), msg[:160])
-
-    data = await _post("sendButtons", payload)
     msg_id = data.get("id") or (data.get("message") or {}).get("id")
     if msg_id:
         OUTBOUND_CACHE_IDS[str(msg_id)] = time.time()
 
-    _purge_outbound()
-    key = sha1_hex(f"{chat_id}\n{canonical_text(msg)}")
-    OUTBOUND_CACHE_TXT[key] = time.time()
-    return data
-
-
-async def send_list(chat_id: str, text: str, list_payload: dict) -> dict:
-    if not HTTPX_WAHA:
-        await init_waha()
-    if not HTTPX_WAHA:
-        return {}
-
-    msg = sanitize_for_whatsapp(text or "")
-    payload = {"session": settings.waha_session, "chatId": chat_id, "text": msg, **(list_payload or {})}
-    logger.info("📤 wa.out list chat_id=%s preview=%s", chat_id, msg[:160])
-
-    data = await _post("sendList", payload)
-    msg_id = data.get("id") or (data.get("message") or {}).get("id")
-    if msg_id:
-        OUTBOUND_CACHE_IDS[str(msg_id)] = time.time()
-
-    _purge_outbound()
-    key = sha1_hex(f"{chat_id}\n{canonical_text(msg)}")
-    OUTBOUND_CACHE_TXT[key] = time.time()
+    OUTBOUND_CACHE_TXT[h] = time.time()
     return data

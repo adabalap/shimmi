@@ -2,14 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import random
-from typing import Callable, TypeVar, Awaitable
+from typing import Awaitable, Callable, TypeVar
 
 T = TypeVar("T")
 
 
-def _sleep(attempt: int, base: float, maxd: float) -> float:
-    d = min(maxd, base * (2 ** (attempt - 1)))
-    return d * (0.75 + random.random() * 0.5)
+def _sleep_time(attempt: int, base_delay: float, max_delay: float) -> float:
+    delay = min(max_delay, base_delay * (2 ** (attempt - 1)))
+    return delay * (0.75 + random.random() * 0.5)
 
 
 async def async_retry(
@@ -27,4 +27,4 @@ async def async_retry(
             attempt += 1
             if attempt >= max_attempts:
                 raise
-            await asyncio.sleep(_sleep(attempt, base_delay, max_delay))
+            await asyncio.sleep(_sleep_time(attempt, base_delay, max_delay))
