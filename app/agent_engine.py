@@ -3,106 +3,71 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
-import re
-from typing import Dict, Optional, List
+import random
+import time
+from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
 from groq import Groq
 
 from .config import settings
 from .retry import async_retry
-from .prompts import SYSTEM_PROMPT, REPAIR_PROMPT
+from .prompts import SYSTEM_PROMPT, REPAIR_PROMPT, VERIFIER_PROMPT
+from .utils import sanitize_for_whatsapp
 
 logger = logging.getLogger("app.agent")
-_NEWLINE = "\n"
+_NEWLINE = chr(10)
 
 
-class MemoryKV(BaseModel):
+class MemoryUpdate(BaseModel):
     key: str = Field(..., min_length=1)
     value: str = Field(..., min_length=1)
 
 
 class ReplyPayload(BaseModel):
-    type: str = Field(..., pattern=r"^(text|buttons|list)$")
-    text: str
-    buttons: list[dict] | None = None
-    list: dict | None = None
+    type: str = Field("text", pattern=r"^(text)$")
+    text: str = Field(..., min_length=1)
 
 
 class AgentResult(BaseModel):
     reply: ReplyPayload
-    memory_updates: list[MemoryKV] | None = None
+    memory_updates: List[MemoryUpdate] = Field(default_factory=list)
+
+
+class ApprovedUpdate(BaseModel):
+    key: str
+    value: str
+    confidence: float = Field(ge=0.0, le=1.0)
+
+
+class VerifyResult(BaseModel):
+    approved: List[ApprovedUpdate] = Field(default_factory=list)
 
 
 GROQ_CLIENT: Optional[Groq] = None
 _inflight = asyncio.Semaphore(int(settings.groq_max_inflight or 5))
+MODEL_CIRCUIT: Dict[str, float] = {}
+STICKY_MODEL: Dict[str, str] = {}
+STICKY_TTL_SEC = 600
 
 
-def _extract_json(text: str) -> dict:
-    s = (text or "").strip()
-    try:
-        return json.loads(s)
-    except Exception:
-        start = s.find("{")
-        end = s.rfind("}")
-        if start != -1 and end != -1 and end > start:
-            return json.loads(s[start:end + 1])
-        raise
+def _model_open(model: str) -> bool:
+    return time.monotonic() >= MODEL_CIRCUIT.get(model, 0.0)
 
 
-def _needs_live_search(user_text: str) -> bool:
-    t = (user_text or "").lower()
-    keys = [
-        "weather", "temperature", "forecast", "rain",
-        "today", "latest", "current", "news", "updates",
-        "stocks", "stock", "share price", "market",
-        "movie", "movies", "trailer", "showtimes", "ipl", "score",
-    ]
-    return any(k in t for k in keys)
-
-
-def _facts_block(facts: Dict[str, str]) -> str:
-    if not facts:
-        return "(none)"
-    return json.dumps(facts, ensure_ascii=False, indent=2)
-
-
-def _context_block(context: list[dict]) -> str:
-    lines = []
-    for c in (context or [])[:10]:
-        meta = c.get("metadata") or {}
-        ts = meta.get("ts", "?")
-        direction = meta.get("direction", "?")
-        txt = (c.get("text") or "").strip()
-        if txt:
-            lines.append(f"- [{ts}] ({direction}): {txt}")
-    return "\n".join(lines) if lines else "(none)"
-
-
-def render_whatsapp(text: str) -> str:
-    """
-    Post-process to avoid ugly tables and make output WhatsApp-friendly.
-    - Converts obvious table rows (with many '|') into bullets.
-    """
-    if not text:
-        return ""
-    s = text.strip()
-
-    # kill markdown tables if they appear
-    if "|" in s and re.search(r"\\|\\s*-{2,}\\s*\\|", s):
-        # crude conversion: keep non-separator lines and bullet them
-        lines = [ln.strip() for ln in s.splitlines() if ln.strip()]
-        lines = [ln for ln in lines if not re.match(r"^\\|?\\s*-{2,}", ln)]
-        bullets = []
-        for ln in lines:
-            ln = ln.strip("|").strip()
-            if ln:
-                bullets.append(f"- {ln.replace('|', ' • ')}")
-        s = "\n".join(bullets)
-
-    # normalize repeated whitespace
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s
+def _pick_model(chat_id: str) -> str:
+    pool = list(settings.groq_model_pool or [])
+    if not pool:
+        return "llama-3.3-70b-versatile"
+    sticky = STICKY_MODEL.get(chat_id)
+    if sticky and _model_open(sticky):
+        return sticky
+    for m in pool:
+        if _model_open(m):
+            STICKY_MODEL[chat_id] = m
+            return m
+    STICKY_MODEL[chat_id] = pool[0]
+    return pool[0]
 
 
 async def init_llm() -> None:
@@ -116,19 +81,61 @@ async def init_llm() -> None:
     logger.info("🧠 llm.init enabled")
 
 
-async def _groq_raw(system: str, user: str, *, model: str, temperature: float, max_tokens: int, extra: dict | None = None) -> str:
+async def close_llm() -> None:
+    return
+
+
+def _extract_json(text: str) -> dict:
+    s = (text or "").strip()
+    return json.loads(s) if s.startswith("{") else json.loads(s[s.find("{"):s.rfind("}")+1])
+
+
+def _needs_live_search(user_text: str) -> bool:
+    t = (user_text or "").lower()
+    keys = ["weather", "temperature", "forecast", "rain", "today", "latest", "current", "news", "update", "stock", "stocks", "price", "movie", "movies"]
+    return any(k in t for k in keys)
+
+
+def _enrich_query(user_text: str, facts: Dict[str, str]) -> str:
+    t = (user_text or "").strip()
+    low = t.lower()
+
+    # Enrich with location/preferences if missing
+    city = facts.get("city") or facts.get("location_city") or facts.get("home_city")
+    country = facts.get("country")
+    topics = facts.get("news_topics") or facts.get("interests")
+    stocks = facts.get("watchlist") or facts.get("stock_watchlist")
+
+    if any(k in low for k in ["weather", "forecast", "temperature", "rain"]) and city and (city.lower() not in low):
+        t = t + f" in {city}"
+        if country and country.lower() not in low:
+            t = t + f", {country}"
+
+    if "news" in low and topics:
+        t = t + f" about {topics}"
+
+    if any(k in low for k in ["stock", "stocks", "price"]) and stocks:
+        t = t + f" for {stocks}"
+
+    return t
+
+
+async def groq_live_search(chat_id: str, query: str) -> str:
     if not GROQ_CLIENT:
         await init_llm()
     if not GROQ_CLIENT:
-        return ""
+        return "Sorry, AI is unavailable right now."
+
     payload = {
-        "model": model,
-        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        "temperature": float(temperature),
-        "max_tokens": int(max_tokens),
+        "model": settings.live_search_model,
+        "messages": [
+            {"role": "system", "content": "Answer for WhatsApp: short, bullets, no tables, no code blocks."},
+            {"role": "user", "content": query},
+        ],
+        "max_tokens": 900,
+        "temperature": 0.2,
+        "compound_custom": {"tools": {"enabled_tools": ["web_search"]}},
     }
-    if extra:
-        payload.update(extra)
 
     async def _call() -> str:
         async with _inflight:
@@ -138,68 +145,96 @@ async def _groq_raw(system: str, user: str, *, model: str, temperature: float, m
     return await async_retry(_call, max_attempts=3, base_delay=0.8, max_delay=10.0)
 
 
-async def groq_live_search(user_text: str, facts: Dict[str, str]) -> str:
-    """
-    Live search with FACTS context (location/preferences/etc) without hard-coding patterns.
-    """
-    model = getattr(settings, "live_search_model", "groq/compound-mini")
-    facts_txt = _facts_block(facts)
+async def _groq_raw(chat_id: str, system: str, user: str, temperature: float, max_tokens: int) -> str:
+    if not GROQ_CLIENT:
+        await init_llm()
+    if not GROQ_CLIENT:
+        return ""
 
-    prompt = (
-        "USER QUESTION:\n" + user_text + "\n\n"
-        "KNOWN FACTS (use only if relevant):\n" + facts_txt + "\n\n"
-        "INSTRUCTIONS:\n"
-        "- Use web search for up-to-date results.\n"
-        "- If location/identity is required and present in facts, use it.\n"
-        "- If missing, ask ONE short follow-up question.\n"
-        "- Respond in WhatsApp-friendly bullets. No tables.\n"
-    )
+    model = _pick_model(chat_id)
+    payload = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        "temperature": float(temperature),
+        "max_tokens": int(max_tokens),
+    }
 
-    extra = {"compound_custom": {"tools": {"enabled_tools": ["web_search"]}}}
-    out = await _groq_raw(
-        system="You may use web search. Keep answers concise and WhatsApp-friendly. No tables.",
-        user=prompt,
-        model=model,
-        temperature=0.2,
-        max_tokens=900,
-        extra=extra,
-    )
-    return render_whatsapp(out or "Sorry, I couldn't fetch that right now.")
+    async def _call() -> str:
+        async with _inflight:
+            resp = await asyncio.to_thread(lambda: GROQ_CLIENT.chat.completions.create(**payload))
+            return (resp.choices[0].message.content or "").strip()
+
+    try:
+        return await async_retry(_call, max_attempts=4, base_delay=0.6, max_delay=8.0)
+    except Exception:
+        MODEL_CIRCUIT[model] = time.monotonic() + (10.0 + random.random() * 4.0)
+        raise
 
 
-async def run_agent(*, chat_id: str, user_text: str, facts: Dict[str, str], context: list[dict]) -> AgentResult:
-    # Live-search path (recommended for weather/news/stocks/movies)
-    if getattr(settings, "live_search_enabled", False) and _needs_live_search(user_text):
-        ans = await groq_live_search(user_text, facts)
-        return AgentResult(reply=ReplyPayload(type="text", text=ans), memory_updates=[])
+async def _verify_updates(chat_id: str, user_text: str, proposed: List[MemoryUpdate]) -> List[MemoryUpdate]:
+    if not proposed:
+        return []
+    if not settings.facts_verification:
+        return proposed
 
-    # Normal librarian path
-    model = (settings.groq_model_pool or ["llama-3.3-70b-versatile"])[0]
-    bundle = (
-        "USER:\n" + user_text + "\n\n"
-        "FACTS:\n" + _facts_block(facts) + "\n\n"
-        "CONTEXT:\n" + _context_block(context) + "\n"
-    )
+    payload = {
+        "user_message": user_text,
+        "proposed": [u.model_dump() for u in proposed],
+    }
+    verifier_user = json.dumps(payload, ensure_ascii=False)
 
-    raw = await _groq_raw(SYSTEM_PROMPT, bundle, model=model, temperature=0.25, max_tokens=900)
+    raw = await _groq_raw(chat_id, VERIFIER_PROMPT, verifier_user, temperature=0.0, max_tokens=450)
+    try:
+        data = _extract_json(raw)
+        vr = VerifyResult.model_validate(data)
+    except Exception:
+        return []
+
+    keep: List[MemoryUpdate] = []
+    for a in vr.approved:
+        if a.confidence >= float(settings.facts_min_conf or 0.85):
+            keep.append(MemoryUpdate(key=str(a.key).strip(), value=str(a.value).strip()))
+    return keep
+
+
+async def run_agent(*, chat_id: str, user_text: str, facts: Dict[str, str], context: List[Dict[str, Any]]) -> AgentResult:
+    # Live search path
+    if settings.live_search_enabled and _needs_live_search(user_text):
+        q = _enrich_query(user_text, facts)
+        ans = await groq_live_search(chat_id, q)
+        return AgentResult(reply=ReplyPayload(type="text", text=sanitize_for_whatsapp(ans)), memory_updates=[])
+
+    # Grounded path
+    bundle = {
+        "user": user_text,
+        "facts": facts,
+        "context": [
+            {
+                "text": c.get("text", ""),
+                "metadata": c.get("metadata", {}),
+            }
+            for c in (context or [])
+        ],
+    }
+
+    raw = await _groq_raw(chat_id, SYSTEM_PROMPT, json.dumps(bundle, ensure_ascii=False), temperature=0.25, max_tokens=900)
+    if settings.debug_agent:
+        logger.info("llm.raw_preview %s", raw[:320])
 
     try:
         data = _extract_json(raw)
     except Exception:
-        repaired = await _groq_raw(REPAIR_PROMPT, raw, model=model, temperature=0.0, max_tokens=500)
+        repaired = await _groq_raw(chat_id, REPAIR_PROMPT, raw, temperature=0.0, max_tokens=550)
         data = _extract_json(repaired)
 
-    # normalize output
-    if isinstance(data.get("reply"), dict) and "text" in data["reply"]:
-        data["reply"]["text"] = render_whatsapp(data["reply"]["text"])
+    result = AgentResult.model_validate(data)
+    # whatsapp formatting safety
+    result.reply.text = sanitize_for_whatsapp(result.reply.text)
 
-    # Back-compat: if model returns memory_update single object, wrap it
-    if "memory_updates" not in data and "memory_update" in data and isinstance(data["memory_update"], dict):
-        data["memory_updates"] = [data["memory_update"]]
-        data.pop("memory_update", None)
+    # verify + keep only deterministic supported updates
+    result.memory_updates = await _verify_updates(chat_id, user_text, result.memory_updates)
 
-    # Ensure memory_updates exists
-    if "memory_updates" not in data:
-        data["memory_updates"] = []
-
-    return AgentResult.model_validate(data)
+    return result
