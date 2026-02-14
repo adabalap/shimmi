@@ -27,8 +27,7 @@ class SQLiteMemory:
             conn.execute("PRAGMA journal_mode=WAL")
             conn.execute("PRAGMA synchronous=NORMAL")
             conn.execute("PRAGMA busy_timeout=3000")
-            conn.execute(
-                """
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_memory(
                     whatsapp_id TEXT NOT NULL,
                     fact_key TEXT NOT NULL,
@@ -36,10 +35,8 @@ class SQLiteMemory:
                     updated_at TEXT NOT NULL,
                     PRIMARY KEY(whatsapp_id, fact_key)
                 )
-                """
-            )
-            conn.execute(
-                """
+            """)
+            conn.execute("""
                 CREATE TABLE IF NOT EXISTS message_log(
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id TEXT NOT NULL,
@@ -50,8 +47,7 @@ class SQLiteMemory:
                     ts TEXT NOT NULL,
                     UNIQUE(chat_id, event_id)
                 )
-                """
-            )
+            """)
             conn.commit()
         logger.info("🗄️ sqlite.ready path=%s", self.path)
 
@@ -81,10 +77,7 @@ class SQLiteMemory:
                         (whatsapp_id, key),
                     ).fetchone()
                     if row is None:
-                        conn.execute(
-                            "INSERT INTO user_memory VALUES (?,?,?,?)",
-                            (whatsapp_id, key, value, now),
-                        )
+                        conn.execute("INSERT INTO user_memory VALUES (?,?,?,?)", (whatsapp_id, key, value, now))
                         conn.commit()
                         return "created"
                     if (row[0] or "").strip() == value:
@@ -97,16 +90,7 @@ class SQLiteMemory:
                     return "updated"
             return await asyncio.to_thread(_do)
 
-    async def log_message(
-        self,
-        *,
-        chat_id: str,
-        whatsapp_id: Optional[str],
-        direction: str,
-        text: str,
-        ts: str,
-        event_id: Optional[str] = None,
-    ) -> None:
+    async def log_message(self, *, chat_id: str, whatsapp_id: Optional[str], direction: str, text: str, ts: str, event_id: Optional[str] = None) -> None:
         if not chat_id or not (text or "").strip():
             return
         async with self._lock:
@@ -130,11 +114,7 @@ class SentenceTransformerEmbedding:
 
     def __call__(self, input: List[str]) -> List[List[float]]:
         emb = self._model.encode(
-            input,
-            batch_size=32,
-            convert_to_numpy=True,
-            normalize_embeddings=True,
-            show_progress_bar=False,
+            input, batch_size=32, convert_to_numpy=True, normalize_embeddings=True, show_progress_bar=False
         )
         return emb.astype("float32").tolist()
 
@@ -164,7 +144,13 @@ class ChromaAmbient:
         if not chat_id or not (text or "").strip():
             return
         doc_id = f"{chat_id}:{message_id}:{direction}"
-        meta = {"chat_id": chat_id, "whatsapp_id": whatsapp_id, "direction": direction, "ts": ts}
+        meta = {
+            "chat_id": chat_id,
+            "whatsapp_id": whatsapp_id,
+            "direction": direction,
+            "ts": ts,
+            "message_id": message_id,
+        }
         await asyncio.to_thread(lambda: self.collection.upsert(ids=[doc_id], documents=[text], metadatas=[meta]))
 
     async def search(self, *, chat_id: str, query: str, k: int) -> List[ContextSnippet]:
@@ -182,7 +168,6 @@ class ChromaAmbient:
         return items[:k]
 
 
-# ✅ module-level singletons (IMPORTANT: main.py must reference via `import app.database as db`)
 sqlite_store: SQLiteMemory | None = None
 chroma_store: ChromaAmbient | None = None
 

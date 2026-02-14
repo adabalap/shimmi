@@ -58,6 +58,16 @@ def trace(step: str, **kw):
     logger.info("🧭 %s | %s", step, " ".join(parts))
 
 
+def is_status_or_broadcast(chat_id: str) -> bool:
+    if not chat_id:
+        return True
+    if chat_id == "status@broadcast":
+        return True
+    if chat_id.endswith("@broadcast"):
+        return True
+    return False
+
+
 def normalize_event(body: dict) -> Tuple[Optional[str], Optional[str], str, bool, str]:
     root = body.get("payload") or body.get("data") or body
     data_obj = root.get("_data") or {}
@@ -91,6 +101,18 @@ def normalize_event(body: dict) -> Tuple[Optional[str], Optional[str], str, bool
     return sender_id, chat_id, text, from_me, event_id
 
 
+def filter_current_event(context_items: list[dict], current_event_id: str) -> list[dict]:
+    if not context_items or not current_event_id:
+        return context_items
+    out = []
+    for c in context_items:
+        meta = c.get("metadata") or {}
+        if str(meta.get("message_id") or "") == str(current_event_id):
+            continue
+        out.append(c)
+    return out
+
+
 async def process_message(chat_id: str, sender_id: str, text: str, event_id: str):
     stop_evt = asyncio.Event()
     keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
@@ -111,23 +133,25 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
                 {"id": c.id, "text": c.text, "metadata": c.metadata, "distance": c.distance}
                 for c in list(merged.values())[:10]
             ]
+            context_items = filter_current_event(context_items, event_id)
+
         trace("BRAIN searched context", chat_id=chat_id, snippets=str(len(context_items)), chroma=str(bool(db.chroma_store)))
 
         trace("BRAIN calling LLM", context_snippets=str(len(context_items)))
         result = await run_agent(chat_id=chat_id, user_text=user_text, facts=facts, context=context_items)
-        trace("BRAIN LLM returned", reply_type=result.reply.type, has_memory_update=str(bool(result.memory_update)))
+        trace("BRAIN LLM returned", reply_type=result.reply.type, has_memory_updates=str(bool(result.memory_updates)))
 
         reply = result.reply
         trace("ACTION sending", chat_id=chat_id, reply_type=reply.type, preview=reply.text[:140])
 
         send_res = {}
         try:
-            if reply.type == "buttons" and getattr(reply, "buttons", None):
-                send_res = await send_buttons(chat_id, reply.text, reply.buttons)  # type: ignore
+            if reply.type == "buttons" and reply.buttons:
+                send_res = await send_buttons(chat_id, reply.text, reply.buttons)
                 if not send_res:
                     send_res = await send_text(chat_id, reply.text)
-            elif reply.type == "list" and getattr(reply, "list", None):
-                send_res = await send_list(chat_id, reply.text, reply.list)  # type: ignore
+            elif reply.type == "list" and reply.list:
+                send_res = await send_list(chat_id, reply.text, reply.list)
                 if not send_res:
                     send_res = await send_text(chat_id, reply.text)
             else:
@@ -136,9 +160,11 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
             trace("ACTION send fallback", err=str(e)[:160])
             send_res = await send_text(chat_id, reply.text)
 
-        allow_store = (not looks_group(chat_id)) or group_allowed(chat_id)
+        # Store outbound (DMs + allowed groups only; never status/broadcast)
+        allow_store = (not is_status_or_broadcast(chat_id)) and ((not looks_group(chat_id)) or group_allowed(chat_id))
         ts_out = datetime.now(UTC).isoformat()
         out_id = str(send_res.get("id") or (send_res.get("message") or {}).get("id") or f"out-{event_id}" or f"out-{int(time.time()*1000)}")
+
         trace("AMBIENT store outbound", allowed=str(allow_store), out_id=out_id)
 
         if allow_store and db.sqlite_store:
@@ -146,9 +172,16 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
         if allow_store and db.chroma_store:
             await db.chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_id, direction="out", text=reply.text, ts=ts_out, message_id=out_id)
 
-        if result.memory_update and db.sqlite_store:
-            status = await db.sqlite_store.upsert_fact(sender_id, result.memory_update.get("key", ""), result.memory_update.get("value", ""))
-            trace("MEMORY upsert", status=status, sender_id=sender_id, key=result.memory_update.get("key", ""))
+        # ✅ Multi memory updates (generic)
+        updates = result.memory_updates or []
+        if db.sqlite_store and updates:
+            for kv in updates:
+                key = (kv.key or "").strip()
+                val = (kv.value or "").strip()
+                if not key or not val:
+                    continue
+                status = await db.sqlite_store.upsert_fact(sender_id, key, val)
+                trace("MEMORY upsert", status=status, sender_id=sender_id, key=key)
 
         trace("BRAIN end", chat_id=chat_id)
 
@@ -170,13 +203,9 @@ async def startup():
     log_startup_env(
         logger,
         keys=[
-            "DATA_DIR",
-            "WAHA_API_URL",
-            "WAHA_SESSION",
-            "CHROMA_ENABLED",
-            "ALLOWED_GROUP_JIDS",
-            "ALLOW_FROM_ME_MESSAGES",
-            "ALLOW_NLP_WITHOUT_PREFIX",
+            "DATA_DIR", "WAHA_API_URL", "WAHA_SESSION",
+            "CHROMA_ENABLED", "ALLOWED_GROUP_JIDS",
+            "ALLOW_FROM_ME_MESSAGES", "ALLOW_NLP_WITHOUT_PREFIX",
             "LIVE_SEARCH_ENABLED",
         ],
     )
@@ -231,12 +260,17 @@ async def webhook(request: Request):
         trace("WEBHOOK ignored", reason="missing_ids")
         return JSONResponse({"status": "ok", "message": "missing ids"})
 
-    # ✅ privacy boundary
+    # ✅ never store/respond to status/broadcast
+    if is_status_or_broadcast(chat_id):
+        trace("WEBHOOK ignored", reason="status_or_broadcast", chat_id=chat_id)
+        return JSONResponse({"status": "ok", "message": "ignored"})
+
+    # ✅ privacy boundary: disallowed groups => no store, no reply
     if looks_group(chat_id) and not group_allowed(chat_id):
         trace("WEBHOOK ignored", reason="group_not_allowed", chat_id=chat_id)
         return JSONResponse({"status": "ok", "message": "group not allowed"})
 
-    # --- strong echo protection ---
+    # echo protection
     nowt = time.time()
     for k, ts in list(OUTBOUND_CACHE_IDS.items()):
         if nowt - ts > OUTBOUND_TTL_SEC:
@@ -255,17 +289,18 @@ async def webhook(request: Request):
             trace("WEBHOOK ignored", reason="echo_cache_text_hash", chat_id=chat_id)
             return JSONResponse({"status": "ok", "message": "echo ignored"})
 
-    # fromMe handling (self-test mode)
+    # fromMe self-test mode
     if from_me and not settings.allow_from_me_messages:
         trace("WEBHOOK ignored", reason="from_me_true and ALLOW_FROM_ME_MESSAGES=0", chat_id=chat_id)
         return JSONResponse({"status": "ok", "message": "fromMe ignored"})
     if from_me and settings.allow_from_me_messages:
         trace("WEBHOOK allowed", reason="from_me_true self-test mode (not echo)", chat_id=chat_id)
 
-    # Ambient store inbound (DMs + allowed groups)
+    # store inbound (DMs + allowed groups only)
     cleaned_in = strip_prefix((text or "").strip())
     ts_in = datetime.now(UTC).isoformat()
     allow_store = (not looks_group(chat_id)) or group_allowed(chat_id)
+
     trace("AMBIENT store inbound", allowed=str(allow_store), chat_id=chat_id, length=str(len(cleaned_in)))
 
     if allow_store and db.sqlite_store and cleaned_in:
@@ -273,7 +308,7 @@ async def webhook(request: Request):
     if allow_store and db.chroma_store and cleaned_in:
         await db.chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_id, direction="in", text=cleaned_in, ts=ts_in, message_id=event_id or f"in-{int(time.time()*1000)}")
 
-    # Group prefix gating
+    # group prefix gating
     if (looks_group(chat_id) or looks_broadcast(chat_id)) and not has_prefix(text):
         trace("WEBHOOK gated", gate="group_prefix", chat_id=chat_id, text=(text or "")[:120])
         return JSONResponse({"status": "ok", "message": "no group prefix"})

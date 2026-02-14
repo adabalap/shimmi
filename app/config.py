@@ -7,19 +7,16 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-
 def _bool(v: str | None, default: bool = False) -> bool:
     if v is None:
         return default
     return str(v).strip().lower() in ("1", "true", "yes", "y", "on")
-
 
 def _int(v: str | None, default: int) -> int:
     try:
         return int(str(v).strip())
     except Exception:
         return default
-
 
 @dataclass(frozen=True)
 class Settings:
@@ -31,7 +28,7 @@ class Settings:
     bot_command_prefix: str = os.getenv("BOT_COMMAND_PREFIX", "@shimmi,shimmi")
     allow_nlp_without_prefix: bool = _bool(os.getenv("ALLOW_NLP_WITHOUT_PREFIX", "1"), True)
 
-    # ✅ allow processing fromMe messages (self-chat) ONLY when not echo-cached
+    # allow processing fromMe messages (self-test), still loop-safe via echo cache
     allow_from_me_messages: bool = _bool(os.getenv("ALLOW_FROM_ME_MESSAGES", "0"), False)
 
     # WAHA
@@ -40,7 +37,6 @@ class Settings:
     waha_session: str = os.getenv("WAHA_SESSION", "default")
     webhook_secret: str = os.getenv("WEBHOOK_SECRET", "")
 
-    # Group allow list
     allowed_group_jids: list[str] = None
 
     # LLM (Groq)
@@ -49,7 +45,7 @@ class Settings:
     groq_timeout: float = float(os.getenv("GROQ_TIMEOUT", "60"))
     groq_max_inflight: int = _int(os.getenv("GROQ_MAX_INFLIGHT", "5"), 5)
 
-    # ✅ Live web search (optional)
+    # Live search (Groq compound web_search)
     live_search_enabled: bool = _bool(os.getenv("LIVE_SEARCH_ENABLED", "0"), False)
     live_search_model: str = os.getenv("LIVE_SEARCH_MODEL", "groq/compound-mini")
 
@@ -69,8 +65,6 @@ class Settings:
     log_level: str = os.getenv("LOG_LEVEL", "INFO")
     log_format: str = os.getenv("LOG_FORMAT", "%(asctime)s %(levelname)s %(name)s:%(message)s")
     access_log_level: str = os.getenv("ACCESS_LOG_LEVEL", "WARNING")
-    log_outbound_preview: bool = _bool(os.getenv("LOG_OUTBOUND_PREVIEW", "1"), True)
-    log_outbound_text: bool = _bool(os.getenv("LOG_OUTBOUND_TEXT", "0"), False)
 
     def __post_init__(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
@@ -79,11 +73,7 @@ class Settings:
         object.__setattr__(self, "allowed_group_jids", allow or None)
 
         pool = [s.strip() for s in os.getenv("GROQ_MODEL_POOL", "").split(",") if s.strip()]
-        object.__setattr__(
-            self,
-            "groq_model_pool",
-            pool or ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
-        )
+        object.__setattr__(self, "groq_model_pool", pool or ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"])
 
     @property
     def sqlite_path(self) -> Path:
@@ -94,6 +84,5 @@ class Settings:
         d = self.data_dir / "chroma"
         d.mkdir(parents=True, exist_ok=True)
         return d
-
 
 settings = Settings()
