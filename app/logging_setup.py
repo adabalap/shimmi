@@ -14,6 +14,5 @@ def setup_logging() -> None:
     logging.getLogger("uvicorn.access").setLevel(getattr(logging, access_level, logging.WARNING))
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    # silence chroma telemetry
     logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
     logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)

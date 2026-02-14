@@ -17,8 +17,6 @@ UTC = timezone.utc
 
 
 class SQLiteMemory:
-    """SQLite facts store + message log."""
-
     def __init__(self, path):
         self.path = str(path)
         self._lock = asyncio.Lock()
@@ -72,7 +70,6 @@ class SQLiteMemory:
         value = (value or "").strip()
         if not key or not value:
             return "unchanged"
-
         async with self._lock:
             def _do() -> str:
                 now = datetime.now(UTC).isoformat()
@@ -80,18 +77,12 @@ class SQLiteMemory:
                     cur = conn.execute("SELECT fact_value FROM user_memory WHERE whatsapp_id=? AND fact_key=?", (whatsapp_id, key))
                     row = cur.fetchone()
                     if row is None:
-                        conn.execute(
-                            "INSERT INTO user_memory (whatsapp_id, fact_key, fact_value, updated_at) VALUES (?,?,?,?)",
-                            (whatsapp_id, key, value, now),
-                        )
+                        conn.execute("INSERT INTO user_memory (whatsapp_id, fact_key, fact_value, updated_at) VALUES (?,?,?,?)", (whatsapp_id, key, value, now))
                         conn.commit()
                         return "created"
                     if (row[0] or "").strip() == value:
                         return "unchanged"
-                    conn.execute(
-                        "UPDATE user_memory SET fact_value=?, updated_at=? WHERE whatsapp_id=? AND fact_key=?",
-                        (value, now, whatsapp_id, key),
-                    )
+                    conn.execute("UPDATE user_memory SET fact_value=?, updated_at=? WHERE whatsapp_id=? AND fact_key=?", (value, now, whatsapp_id, key))
                     conn.commit()
                     return "updated"
             return await asyncio.to_thread(_do)
@@ -103,10 +94,7 @@ class SQLiteMemory:
             def _do() -> None:
                 with sqlite3.connect(self.path) as conn:
                     try:
-                        conn.execute(
-                            "INSERT INTO message_log (chat_id, whatsapp_id, direction, event_id, text, ts) VALUES (?,?,?,?,?,?)",
-                            (chat_id, whatsapp_id or "", direction, event_id or None, text, ts),
-                        )
+                        conn.execute("INSERT INTO message_log (chat_id, whatsapp_id, direction, event_id, text, ts) VALUES (?,?,?,?,?,?)", (chat_id, whatsapp_id or "", direction, event_id or None, text, ts))
                         conn.commit()
                     except sqlite3.IntegrityError:
                         pass
@@ -133,10 +121,7 @@ class ContextSnippet:
 
 class ChromaAmbient:
     def __init__(self, persist_dir, collection_name: str, embed_model: str):
-        self.client = chromadb.PersistentClient(
-            path=str(persist_dir),
-            settings=ChromaSettings(anonymized_telemetry=False),
-        )
+        self.client = chromadb.PersistentClient(path=str(persist_dir), settings=ChromaSettings(anonymized_telemetry=False))
         self.collection = self.client.get_or_create_collection(
             name=collection_name,
             metadata={"hnsw:space": "cosine"},
