@@ -16,7 +16,7 @@ from .config import settings
 from .utils import (
     verify_signature, canonical_text, has_prefix, strip_invocation,
     compile_prefix_re, chat_is_allowed, canonical_user_key
-)
+, normalize_whatsapp_id)
 import app.database as database
 from .waha_provider import (
     init_waha, close_waha, send_text, typing_keepalive,
@@ -132,7 +132,7 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
     stop_evt = asyncio.Event()
     keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
 
-    sender_key = canonical_user_key(sender_id) or (sender_id or "")
+    sender_key = normalize_whatsapp_id(sender_id) or (sender_id or "")
 
     try:
         user_text = strip_invocation((text or "").strip())
@@ -275,7 +275,7 @@ async def webhook(request: Request):
         log_allowed(chat_id, "↪️ webhook.ignore", reason="echo")
         return JSONResponse({"status": "ok", "message": "echo ignored"})
 
-    sender_key = canonical_user_key(sender_id) or (sender_id or "")
+    sender_key = normalize_whatsapp_id(sender_id) or (sender_id or "")
     
     await _ambient_store(chat_id=chat_id, sender_key=sender_key, text=text or "", event_id=event_id)
 
