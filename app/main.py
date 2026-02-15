@@ -374,4 +374,130 @@ async def webhook(request: Request):
 
 @app.get("/healthz")
 async def health():
-    return {"status": "ok"}
+    """Comprehensive health check for monitoring systems"""
+    checks = {
+        "status": "healthy",
+        "timestamp": datetime.now(UTC).isoformat(),
+        "checks": {
+            "database": {"status": "unknown", "message": ""},
+            "chroma": {"status": "unknown", "message": ""},
+            "llm": {"status": "unknown", "message": ""},
+            "waha": {"status": "unknown", "message": ""}
+        }
+    }
+
+    overall_healthy = True
+
+    # Check SQLite
+    try:
+        if database.sqlite_store:
+            # Try a simple query
+            test_facts = await database.sqlite_store.get_all_facts("_health_check_")
+            checks["checks"]["database"] = {
+                "status": "healthy",
+                "message": "SQLite operational"
+            }
+        else:
+            checks["checks"]["database"] = {
+                "status": "degraded",
+                "message": "SQLite not initialized"
+            }
+            overall_healthy = False
+    except Exception as e:
+        checks["checks"]["database"] = {
+            "status": "unhealthy",
+            "message": f"SQLite error: {str(e)[:100]}"
+        }
+        overall_healthy = False
+
+    # Check ChromaDB
+    try:
+        if database.chroma_store:
+            # Try to count documents
+            count = await asyncio.to_thread(
+                lambda: database.chroma_store.collection.count()
+            )
+            checks["checks"]["chroma"] = {
+                "status": "healthy",
+                "message": f"ChromaDB operational ({count} docs)"
+            }
+        else:
+            checks["checks"]["chroma"] = {
+                "status": "disabled",
+                "message": "ChromaDB disabled"
+            }
+    except Exception as e:
+        checks["checks"]["chroma"] = {
+            "status": "unhealthy",
+            "message": f"ChromaDB error: {str(e)[:100]}"
+        }
+        overall_healthy = False
+
+    # Check LLM
+    try:
+        from .agent_engine import GROQ_CLIENT
+        if GROQ_CLIENT:
+            checks["checks"]["llm"] = {
+                "status": "healthy",
+                "message": "Groq client initialized"
+            }
+        else:
+            checks["checks"]["llm"] = {
+                "status": "unhealthy",
+                "message": "LLM not initialized"
+            }
+            overall_healthy = False
+    except Exception as e:
+        checks["checks"]["llm"] = {
+            "status": "unhealthy",
+            "message": f"LLM error: {str(e)[:100]}"
+        }
+        overall_healthy = False
+
+    # Check WAHA connection
+    try:
+        from .waha_provider import waha_client
+        if waha_client:
+            checks["checks"]["waha"] = {
+                "status": "healthy",
+                "message": "WAHA client initialized"
+            }
+        else:
+            checks["checks"]["waha"] = {
+                "status": "unhealthy",
+                "message": "WAHA not initialized"
+            }
+            overall_healthy = False
+    except Exception as e:
+        checks["checks"]["waha"] = {
+            "status": "unhealthy",
+            "message": f"WAHA error: {str(e)[:100]}"
+        }
+        overall_healthy = False
+
+    # Set overall status
+    if not overall_healthy:
+        checks["status"] = "unhealthy"
+        status_code = 503
+    elif any(c["status"] == "degraded" for c in checks["checks"].values()):
+        checks["status"] = "degraded"
+        status_code = 200
+    else:
+        checks["status"] = "healthy"
+        status_code = 200
+
+    return JSONResponse(checks, status_code=status_code)
+
+
+@app.get("/metrics")
+async def metrics():
+    """Expose basic metrics for monitoring"""
+    return {
+        "queues": {
+            chat_id: q.qsize()
+            for chat_id, q in CHAT_QUEUES.items()
+        },
+        "active_workers": len(CHAT_WORKERS),
+        "outbound_cache_size": len(OUTBOUND_CACHE_IDS),
+    }
+

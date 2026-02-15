@@ -136,25 +136,95 @@ class ChromaAmbient:
         meta = {"chat_id": chat_id, "whatsapp_id": whatsapp_id, "direction": direction, "ts": ts}
         await asyncio.to_thread(lambda: self.collection.upsert(ids=[doc_id], documents=[text], metadatas=[meta]))
 
+    #async def search(self, *, chat_id: str, query: str, k: int) -> List[ContextSnippet]:
+    #    res = await asyncio.to_thread(lambda: self.collection.query(query_texts=[query], n_results=k, where={"chat_id": chat_id}))
+    #    out: List[ContextSnippet] = []
+    #    ids = res.get("ids", [[]])[0]
+    #    docs = res.get("documents", [[]])[0]
+    #    metas = res.get("metadatas", [[]])[0]
+    #    dists = res.get("distances", [[]])[0] if res.get("distances") else [None] * len(ids)
+    #    for _id, doc, meta, dist in zip(ids, docs, metas, dists):
+    #        out.append(ContextSnippet(id=_id, text=doc, metadata=meta or {}, distance=dist))
+    #    return out
+
+    #async def recent_window(self, *, chat_id: str, k: int) -> List[ContextSnippet]:
+    #    res = await asyncio.to_thread(lambda: self.collection.get(where={"chat_id": chat_id}, limit=max(50, k * 5), include=["documents", "metadatas"]))
+    #    items: List[ContextSnippet] = []
+    #    for _id, doc, meta in zip(res.get("ids", []), res.get("documents", []), res.get("metadatas", [])):
+    #        items.append(ContextSnippet(id=_id, text=doc, metadata=meta or {}, distance=None))
+    #    items.sort(key=lambda x: x.metadata.get("ts", ""), reverse=True)
+    #    return items[:k]
     async def search(self, *, chat_id: str, query: str, k: int) -> List[ContextSnippet]:
-        res = await asyncio.to_thread(lambda: self.collection.query(query_texts=[query], n_results=k, where={"chat_id": chat_id}))
+     """Search with dynamic k to prevent warnings"""
+
+        # Get actual count first
+        try:
+            count = await asyncio.to_thread(
+                lambda: self.collection.count(where={"chat_id": chat_id})
+            )
+        except Exception:
+            count = 0
+
+        # Adjust k to actual available items
+        actual_k = min(k, max(count, 1))
+
+        if actual_k == 0:
+            return []
+
+        res = await asyncio.to_thread(
+            lambda: self.collection.query(
+                query_texts=[query],
+                n_results=actual_k,
+                where={"chat_id": chat_id}
+            )
+        )
+
         out: List[ContextSnippet] = []
         ids = res.get("ids", [[]])[0]
         docs = res.get("documents", [[]])[0]
         metas = res.get("metadatas", [[]])[0]
         dists = res.get("distances", [[]])[0] if res.get("distances") else [None] * len(ids)
+
         for _id, doc, meta, dist in zip(ids, docs, metas, dists):
             out.append(ContextSnippet(id=_id, text=doc, metadata=meta or {}, distance=dist))
+
         return out
 
     async def recent_window(self, *, chat_id: str, k: int) -> List[ContextSnippet]:
-        res = await asyncio.to_thread(lambda: self.collection.get(where={"chat_id": chat_id}, limit=max(50, k * 5), include=["documents", "metadatas"]))
+        """Get recent messages with dynamic sizing"""
+
+        # Get count first
+        try:
+            count = await asyncio.to_thread(
+                lambda: self.collection.count(where={"chat_id": chat_id})
+            )
+        except Exception:
+            count = 0
+
+        if count == 0:
+            return []
+
+        # Fetch more than needed for sorting
+        fetch_limit = max(min(count, 50), k * 5)
+
+        res = await asyncio.to_thread(
+            lambda: self.collection.get(
+                where={"chat_id": chat_id},
+                limit=fetch_limit,
+                include=["documents", "metadatas"]
+            )
+        )
+
         items: List[ContextSnippet] = []
-        for _id, doc, meta in zip(res.get("ids", []), res.get("documents", []), res.get("metadatas", [])):
+        for _id, doc, meta in zip(
+            res.get("ids", []),
+            res.get("documents", []),
+            res.get("metadatas", [])
+        ):
             items.append(ContextSnippet(id=_id, text=doc, metadata=meta or {}, distance=None))
+
         items.sort(key=lambda x: x.metadata.get("ts", ""), reverse=True)
         return items[:k]
-
 
 sqlite_store: Optional[SQLiteMemory] = None
 chroma_store: Optional[ChromaAmbient] = None
