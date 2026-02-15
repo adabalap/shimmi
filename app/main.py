@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+import groq
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -112,6 +113,54 @@ def _is_echo(chat_id: str, text: str, event_id: str) -> bool:
     return False
 
 
+#async def process_message(chat_id: str, sender_id: str, text: str, event_id: str, from_me: bool) -> None:
+#    stop_evt = asyncio.Event()
+#    keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
+#
+#    sender_key = canonical_user_key(sender_id) or (sender_id or "")
+#
+#    try:
+#        user_text = strip_invocation((text or "").strip())
+#        log_allowed(chat_id, "🧠 flow.begin", chat=str(chat_id), sender=str(sender_id), sender_key=str(sender_key), fromMe=from_me, text=user_text)
+#
+#        facts = await database.sqlite_store.get_all_facts(sender_key) if database.sqlite_store else {}
+#        log_allowed(chat_id, "🧠 facts.loaded", count=len(facts), keys=",".join(list(facts.keys())[:10]))
+#
+#        context_items: List[Dict[str, Any]] = []
+#        if database.chroma_store:
+#            rel = await database.chroma_store.search(chat_id=chat_id, query=user_text, k=settings.chroma_top_k)
+#            rec = await database.chroma_store.recent_window(chat_id=chat_id, k=settings.chroma_recent_k)
+#            merged = {c.id: c for c in (rel + rec)}
+#            context_items = [{"id": c.id, "text": c.text, "metadata": c.metadata, "distance": c.distance} for c in list(merged.values())[:10]]
+#
+#        result = await run_agent(chat_id=chat_id, user_text=user_text, facts=facts, context=context_items)
+#
+#        send_res = await send_text(chat_id, result.reply.text)
+#        log_allowed(chat_id, "🧠 flow.action", sent=bool(send_res), id=str(send_res.get("id") or ""))
+#
+#        ts_out = datetime.now(UTC).isoformat()
+#        out_id = str(send_res.get("id") or (send_res.get("message") or {}).get("id") or ("out-" + event_id) or ("out-" + str(int(time.time()*1000))))
+#        if database.sqlite_store:
+#            await database.sqlite_store.log_message(chat_id=chat_id, whatsapp_id=sender_key, direction="out", text=result.reply.text, ts=ts_out, event_id=out_id)
+#        if database.chroma_store:
+#            await database.chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_key, direction="out", text=result.reply.text, ts=ts_out, message_id=out_id)
+#
+#        if database.sqlite_store:
+#            if result.memory_updates:
+#                for mu in result.memory_updates:
+#                    status = await database.sqlite_store.upsert_fact(sender_key, mu.key, mu.value)
+#                    log_allowed(chat_id, "🧠 memory", status=status, key=mu.key)
+#            else:
+#                log_allowed(chat_id, "🧠 memory", status="none")
+#
+#        log_allowed(chat_id, "🧠 flow.end")
+#
+#    finally:
+#        stop_evt.set()
+#        try:
+#            await keepalive_task
+#        except Exception:
+#            pass
 async def process_message(chat_id: str, sender_id: str, text: str, event_id: str, from_me: bool) -> None:
     stop_evt = asyncio.Event()
     keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
@@ -120,10 +169,10 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
 
     try:
         user_text = strip_invocation((text or "").strip())
-        log_allowed(chat_id, "🧠 flow.begin", chat=str(chat_id), sender=str(sender_id), sender_key=str(sender_key), fromMe=from_me, text=user_text)
+        log_allowed(chat_id, "🧠  flow.begin", chat=str(chat_id), sender=str(sender_id), sender_key=str(sender_key), fromMe=from_me, text=user_text)
 
         facts = await database.sqlite_store.get_all_facts(sender_key) if database.sqlite_store else {}
-        log_allowed(chat_id, "🧠 facts.loaded", count=len(facts), keys=",".join(list(facts.keys())[:10]))
+        log_allowed(chat_id, "🧠  facts.loaded", count=len(facts), keys=",".join(list(facts.keys())[:10]))
 
         context_items: List[Dict[str, Any]] = []
         if database.chroma_store:
@@ -132,34 +181,56 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
             merged = {c.id: c for c in (rel + rec)}
             context_items = [{"id": c.id, "text": c.text, "metadata": c.metadata, "distance": c.distance} for c in list(merged.values())[:10]]
 
+        # NEW: Extract and save memory BEFORE calling agent
+        # This ensures we don't lose facts if the agent fails
+        from .agent_engine import _extract_memory, _verify_updates
+
+        proposed = await _extract_memory(chat_id, user_text)
+        verified_early = await _verify_updates(chat_id, user_text, proposed)
+
+        if verified_early and database.sqlite_store:
+            for mu in verified_early:
+                status = await database.sqlite_store.upsert_fact(sender_key, mu.key, mu.value)
+                log_allowed(chat_id, "🧠  memory.early_save", status=status, key=mu.key)
+            # Reload facts to include newly saved ones
+            facts = await database.sqlite_store.get_all_facts(sender_key)
+
+        # Now call agent with potentially updated facts
         result = await run_agent(chat_id=chat_id, user_text=user_text, facts=facts, context=context_items)
 
         send_res = await send_text(chat_id, result.reply.text)
-        log_allowed(chat_id, "🧠 flow.action", sent=bool(send_res), id=str(send_res.get("id") or ""))
+        log_allowed(chat_id, "🧠  flow.action", sent=bool(send_res), id=str(send_res.get("id") or ""))
 
         ts_out = datetime.now(UTC).isoformat()
         out_id = str(send_res.get("id") or (send_res.get("message") or {}).get("id") or ("out-" + event_id) or ("out-" + str(int(time.time()*1000))))
+
         if database.sqlite_store:
             await database.sqlite_store.log_message(chat_id=chat_id, whatsapp_id=sender_key, direction="out", text=result.reply.text, ts=ts_out, event_id=out_id)
         if database.chroma_store:
             await database.chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_key, direction="out", text=result.reply.text, ts=ts_out, message_id=out_id)
 
-        if database.sqlite_store:
-            if result.memory_updates:
-                for mu in result.memory_updates:
-                    status = await database.sqlite_store.upsert_fact(sender_key, mu.key, mu.value)
-                    log_allowed(chat_id, "🧠 memory", status=status, key=mu.key)
-            else:
-                log_allowed(chat_id, "🧠 memory", status="none")
+        # Save any additional memory updates from agent
+        if database.sqlite_store and result.memory_updates:
+            for mu in result.memory_updates:
+                # Skip if already saved in early_save
+                if any(e.key == mu.key and e.value == mu.value for e in verified_early):
+                    continue
+                status = await database.sqlite_store.upsert_fact(sender_key, mu.key, mu.value)
+                log_allowed(chat_id, "🧠  memory", status=status, key=mu.key)
 
-        log_allowed(chat_id, "🧠 flow.end")
+        log_allowed(chat_id, "🧠  flow.end")
 
+    except Exception as e:
+        # Even if processing failed, at least we saved the extracted memory
+        logger.exception("process_message.failed chat=%s", chat_id)
+        raise
     finally:
         stop_evt.set()
         try:
             await keepalive_task
         except Exception:
             pass
+
 
 
 @app.on_event("startup")
@@ -234,20 +305,60 @@ async def webhook(request: Request):
         q = asyncio.Queue(maxsize=settings.llm_max_queue_per_chat)
         CHAT_QUEUES[chat_id] = q
 
+        #async def _worker():
+        #    log_allowed(chat_id, "🧵 worker.spawned")
+        #    try:
+        #        while True:
+        #            item = await q.get()
+        #            try:
+        #                await process_message(chat_id=chat_id, sender_id=item["sender_id"], text=item["text"], event_id=item["event_id"], from_me=item["from_me"])
+        #            except Exception:
+        #                logger.exception("worker.error chat=%s", chat_id)
+        #            finally:
+        #                q.task_done()
+        #    except asyncio.CancelledError:
+        #        pass
+
         async def _worker():
-            log_allowed(chat_id, "🧵 worker.spawned")
+            log_allowed(chat_id, "🧵  worker.spawned")
             try:
                 while True:
                     item = await q.get()
                     try:
-                        await process_message(chat_id=chat_id, sender_id=item["sender_id"], text=item["text"], event_id=item["event_id"], from_me=item["from_me"])
-                    except Exception:
+                        await process_message(
+                            chat_id=chat_id,
+                            sender_id=item["sender_id"],
+                            text=item["text"],
+                            event_id=item["event_id"],
+                            from_me=item["from_me"]
+                        )
+                    except groq.RateLimitError as e:
+                        # Specific handling for rate limits
+                        logger.error("worker.rate_limit chat=%s error=%s", chat_id, str(e)[:200])
+                        await send_text(
+                            chat_id,
+                            "I'm temporarily at capacity. Please try again in a few minutes. 🙏"
+                        )
+                    except Exception as e:
+                        # Generic error handling
                         logger.exception("worker.error chat=%s", chat_id)
+                        error_type = type(e).__name__
+        
+                        # Give user a helpful message
+                        if "timeout" in str(e).lower():
+                            msg = "Request timed out. Please try again. ⏱️ "
+                        elif "network" in str(e).lower() or "connection" in str(e).lower():
+                            msg = "Network issue. Please try again shortly. 🌐"
+                        else:
+                            msg = "I encountered an error. Please try rephrasing or try again later. 🤖"
+        
+                        await send_text(chat_id, msg)
                     finally:
                         q.task_done()
             except asyncio.CancelledError:
+                log_allowed(chat_id, "🧵  worker.cancelled")
                 pass
-
+                            
         CHAT_WORKERS[chat_id] = asyncio.create_task(_worker())
 
     try:

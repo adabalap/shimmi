@@ -22,6 +22,9 @@ from .prompts import (
     LIVE_SEARCH_PROMPT,
 )
 from .utils import sanitize_for_whatsapp
+from .rate_limit_manager import rate_limiter
+
+__all__ = ['init_llm', 'close_llm', 'run_agent', '_extract_memory', '_verify_updates']
 
 logger = logging.getLogger("app.agent")
 
@@ -148,6 +151,18 @@ async def _groq_raw(chat_id: str, system: str, user: str, temperature: float, ma
         MODEL_CIRCUIT[model] = time.monotonic() + (10.0 + random.random() * 4.0)
         raise
 
+    try:
+        return await async_retry(_call, max_attempts=4, base_delay=0.6, max_delay=8.0)
+    except Exception as e:
+        # Check if it's a rate limit error
+        error_str = str(e).lower()
+        if "rate" in error_str and "limit" in error_str:
+            # Record the failure to update our rate limiter
+            await rate_limiter.record_failure()
+            logger.error("groq.rate_limit_exceeded error=%s", str(e)[:200])
+
+        MODEL_CIRCUIT[model] = time.monotonic() + (10.0 + random.random() * 4.0)
+        raise
 
 async def _format_whatsapp(chat_id: str, text: str) -> str:
     raw = await _groq_raw(chat_id, FORMATTER_PROMPT, text, temperature=0.0, max_tokens=350)
@@ -239,6 +254,16 @@ def _locale_present(facts: Dict[str, str]) -> bool:
 
 
 async def run_agent(*, chat_id: str, user_text: str, facts: Dict[str, str], context: List[Dict[str, Any]]) -> AgentResult:
+    # STEP 1: Check rate limits BEFORE processing
+    # Estimate: planner(500) + memory(400) + main_agent(900) = ~1800 tokens
+    allowed, error_msg = await rate_limiter.check_and_reserve(estimated_tokens=1800)
+    if not allowed:
+        logger.warning("rate_limit.blocked chat=%s", chat_id)
+        return AgentResult(
+            reply=ReplyPayload(type="text", text=error_msg),
+            memory_updates=[]
+        )
+
     proposed = await _extract_memory(chat_id, user_text)
     verified = await _verify_updates(chat_id, user_text, proposed)
 
