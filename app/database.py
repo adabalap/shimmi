@@ -155,7 +155,7 @@ class ChromaAmbient:
     #    items.sort(key=lambda x: x.metadata.get("ts", ""), reverse=True)
     #    return items[:k]
     async def search(self, *, chat_id: str, query: str, k: int) -> List[ContextSnippet]:
-     """Search with dynamic k to prevent warnings"""
+        """Search with dynamic k to prevent warnings"""
 
         # Get actual count first
         try:
