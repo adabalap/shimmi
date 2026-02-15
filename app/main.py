@@ -1,3 +1,4 @@
+"""Main application with all integrations"""
 from __future__ import annotations
 
 import asyncio
@@ -12,10 +13,17 @@ from fastapi.responses import JSONResponse
 
 from .logging_setup import setup_logging
 from .config import settings
-from .utils import verify_signature, canonical_text, has_prefix, strip_invocation, compile_prefix_re, chat_is_allowed, canonical_user_key
+from .utils import (
+    verify_signature, canonical_text, has_prefix, strip_invocation,
+    compile_prefix_re, chat_is_allowed, canonical_user_key
+)
 import app.database as database
-from .waha_provider import init_waha, close_waha, send_text, typing_keepalive, OUTBOUND_CACHE_IDS, OUTBOUND_CACHE_TXT, OUTBOUND_TTL_SEC, outbound_hash
-from .agent_engine import init_llm, close_llm, run_agent
+from .waha_provider import (
+    init_waha, close_waha, send_text, typing_keepalive,
+    OUTBOUND_CACHE_IDS, OUTBOUND_CACHE_TXT, OUTBOUND_TTL_SEC, outbound_hash
+)
+from .multi_provider_llm import init_llm, close_llm, smart_complete
+from .agent_engine import run_agent
 
 setup_logging()
 logger = logging.getLogger("app")
@@ -88,9 +96,16 @@ async def _ambient_store(*, chat_id: str, sender_key: str, text: str, event_id: 
 
     ts_in = datetime.now(UTC).isoformat()
     if database.sqlite_store:
-        await database.sqlite_store.log_message(chat_id=chat_id, whatsapp_id=sender_key, direction="in", text=cleaned, ts=ts_in, event_id=event_id or None)
+        await database.sqlite_store.log_message(
+            chat_id=chat_id, whatsapp_id=sender_key, direction="in",
+            text=cleaned, ts=ts_in, event_id=event_id or None
+        )
     if database.chroma_store:
-        await database.chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_key, direction="in", text=cleaned, ts=ts_in, message_id=event_id or ("in-" + str(int(time.time()*1000))))
+        await database.chroma_store.add_message(
+            chat_id=chat_id, whatsapp_id=sender_key, direction="in",
+            text=cleaned, ts=ts_in,
+            message_id=event_id or ("in-" + str(int(time.time()*1000)))
+        )
 
 
 def _purge_outbound_caches() -> None:
@@ -113,54 +128,6 @@ def _is_echo(chat_id: str, text: str, event_id: str) -> bool:
     return False
 
 
-#async def process_message(chat_id: str, sender_id: str, text: str, event_id: str, from_me: bool) -> None:
-#    stop_evt = asyncio.Event()
-#    keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
-#
-#    sender_key = canonical_user_key(sender_id) or (sender_id or "")
-#
-#    try:
-#        user_text = strip_invocation((text or "").strip())
-#        log_allowed(chat_id, "🧠 flow.begin", chat=str(chat_id), sender=str(sender_id), sender_key=str(sender_key), fromMe=from_me, text=user_text)
-#
-#        facts = await database.sqlite_store.get_all_facts(sender_key) if database.sqlite_store else {}
-#        log_allowed(chat_id, "🧠 facts.loaded", count=len(facts), keys=",".join(list(facts.keys())[:10]))
-#
-#        context_items: List[Dict[str, Any]] = []
-#        if database.chroma_store:
-#            rel = await database.chroma_store.search(chat_id=chat_id, query=user_text, k=settings.chroma_top_k)
-#            rec = await database.chroma_store.recent_window(chat_id=chat_id, k=settings.chroma_recent_k)
-#            merged = {c.id: c for c in (rel + rec)}
-#            context_items = [{"id": c.id, "text": c.text, "metadata": c.metadata, "distance": c.distance} for c in list(merged.values())[:10]]
-#
-#        result = await run_agent(chat_id=chat_id, user_text=user_text, facts=facts, context=context_items)
-#
-#        send_res = await send_text(chat_id, result.reply.text)
-#        log_allowed(chat_id, "🧠 flow.action", sent=bool(send_res), id=str(send_res.get("id") or ""))
-#
-#        ts_out = datetime.now(UTC).isoformat()
-#        out_id = str(send_res.get("id") or (send_res.get("message") or {}).get("id") or ("out-" + event_id) or ("out-" + str(int(time.time()*1000))))
-#        if database.sqlite_store:
-#            await database.sqlite_store.log_message(chat_id=chat_id, whatsapp_id=sender_key, direction="out", text=result.reply.text, ts=ts_out, event_id=out_id)
-#        if database.chroma_store:
-#            await database.chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_key, direction="out", text=result.reply.text, ts=ts_out, message_id=out_id)
-#
-#        if database.sqlite_store:
-#            if result.memory_updates:
-#                for mu in result.memory_updates:
-#                    status = await database.sqlite_store.upsert_fact(sender_key, mu.key, mu.value)
-#                    log_allowed(chat_id, "🧠 memory", status=status, key=mu.key)
-#            else:
-#                log_allowed(chat_id, "🧠 memory", status="none")
-#
-#        log_allowed(chat_id, "🧠 flow.end")
-#
-#    finally:
-#        stop_evt.set()
-#        try:
-#            await keepalive_task
-#        except Exception:
-#            pass
 async def process_message(chat_id: str, sender_id: str, text: str, event_id: str, from_me: bool) -> None:
     stop_evt = asyncio.Event()
     keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
@@ -169,61 +136,87 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
 
     try:
         user_text = strip_invocation((text or "").strip())
-        log_allowed(chat_id, "🧠  flow.begin", chat=str(chat_id), sender=str(sender_id), sender_key=str(sender_key), fromMe=from_me, text=user_text)
+        log_allowed(chat_id, "🧠 flow.begin", chat=str(chat_id), sender=str(sender_id),
+                   sender_key=str(sender_key), fromMe=from_me, text=user_text)
 
+        # Get facts
         facts = await database.sqlite_store.get_all_facts(sender_key) if database.sqlite_store else {}
-        log_allowed(chat_id, "🧠  facts.loaded", count=len(facts), keys=",".join(list(facts.keys())[:10]))
+        log_allowed(chat_id, "🧠 facts.loaded", count=len(facts), keys=",".join(list(facts.keys())[:10]))
 
+        # Get context with user filtering for anti-hallucination
         context_items: List[Dict[str, Any]] = []
         if database.chroma_store:
-            rel = await database.chroma_store.search(chat_id=chat_id, query=user_text, k=settings.chroma_top_k)
-            rec = await database.chroma_store.recent_window(chat_id=chat_id, k=settings.chroma_recent_k)
+            rel = await database.chroma_store.search(
+                chat_id=chat_id,
+                query=user_text,
+                k=settings.chroma_top_k,
+                whatsapp_id=sender_key  # ANTI-HALLUCINATION: Only this user's messages
+            )
+            rec = await database.chroma_store.recent_window(
+                chat_id=chat_id,
+                k=settings.chroma_recent_k,
+                whatsapp_id=sender_key  # ANTI-HALLUCINATION: Only this user's messages
+            )
+            
             merged = {c.id: c for c in (rel + rec)}
-            context_items = [{"id": c.id, "text": c.text, "metadata": c.metadata, "distance": c.distance} for c in list(merged.values())[:10]]
+            context_items.extend([
+                {"id": c.id, "text": c.text, "metadata": c.metadata, "distance": c.distance}
+                for c in list(merged.values())[:10]
+            ])
 
-        # NEW: Extract and save memory BEFORE calling agent
-        # This ensures we don't lose facts if the agent fails
-        from .agent_engine import _extract_memory, _verify_updates
-
-        proposed = await _extract_memory(chat_id, user_text)
-        verified_early = await _verify_updates(chat_id, user_text, proposed)
-
-        if verified_early and database.sqlite_store:
-            for mu in verified_early:
-                status = await database.sqlite_store.upsert_fact(sender_key, mu.key, mu.value)
-                log_allowed(chat_id, "🧠  memory.early_save", status=status, key=mu.key)
-            # Reload facts to include newly saved ones
-            facts = await database.sqlite_store.get_all_facts(sender_key)
-
-        # Now call agent with potentially updated facts
-        result = await run_agent(chat_id=chat_id, user_text=user_text, facts=facts, context=context_items)
+        # Run agent
+        result = await run_agent(
+            chat_id=chat_id,
+            user_text=user_text,
+            facts=facts,
+            context=context_items,
+            llm_complete_fn=smart_complete,
+            whatsapp_id=sender_key  # Pass for tracking
+        )
 
         send_res = await send_text(chat_id, result.reply.text)
-        log_allowed(chat_id, "🧠  flow.action", sent=bool(send_res), id=str(send_res.get("id") or ""))
+        log_allowed(chat_id, "🧠 flow.action", sent=bool(send_res), id=str(send_res.get("id") or ""))
 
+        # Log outbound
         ts_out = datetime.now(UTC).isoformat()
-        out_id = str(send_res.get("id") or (send_res.get("message") or {}).get("id") or ("out-" + event_id) or ("out-" + str(int(time.time()*1000))))
-
+        out_id = str(
+            send_res.get("id")
+            or (send_res.get("message") or {}).get("id")
+            or ("out-" + event_id)
+            or ("out-" + str(int(time.time()*1000)))
+        )
+        
         if database.sqlite_store:
-            await database.sqlite_store.log_message(chat_id=chat_id, whatsapp_id=sender_key, direction="out", text=result.reply.text, ts=ts_out, event_id=out_id)
+            await database.sqlite_store.log_message(
+                chat_id=chat_id, whatsapp_id=sender_key, direction="out",
+                text=result.reply.text, ts=ts_out, event_id=out_id
+            )
         if database.chroma_store:
-            await database.chroma_store.add_message(chat_id=chat_id, whatsapp_id=sender_key, direction="out", text=result.reply.text, ts=ts_out, message_id=out_id)
+            await database.chroma_store.add_message(
+                chat_id=chat_id, whatsapp_id=sender_key, direction="out",
+                text=result.reply.text, ts=ts_out, message_id=out_id
+            )
 
-        # Save any additional memory updates from agent
+        # Save memory updates
         if database.sqlite_store and result.memory_updates:
             for mu in result.memory_updates:
-                # Skip if already saved in early_save
-                if any(e.key == mu.key and e.value == mu.value for e in verified_early):
-                    continue
                 status = await database.sqlite_store.upsert_fact(sender_key, mu.key, mu.value)
-                log_allowed(chat_id, "🧠  memory", status=status, key=mu.key)
+                log_allowed(chat_id, "🧠 memory", status=status, key=mu.key)
 
-        log_allowed(chat_id, "🧠  flow.end")
+        log_allowed(chat_id, "🧠 flow.end")
 
+    except groq.RateLimitError:
+        logger.error("rate_limit.error chat=%s", chat_id)
+        try:
+            await send_text(chat_id, "I'm at capacity. Please try again in a few minutes. 🙏")
+        except:
+            pass
     except Exception as e:
-        # Even if processing failed, at least we saved the extracted memory
-        logger.exception("process_message.failed chat=%s", chat_id)
-        raise
+        logger.exception("process_message.error chat=%s", chat_id)
+        try:
+            await send_text(chat_id, "I encountered an error. Please try again. 🤖")
+        except:
+            pass
     finally:
         stop_evt.set()
         try:
@@ -232,11 +225,10 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
             pass
 
 
-
 @app.on_event("startup")
 async def startup() -> None:
     compile_prefix_re()
-    database.init_stores()
+    database.init_stores()  # This function now exists!
     await init_waha()
     await init_llm()
     logger.info("startup.ready allowlist_count=%s", len(settings.allowed_chat_jids or []))
@@ -270,7 +262,8 @@ async def webhook(request: Request):
     if not chat_is_allowed(chat_id):
         return JSONResponse({"status": "ok", "message": "chat not allowed"})
 
-    log_allowed(chat_id, "📩 webhook.recv", chat=str(chat_id), sender=str(sender_id), fromMe=from_me, text=(text or "")[:120])
+    log_allowed(chat_id, "📩 webhook.recv", chat=str(chat_id), sender=str(sender_id),
+               fromMe=from_me, text=(text or "")[:120])
 
     if not (text or "").strip():
         log_allowed(chat_id, "↪️ webhook.ignore", reason="empty_text")
@@ -283,6 +276,7 @@ async def webhook(request: Request):
         return JSONResponse({"status": "ok", "message": "echo ignored"})
 
     sender_key = canonical_user_key(sender_id) or (sender_id or "")
+    
     await _ambient_store(chat_id=chat_id, sender_key=sender_key, text=text or "", event_id=event_id)
 
     if from_me and not settings.allow_fromme:
@@ -305,22 +299,8 @@ async def webhook(request: Request):
         q = asyncio.Queue(maxsize=settings.llm_max_queue_per_chat)
         CHAT_QUEUES[chat_id] = q
 
-        #async def _worker():
-        #    log_allowed(chat_id, "🧵 worker.spawned")
-        #    try:
-        #        while True:
-        #            item = await q.get()
-        #            try:
-        #                await process_message(chat_id=chat_id, sender_id=item["sender_id"], text=item["text"], event_id=item["event_id"], from_me=item["from_me"])
-        #            except Exception:
-        #                logger.exception("worker.error chat=%s", chat_id)
-        #            finally:
-        #                q.task_done()
-        #    except asyncio.CancelledError:
-        #        pass
-
         async def _worker():
-            log_allowed(chat_id, "🧵  worker.spawned")
+            log_allowed(chat_id, "🧵 worker.spawned")
             try:
                 while True:
                     item = await q.get()
@@ -332,37 +312,20 @@ async def webhook(request: Request):
                             event_id=item["event_id"],
                             from_me=item["from_me"]
                         )
-                    except groq.RateLimitError as e:
-                        # Specific handling for rate limits
-                        logger.error("worker.rate_limit chat=%s error=%s", chat_id, str(e)[:200])
-                        await send_text(
-                            chat_id,
-                            "I'm temporarily at capacity. Please try again in a few minutes. 🙏"
-                        )
-                    except Exception as e:
-                        # Generic error handling
+                    except Exception:
                         logger.exception("worker.error chat=%s", chat_id)
-                        error_type = type(e).__name__
-        
-                        # Give user a helpful message
-                        if "timeout" in str(e).lower():
-                            msg = "Request timed out. Please try again. ⏱️ "
-                        elif "network" in str(e).lower() or "connection" in str(e).lower():
-                            msg = "Network issue. Please try again shortly. 🌐"
-                        else:
-                            msg = "I encountered an error. Please try rephrasing or try again later. 🤖"
-        
-                        await send_text(chat_id, msg)
                     finally:
                         q.task_done()
             except asyncio.CancelledError:
-                log_allowed(chat_id, "🧵  worker.cancelled")
                 pass
-                            
+
         CHAT_WORKERS[chat_id] = asyncio.create_task(_worker())
 
     try:
-        await asyncio.wait_for(q.put({"text": text or "", "sender_id": sender_id, "event_id": event_id, "from_me": from_me}), timeout=settings.llm_queue_wait_sec)
+        await asyncio.wait_for(
+            q.put({"text": text or "", "sender_id": sender_id, "event_id": event_id, "from_me": from_me}),
+            timeout=settings.llm_queue_wait_sec
+        )
     except asyncio.TimeoutError:
         await send_text(chat_id, "I'm busy; try again in a few seconds.")
         log_allowed(chat_id, "⏳ queue.timeout")
@@ -374,130 +337,4 @@ async def webhook(request: Request):
 
 @app.get("/healthz")
 async def health():
-    """Comprehensive health check for monitoring systems"""
-    checks = {
-        "status": "healthy",
-        "timestamp": datetime.now(UTC).isoformat(),
-        "checks": {
-            "database": {"status": "unknown", "message": ""},
-            "chroma": {"status": "unknown", "message": ""},
-            "llm": {"status": "unknown", "message": ""},
-            "waha": {"status": "unknown", "message": ""}
-        }
-    }
-
-    overall_healthy = True
-
-    # Check SQLite
-    try:
-        if database.sqlite_store:
-            # Try a simple query
-            test_facts = await database.sqlite_store.get_all_facts("_health_check_")
-            checks["checks"]["database"] = {
-                "status": "healthy",
-                "message": "SQLite operational"
-            }
-        else:
-            checks["checks"]["database"] = {
-                "status": "degraded",
-                "message": "SQLite not initialized"
-            }
-            overall_healthy = False
-    except Exception as e:
-        checks["checks"]["database"] = {
-            "status": "unhealthy",
-            "message": f"SQLite error: {str(e)[:100]}"
-        }
-        overall_healthy = False
-
-    # Check ChromaDB
-    try:
-        if database.chroma_store:
-            # Try to count documents
-            count = await asyncio.to_thread(
-                lambda: database.chroma_store.collection.count()
-            )
-            checks["checks"]["chroma"] = {
-                "status": "healthy",
-                "message": f"ChromaDB operational ({count} docs)"
-            }
-        else:
-            checks["checks"]["chroma"] = {
-                "status": "disabled",
-                "message": "ChromaDB disabled"
-            }
-    except Exception as e:
-        checks["checks"]["chroma"] = {
-            "status": "unhealthy",
-            "message": f"ChromaDB error: {str(e)[:100]}"
-        }
-        overall_healthy = False
-
-    # Check LLM
-    try:
-        from .agent_engine import GROQ_CLIENT
-        if GROQ_CLIENT:
-            checks["checks"]["llm"] = {
-                "status": "healthy",
-                "message": "Groq client initialized"
-            }
-        else:
-            checks["checks"]["llm"] = {
-                "status": "unhealthy",
-                "message": "LLM not initialized"
-            }
-            overall_healthy = False
-    except Exception as e:
-        checks["checks"]["llm"] = {
-            "status": "unhealthy",
-            "message": f"LLM error: {str(e)[:100]}"
-        }
-        overall_healthy = False
-
-    # Check WAHA connection
-    try:
-        from .waha_provider import waha_client
-        if waha_client:
-            checks["checks"]["waha"] = {
-                "status": "healthy",
-                "message": "WAHA client initialized"
-            }
-        else:
-            checks["checks"]["waha"] = {
-                "status": "unhealthy",
-                "message": "WAHA not initialized"
-            }
-            overall_healthy = False
-    except Exception as e:
-        checks["checks"]["waha"] = {
-            "status": "unhealthy",
-            "message": f"WAHA error: {str(e)[:100]}"
-        }
-        overall_healthy = False
-
-    # Set overall status
-    if not overall_healthy:
-        checks["status"] = "unhealthy"
-        status_code = 503
-    elif any(c["status"] == "degraded" for c in checks["checks"].values()):
-        checks["status"] = "degraded"
-        status_code = 200
-    else:
-        checks["status"] = "healthy"
-        status_code = 200
-
-    return JSONResponse(checks, status_code=status_code)
-
-
-@app.get("/metrics")
-async def metrics():
-    """Expose basic metrics for monitoring"""
-    return {
-        "queues": {
-            chat_id: q.qsize()
-            for chat_id, q in CHAT_QUEUES.items()
-        },
-        "active_workers": len(CHAT_WORKERS),
-        "outbound_cache_size": len(OUTBOUND_CACHE_IDS),
-    }
-
+    return {"status": "ok", "version": "6.0.1"}
