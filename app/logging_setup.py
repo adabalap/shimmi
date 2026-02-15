@@ -1,5 +1,4 @@
 from __future__ import annotations
-
 import logging
 import os
 
@@ -12,7 +11,7 @@ def setup_logging() -> None:
 
     access_level = os.getenv("ACCESS_LOG_LEVEL", "WARNING").upper()
     logging.getLogger("uvicorn.access").setLevel(getattr(logging, access_level, logging.WARNING))
-    logging.getLogger("httpx").setLevel(logging.WARNING)
 
+    logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("chromadb.telemetry").setLevel(logging.CRITICAL)
     logging.getLogger("chromadb.telemetry.product.posthog").setLevel(logging.CRITICAL)

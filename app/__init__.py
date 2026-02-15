@@ -1,2 +1,2 @@
-"""Shimmi Bot V6 - Final Complete"""
-__version__ = "6.0.2"
+"""Shimmi Bot - Token Optimized"""
+__version__ = "6.1.0"
