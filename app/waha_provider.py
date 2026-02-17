@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from typing import Dict, Optional
 
@@ -38,6 +39,32 @@ def _purge_outbound() -> None:
             OUTBOUND_CACHE_TXT.pop(k, None)
 
 
+def _emoji_prefix(text: str) -> str:
+    """
+    Prefix outbound responses with BOT_EMOJI if enabled.
+    Uses:
+      BOT_EMOJI=🤖
+      BOT_EMOJI_PREFIX_ENABLED=1
+    """
+    enabled = str(os.getenv("BOT_EMOJI_PREFIX_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "y", "on")
+    if not enabled:
+        return text
+
+    emoji = (os.getenv("BOT_EMOJI") or "").strip()
+    if not emoji:
+        return text
+
+    s = (text or "").lstrip()
+    if not s:
+        return s
+
+    # Don't double-prefix
+    if s.startswith(emoji):
+        return s
+
+    return f"{emoji} {s}"
+
+
 async def init_waha() -> None:
     global HTTPX_WAHA
     if HTTPX_WAHA:
@@ -49,6 +76,7 @@ async def init_waha() -> None:
     async with _init_lock:
         if HTTPX_WAHA:
             return
+
         limits = httpx.Limits(max_keepalive_connections=10, max_connections=20)
         headers = {"X-Api-Key": settings.waha_api_key} if settings.waha_api_key else None
         timeout = httpx.Timeout(connect=5.0, read=30.0, write=30.0, pool=5.0)
@@ -119,19 +147,20 @@ async def send_text(chat_id: str, text: str) -> dict:
     if not HTTPX_WAHA:
         return {}
 
-    msg = sanitize_for_whatsapp(text or "")
+    # Apply bot emoji prefix (if enabled), then sanitize
+    msg = _emoji_prefix(text or "")
+    msg = sanitize_for_whatsapp(msg)
     if not msg:
         return {}
 
     _purge_outbound()
-
     h = outbound_hash(chat_id, msg)
+
     payload = {"session": settings.waha_session, "chatId": chat_id, "text": msg}
     data = await _post("sendText", payload)
 
     msg_id = data.get("id") or (data.get("message") or {}).get("id")
     if msg_id:
         OUTBOUND_CACHE_IDS[str(msg_id)] = time.time()
-
-    OUTBOUND_CACHE_TXT[h] = time.time()
+        OUTBOUND_CACHE_TXT[h] = time.time()
     return data

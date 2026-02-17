@@ -74,6 +74,27 @@ class SQLiteMemory:
                 """
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_message_log_chat_ts ON message_log(chat_id, ts DESC)")
+            # Check if importance column exists, add if missing
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(user_memory)").fetchall()]
+
+            if "importance" not in cols:
+                conn.execute("ALTER TABLE user_memory ADD COLUMN importance REAL DEFAULT 0.5")
+                logger.info("schema.migration added importance column")
+
+            if "source" not in cols:
+                conn.execute("ALTER TABLE user_memory ADD COLUMN source TEXT DEFAULT 'user_stated'")
+                conn.execute("CREATE INDEX IF NOT EXISTS idx_memory_source ON user_memory(whatsapp_id, source)")
+                logger.info("schema.migration added source column")
+
+            if "confidence" not in cols:
+                conn.execute("ALTER TABLE user_memory ADD COLUMN confidence REAL DEFAULT 1.0")
+                logger.info("schema.migration added confidence column")
+
+            if "frequency" not in cols:
+                conn.execute("ALTER TABLE user_memory ADD COLUMN frequency INTEGER DEFAULT 1")
+                logger.info("schema.migration added frequency column")
+
+            #conn.commit()
 
             # --- Safe schema drift migration (no non-constant defaults) ---
             cols = [r[1] for r in conn.execute("PRAGMA table_info(user_memory)").fetchall()]
@@ -111,7 +132,17 @@ class SQLiteMemory:
 
             return await asyncio.to_thread(_do)
 
-    async def upsert_fact(self, whatsapp_id: str, key: str, value: str) -> str:
+    #async def upsert_fact(self, whatsapp_id: str, key: str, value: str) -> str:
+    async def upsert_fact(
+        self,
+        whatsapp_id: str,
+        key: str,
+        value: str,
+        importance: float = 0.5,    # ADD
+        source: str = "user_stated", # ADD
+        confidence: float = 1.0      # ADD
+        ) -> str:
+
         """Upsert a fact"""
         key = (key or "").strip()
         value = (value or "").strip()
@@ -146,6 +177,18 @@ class SQLiteMemory:
                     )
                     conn.commit()
                     return "updated"
+                    # In INSERT query (line 132-136), add new columns:
+                    conn.execute(
+                        "INSERT INTO user_memory (whatsapp_id, fact_key, fact_value, importance, source, confidence, frequency, created_at, updated_at) "
+                        "VALUES (?,?,?,?,?,?,?,?,?)",
+                        (whatsapp_id, key, value, importance, source, confidence, 1, now, now),
+                        )
+
+                    # In UPDATE query (line 143-147), add:
+                    conn.execute(
+                        "UPDATE user_memory SET fact_value=?, importance=?, confidence=?, frequency=frequency+1, updated_at=? WHERE whatsapp_id=? AND fact_key=?",
+                        (value, importance, confidence, now, whatsapp_id, key),
+                    )
 
             return await asyncio.to_thread(_do)
 

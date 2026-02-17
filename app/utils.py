@@ -1,14 +1,24 @@
 """
 Token-Optimized Utilities
 Includes WhatsApp ID normalization and response caching
+
+Refactor goals:
+- STRICT allowlist: respond only to chat IDs listed in ALLOWED_GROUP_JIDS
+- Prefix detection anywhere in sentence: BOT_COMMAND_PREFIX can appear anywhere
+- Robust prefix stripping
 """
 from __future__ import annotations
 
 import hashlib
 import re
 import time
-from datetime import datetime, timedelta
-from typing import Optional, Dict, Tuple
+from typing import Optional, Dict, Tuple, List
+
+from .config import settings
+
+# ---------------------------------------------------------------------------
+# Hashing / IDs
+# ---------------------------------------------------------------------------
 
 def sha1_hex(data: str | bytes) -> str:
     """
@@ -22,119 +32,88 @@ def sha1_hex(data: str | bytes) -> str:
 
 def normalize_whatsapp_id(raw_id: str) -> str:
     """
-    Normalize WhatsApp ID to ensure consistency
-    
-    CRITICAL: This fixes user isolation issues!
-    
-    Examples:
-        "4930656034916@lid" → "4930656034916"
-        "4930656034916@c.us" → "4930656034916"
-        "4930656034916" → "4930656034916"
-        "919573717667-1370233241@g.us" → "919573717667-1370233241@g.us" (group, keep as-is)
+    Normalize WhatsApp ID to ensure consistency for USER IDs (not chat IDs).
+    - Keeps groups as-is (@g.us)
+    - Strips suffixes for user ids: @lid, @c.us, @s.whatsapp.net
     """
     if not raw_id:
         return ""
-    
-    # Keep group IDs as-is
     if "@g.us" in raw_id:
         return raw_id
-    
-    # Strip @lid and @c.us suffixes for individual users
-    return raw_id.split('@')[0]
+    return raw_id.split("@")[0]
 
+
+# Compatibility alias used by main.py
+canonical_user_key = normalize_whatsapp_id
+
+
+def _normalize_chat_id(chat_id: Optional[str]) -> Optional[str]:
+    """
+    Normalize CHAT IDs for allowlist comparison.
+    - WA sometimes sends @s.whatsapp.net; normalize to @c.us
+    - Keep @lid, @c.us, @g.us as-is otherwise
+    """
+    if not chat_id:
+        return None
+    if chat_id.endswith("@s.whatsapp.net"):
+        return chat_id.replace("@s.whatsapp.net", "@c.us")
+    return chat_id
+
+
+# ---------------------------------------------------------------------------
+# Response Cache (kept mostly as-is)
+# ---------------------------------------------------------------------------
 
 class ResponseCache:
     """
     In-memory response cache to reduce token usage
-    
-    Token savings: ~9,000 tokens per cache hit!
     """
-    
     def __init__(self, ttl_seconds: int = 300):
         self.cache: Dict[str, Tuple[str, float]] = {}
         self.ttl = ttl_seconds
         self.hits = 0
         self.misses = 0
-    
+
     def _make_key(self, user_id: str, query: str, facts: Dict[str, str]) -> str:
-        """Create cache key from user, query, and facts"""
-        # Normalize query
         normalized_query = query.lower().strip()
-        
-        # Sort facts for consistent hashing
-        facts_str = "|".join(f"{k}:{v}" for k, v in sorted(facts.items()))
-        
-        # Create hash
+        facts_str = "\n".join(f"{k}:{v}" for k, v in sorted(facts.items()))
         raw = f"{user_id}:{normalized_query}:{facts_str}"
         return hashlib.md5(raw.encode()).hexdigest()
-    
+
     def get(self, user_id: str, query: str, facts: Dict[str, str]) -> Optional[str]:
-        """Get cached response if available and fresh"""
         key = self._make_key(user_id, query, facts)
-        
         if key in self.cache:
             response, timestamp = self.cache[key]
             age = time.time() - timestamp
-            
             if age < self.ttl:
                 self.hits += 1
-                return response  # Cache hit! 0 tokens used!
-            else:
-                # Expired, remove
-                del self.cache[key]
-        
+                return response
+            del self.cache[key]
         self.misses += 1
         return None
-    
+
     def set(self, user_id: str, query: str, facts: Dict[str, str], response: str):
-        """Cache a response"""
         key = self._make_key(user_id, query, facts)
         self.cache[key] = (response, time.time())
-        
-        # Limit cache size
         if len(self.cache) > 100:
-            # Remove oldest entries
             sorted_items = sorted(self.cache.items(), key=lambda x: x[1][1])
-            for k, _ in sorted_items[:20]:  # Remove 20 oldest
+            for k, _ in sorted_items[:20]:
                 del self.cache[k]
-    
-    def clear_user(self, user_id: str):
-        """Clear all cache entries for a user (when facts change)"""
-        to_remove = []
-        for key in self.cache:
-            # Check if this key belongs to user
-            if user_id in str(key):  # Simple check
-                to_remove.append(key)
-        
-        for key in to_remove:
-            del self.cache[key]
-    
-    def stats(self) -> Dict[str, int]:
-        """Get cache statistics"""
+
+    def stats(self) -> Dict[str, str]:
         total = self.hits + self.misses
-        hit_rate = (self.hits / total * 100) if total > 0 else 0
-        
-        return {
-            "hits": self.hits,
-            "misses": self.misses,
-            "hit_rate": f"{hit_rate:.1f}%",
-            "size": len(self.cache)
-        }
+        hit_rate = (self.hits / total * 100) if total > 0 else 0.0
+        return {"hits": str(self.hits), "misses": str(self.misses), "hit_rate": f"{hit_rate:.1f}%", "size": str(len(self.cache))}
 
 
-# Global cache instance
-response_cache = ResponseCache(ttl_seconds=300)  # 5 minutes
+response_cache = ResponseCache(ttl_seconds=300)
 
+
+# ---------------------------------------------------------------------------
+# Token / context helpers (kept as-is)
+# ---------------------------------------------------------------------------
 
 def should_use_cache(query: str) -> bool:
-    """
-    Determine if query should use cache
-    
-    Don't cache:
-    - Time queries (always current)
-    - Search queries (results change)
-    - "What's new" type queries
-    """
     no_cache_patterns = [
         "what time",
         "current time",
@@ -145,28 +124,19 @@ def should_use_cache(query: str) -> bool:
         "weather",
         "forecast",
     ]
-    
-    query_lower = query.lower()
-    return not any(pattern in query_lower for pattern in no_cache_patterns)
+    q = (query or "").lower()
+    return not any(p in q for p in no_cache_patterns)
 
 
 def estimate_tokens(text: str) -> int:
-    """Rough token estimation (1 token ≈ 4 chars)"""
-    return len(text) // 4
+    return len(text or "") // 4
 
 
 def needs_context(query: str) -> bool:
-    """
-    Determine if query needs conversation context
-    
-    Most factual queries DON'T need context!
-    This saves 8,000+ tokens per query!
-    """
-    # Queries that need ONLY facts, no context
     fact_only_patterns = [
         "what do you know about me",
         "my favorite",
-        "my favourite", 
+        "my favourite",
         "do i have",
         "do i like",
         "where do i",
@@ -177,23 +147,12 @@ def needs_context(query: str) -> bool:
         "what kind of",
         "do i own",
     ]
-    
-    query_lower = query.lower()
-    return not any(pattern in query_lower for pattern in fact_only_patterns)
+    q = (query or "").lower()
+    return not any(p in q for p in fact_only_patterns)
 
 
 def extract_fact_key(query: str) -> Optional[str]:
-    """
-    Extract what fact the user is asking about
-    
-    Examples:
-        "What's my favorite drink?" → "favorite_drink"
-        "What kind of bike do I have?" → "bike"
-        "Where do I live?" → "city" or "location"
-    """
-    query_lower = query.lower()
-    
-    # Patterns to extract
+    q = (query or "").lower()
     patterns = {
         "favorite drink": "favorite_drink",
         "favourite drink": "favorite_drink",
@@ -206,98 +165,143 @@ def extract_fact_key(query: str) -> Optional[str]:
         "location": "location",
         "name": "name",
     }
-    
     for pattern, fact_key in patterns.items():
-        if re.search(pattern, query_lower):
+        if re.search(pattern, q):
             return fact_key
-    
     return None
 
 
 def compress_context(messages: list, max_tokens: int = 500) -> str:
-    """
-    Compress conversation context to summary
-    
-    Token savings: ~7,500 tokens per query!
-    
-    BEFORE: 10 full messages = 8,000 tokens
-    AFTER: Short summary = 500 tokens
-    """
     if not messages:
         return ""
-    
     if len(messages) <= 2:
-        # If only 1-2 messages, return as-is
         return "\n".join(m.get("text", "") for m in messages)
-    
-    # Extract key points
-    topics = []
-    for msg in messages[-5:]:  # Last 5 only
-        text = msg.get("text", "")
-        if len(text) > 100:
-            # Long message, take first line
-            topics.append(text.split('\n')[0][:100])
+
+    topics: List[str] = []
+    for msg in messages[-5:]:
+        txt = msg.get("text", "")
+        if len(txt) > 100:
+            topics.append(txt.split("\n")[0][:100])
         else:
-            topics.append(text)
-    
+            topics.append(txt)
+
     summary = "Recent conversation:\n" + "\n".join(f"- {t}" for t in topics)
-    
-    # Enforce token limit
     if estimate_tokens(summary) > max_tokens:
-        summary = summary[:max_tokens * 4]
-    
+        summary = summary[: max_tokens * 4]
     return summary
 
 
-# Keep original utils from user's code
-canonical_user_key = normalize_whatsapp_id  # Alias for compatibility
-
+# ---------------------------------------------------------------------------
+# WhatsApp formatting / signature
+# ---------------------------------------------------------------------------
 
 def sanitize_for_whatsapp(text: str) -> str:
-    """Sanitize text for WhatsApp"""
-    return text.strip()
+    return (text or "").strip()
 
 
 def verify_signature(raw_body: bytes, signature: Optional[str]) -> bool:
-    """Verify webhook signature"""
-    # Simplified for now - implement proper HMAC verification
+    # Placeholder; you can implement HMAC verification later if needed
     return True
 
 
 def canonical_text(text: str) -> str:
-    """Canonicalize text for comparison"""
-    return text.lower().strip()
+    return (text or "").lower().strip()
+
+
+# ---------------------------------------------------------------------------
+# STRICT allowlist
+# ---------------------------------------------------------------------------
+
+def chat_is_allowed(chat_id: Optional[str]) -> bool:
+    """
+    Strict: respond only if chat_id is listed in ALLOWED_GROUP_JIDS.
+    """
+    cid = _normalize_chat_id(chat_id)
+    if not cid:
+        return False
+    allow = settings.allowed_chat_jids or []
+    # Normalize allowlist entries too
+    allow_norm = {_normalize_chat_id(a.strip()) for a in allow if a and a.strip()}
+    return cid in allow_norm
+
+
+# ---------------------------------------------------------------------------
+# Prefix detection anywhere (compiled regex)
+# ---------------------------------------------------------------------------
+
+_PREFIX_RE: Optional[re.Pattern] = None
+_PREFIX_TOKENS: List[str] = []
+
+def compile_prefix_re() -> None:
+    """
+    Compile prefix regex from settings.bot_command_prefix.
+    Supports prefix tokens anywhere in the sentence, not only at start.
+
+    We match tokens when bounded by start/space/punctuation to avoid matching inside words.
+    """
+    global _PREFIX_RE, _PREFIX_TOKENS
+
+    raw = (settings.bot_command_prefix or "").strip()
+    tokens = [t.strip() for t in raw.split(",") if t.strip()]
+    # Fallback safety
+    if not tokens:
+        tokens = ["@shimmi", "shimmi", "@spock", "spock"]
+
+    _PREFIX_TOKENS = tokens
+
+    # Sort longer first to prevent partial matches (e.g., @shimmi before shimmi)
+    tokens_sorted = sorted(tokens, key=len, reverse=True)
+    alts = "|".join(re.escape(t) for t in tokens_sorted)
+
+    # Boundary: start OR whitespace/punct before and after token
+    # Works better than \b for non-latin tokens too.
+    before = r"(^|[\s,.:;!?()\[\]{}<>\"'“”‘’\-])"
+    after = r"($|[\s,.:;!?()\[\]{}<>\"'“”‘’\-])"
+
+    _PREFIX_RE = re.compile(before + r"(" + alts + r")" + after, flags=re.IGNORECASE)
+
+
+def _ensure_prefix_re():
+    global _PREFIX_RE
+    if _PREFIX_RE is None:
+        compile_prefix_re()
 
 
 def has_prefix(text: str) -> bool:
-    """Check if message has bot prefix"""
+    """
+    True if any BOT_COMMAND_PREFIX token appears anywhere in text.
+    """
     if not text:
         return False
-    prefixes = ["@shimmi", "shimmi", "@spock", "spock"]
-    text_lower = text.lower()
-    return any(text_lower.startswith(p) for p in prefixes)
+    _ensure_prefix_re()
+    assert _PREFIX_RE is not None
+    return _PREFIX_RE.search(text) is not None
 
 
 def strip_invocation(text: str) -> str:
-    """Strip bot invocation prefix"""
+    """
+    Remove the first occurrence of a prefix token (anywhere) and tidy punctuation/spacing.
+    Example:
+      "Hey Spock, what do you know?" -> "Hey what do you know?"
+    """
     if not text:
         return ""
-    prefixes = ["@shimmi", "shimmi", "@spock", "spock"]
-    text_lower = text.lower()
-    for prefix in prefixes:
-        if text_lower.startswith(prefix):
-            return text[len(prefix):].strip(", :")
-    return text
 
+    _ensure_prefix_re()
+    assert _PREFIX_RE is not None
 
-def compile_prefix_re():
-    """Compile prefix regex (placeholder)"""
-    pass
+    m = _PREFIX_RE.search(text)
+    if not m:
+        return text.strip()
 
+    # Remove matched token including surrounding boundary char if it is punctuation/space
+    start, end = m.span(2)  # token group
+    # Remove token only, then clean up
+    out = (text[:start] + text[end:]).strip()
 
-def chat_is_allowed(chat_id: Optional[str]) -> bool:
-    """Check if chat is in allowlist"""
-    if not chat_id:
-        return False
-    # Simplified - implement proper allowlist check
-    return True
+    # Clean up doubled spaces and leftover punctuation patterns like ", ,"
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"\s+([,.:;!?])", r"\1", out)     # no space before punctuation
+    out = re.sub(r"([,.:;!?]){2,}", r"\1", out)    # collapse repeated punctuation
+    out = out.strip(" ,:;")
+    return out.strip()
