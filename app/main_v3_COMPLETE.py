@@ -411,24 +411,13 @@ async def startup() -> None:
         db_path = Path(settings.data_dir) / "shimmi.sqlite"
         reminder_manager = ReminderManager(db_path)
 
-        #reminder_scheduler = await start_reminder_scheduler(
-        #    manager=reminder_manager,
-        #    send_message_fn=send_text,
-        #    check_interval=60
-        #)
-        #
-        #logger.info("⏰ reminder_system.initialized")
-        try:
-            logger.info("⏰ Starting reminder scheduler...")
-            reminder_scheduler = await start_reminder_scheduler(
-                manager=reminder_manager,
-                send_message_fn=send_text,
-                check_interval=60
-            )
-            logger.info("⏰ reminder_scheduler object created: %s", type(reminder_scheduler))
-            logger.info("⏰ reminder_system.initialized")
-        except Exception as e:
-            logger.error("⏰ FAILED to start reminder scheduler: %s", str(e), exc_info=True)
+        reminder_scheduler = await start_reminder_scheduler(
+            manager=reminder_manager,
+            send_message_fn=send_text,
+            check_interval=60
+        )
+
+        logger.info("⏰ reminder_system.initialized")
 
     await init_waha()
     await init_llm()
@@ -485,9 +474,20 @@ async def webhook(request: Request):
         log_allowed(chat_id, "↪️ webhook.ignore", reason="fromMe_disabled")
         return JSONResponse({"status": "ok", "message": "fromMe ignored"})
 
-    if (not settings.allow_nlp_without_prefix) and not has_prefix(text):
-        log_allowed(chat_id, "↪️ webhook.ignore", reason="no_prefix")
-        return JSONResponse({"status": "ok", "message": "no prefix"})
+    # 🔴 NEW v3: Check if this is a reminder command (bypass prefix for reminders)
+    is_reminder_command = False
+    if reminder_manager:
+        from .reminder_commands import detect_command
+        command_type = detect_command(text or "")
+        is_reminder_command = command_type is not None
+        if is_reminder_command:
+            logger.info("📍 reminder.detected type=%s bypass_prefix=True", command_type)
+
+    # 🔴 MODIFIED v3: Only check prefix for non-reminder commands
+    if not is_reminder_command:
+        if (not settings.allow_nlp_without_prefix) and not has_prefix(text):
+            log_allowed(chat_id, "↪️ webhook.ignore", reason="no_prefix")
+            return JSONResponse({"status": "ok", "message": "no prefix"})
 
     last = CHAT_LAST_MSG_TS.get(chat_id, 0.0)
     nowp = time.perf_counter()
@@ -545,17 +545,49 @@ async def health():
 async def reminder_health():
     """Health check for reminder system"""
     if not reminder_scheduler:
-        return JSONResponse({"status": "disabled"}, status_code=503)
+        return JSONResponse({"status": "disabled", "message": "Reminder system not initialized"}, status_code=503)
+    
     try:
         health = await reminder_scheduler.get_health_status()
-        return JSONResponse(health, status_code=200 if health['status']=='healthy' else 503)
+        status_code = 200 if health['status'] == 'healthy' else 503
+        return JSONResponse(health, status_code=status_code)
     except Exception as e:
+        logger.error("reminder.health_error err=%s", str(e))
         return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
+
 
 @app.get("/metrics/reminders")
 async def reminder_metrics():
-    """Metrics endpoint"""
-    if not reminder_scheduler:
-        return JSONResponse({"error": "not_initialized"}, status_code=503)
-    return JSONResponse(reminder_scheduler.metrics.to_dict())
+    """Metrics endpoint for monitoring"""
+    if not reminder_scheduler or not reminder_manager:
+        return JSONResponse({"error": "reminder_system_not_initialized"}, status_code=503)
+    
+    try:
+        metrics = reminder_scheduler.metrics.to_dict()
+        
+        # Add database stats
+        import sqlite3
+        with sqlite3.connect(str(reminder_manager.db_path)) as conn:
+            cursor = conn.execute(
+                """
+                SELECT status, COUNT(*) as count
+                FROM reminders
+                GROUP BY status
+                """
+            )
+            status_counts = {row[0]: row[1] for row in cursor.fetchall()}
+        
+        return JSONResponse({
+            "scheduler": metrics,
+            "database": {
+                "active_reminders": status_counts.get('active', 0),
+                "completed_reminders": status_counts.get('completed', 0),
+                "snoozed_reminders": status_counts.get('snoozed', 0),
+                "overdue_reminders": status_counts.get('overdue', 0),
+                "cancelled_reminders": status_counts.get('cancelled', 0),
+            }
+        })
+    except Exception as e:
+        logger.error("reminder.metrics_error err=%s", str(e))
+        return JSONResponse({"error": str(e)}, status_code=500)
 

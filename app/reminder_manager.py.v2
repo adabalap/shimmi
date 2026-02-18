@@ -1,6 +1,6 @@
 """
-Reminder Manager - v3 PRODUCTION
-Enhanced with count, search, bulk operations, better error handling
+Reminder Manager - CRUD Operations
+Handles all database operations for reminders
 """
 from __future__ import annotations
 
@@ -44,6 +44,7 @@ class Reminder:
             self.notifications_sent = []
     
     def to_dict(self) -> Dict[str, Any]:
+        """Convert to dictionary"""
         return {
             'id': self.id,
             'whatsapp_id': self.whatsapp_id,
@@ -58,15 +59,11 @@ class Reminder:
 
 
 class ReminderManager:
-    """Production-grade reminder manager with enhanced features"""
+    """Manages reminder lifecycle with SQLite backend"""
     
     def __init__(self, db_path: Path):
         self.db_path = str(db_path)
         self._lock = asyncio.Lock()
-    
-    # -------------------------------------------------------------------------
-    # Core CRUD Operations
-    # -------------------------------------------------------------------------
     
     async def create_reminder(
         self,
@@ -84,7 +81,10 @@ class ReminderManager:
         description: Optional[str] = None,
         allow_group_complete: bool = False,
     ) -> int:
-        """Create a new reminder - Returns reminder ID"""
+        """
+        Create a new reminder
+        Returns reminder ID
+        """
         async with self._lock:
             def _do() -> int:
                 now = datetime.now(UTC).isoformat()
@@ -118,6 +118,7 @@ class ReminderManager:
                     )
                     reminder_id = cursor.lastrowid
                     
+                    # Log creation
                     conn.execute(
                         "INSERT INTO reminder_log (reminder_id, action, timestamp, whatsapp_id) VALUES (?, ?, ?, ?)",
                         (reminder_id, 'created', now, whatsapp_id)
@@ -126,8 +127,8 @@ class ReminderManager:
                     conn.commit()
                     
                     logger.info(
-                        "reminder.created id=%d user=%s title=%s due=%s",
-                        reminder_id, whatsapp_id, title[:50], due_iso
+                        "reminder.created id=%d user=%s title=%s due=%s recurrence=%s",
+                        reminder_id, whatsapp_id, title, due_iso, recurrence_type
                     )
                     
                     return reminder_id
@@ -145,7 +146,10 @@ class ReminderManager:
                         (reminder_id,)
                     )
                     row = cursor.fetchone()
-                    return self._row_to_reminder(row) if row else None
+                    
+                    if row:
+                        return self._row_to_reminder(row)
+                    return None
             
             return await asyncio.to_thread(_do)
     
@@ -169,6 +173,7 @@ class ReminderManager:
                         """,
                         (whatsapp_id, status, limit)
                     )
+                    
                     return [self._row_to_reminder(row) for row in cursor.fetchall()]
             
             return await asyncio.to_thread(_do)
@@ -179,11 +184,25 @@ class ReminderManager:
         whatsapp_id: str,
         mark_date: Optional[datetime] = None
     ) -> bool:
-        """Mark reminder as complete"""
+        """
+        Mark reminder as complete
+        
+        For recurring reminders:
+        - Updates to next occurrence
+        - Increments completion count
+        
+        For one-time reminders:
+        - Marks as completed
+        """
         async with self._lock:
             def _do() -> bool:
                 reminder = self.get_reminder_sync(reminder_id)
-                if not reminder or reminder.whatsapp_id != whatsapp_id:
+                if not reminder:
+                    return False
+                
+                # Verify ownership
+                if reminder.whatsapp_id != whatsapp_id:
+                    logger.warning("reminder.complete_denied id=%d user=%s (not owner)", reminder_id, whatsapp_id)
                     return False
                 
                 now = datetime.now(UTC).isoformat()
@@ -191,6 +210,7 @@ class ReminderManager:
                 
                 with sqlite3.connect(self.db_path) as conn:
                     if reminder.recurrence_type == 'once':
+                        # One-time: mark as completed
                         conn.execute(
                             """
                             UPDATE reminders 
@@ -202,9 +222,12 @@ class ReminderManager:
                             """,
                             (completed_at, now, reminder_id)
                         )
-                        logger.info("reminder.completed id=%d", reminder_id)
+                        
+                        logger.info("reminder.completed id=%d title=%s", reminder_id, reminder.title)
                     else:
+                        # Recurring: schedule next occurrence
                         next_due = self._calculate_next_due(reminder)
+                        
                         conn.execute(
                             """
                             UPDATE reminders
@@ -219,12 +242,18 @@ class ReminderManager:
                             """,
                             (next_due.isoformat(), completed_at, now, reminder_id)
                         )
-                        logger.info("reminder.rescheduled id=%d next=%s", reminder_id, next_due)
+                        
+                        logger.info(
+                            "reminder.completed_recurring id=%d next_due=%s",
+                            reminder_id, next_due.isoformat()
+                        )
                     
+                    # Log action
                     conn.execute(
                         "INSERT INTO reminder_log (reminder_id, action, timestamp, whatsapp_id) VALUES (?, ?, ?, ?)",
                         (reminder_id, 'completed', now, whatsapp_id)
                     )
+                    
                     conn.commit()
                     return True
             
@@ -263,9 +292,10 @@ class ReminderManager:
                         "INSERT INTO reminder_log (reminder_id, action, timestamp, details, whatsapp_id) VALUES (?, ?, ?, ?, ?)",
                         (reminder_id, 'snoozed', now.isoformat(), json.dumps({'minutes': minutes}), whatsapp_id)
                     )
+                    
                     conn.commit()
                     
-                    logger.info("reminder.snoozed id=%d mins=%d", reminder_id, minutes)
+                    logger.info("reminder.snoozed id=%d minutes=%d until=%s", reminder_id, minutes, snooze_until)
                     return snooze_until
             
             return await asyncio.to_thread(_do)
@@ -285,99 +315,30 @@ class ReminderManager:
                         "UPDATE reminders SET status = 'cancelled', updated_at = ? WHERE id = ?",
                         (now, reminder_id)
                     )
+                    
                     conn.execute(
                         "INSERT INTO reminder_log (reminder_id, action, timestamp, whatsapp_id) VALUES (?, ?, ?, ?)",
                         (reminder_id, 'cancelled', now, whatsapp_id)
                     )
+                    
                     conn.commit()
                     
-                    logger.info("reminder.cancelled id=%d", reminder_id)
+                    logger.info("reminder.cancelled id=%d title=%s", reminder_id, reminder.title)
                     return True
             
             return await asyncio.to_thread(_do)
     
-    # -------------------------------------------------------------------------
-    # NEW: Production Features
-    # -------------------------------------------------------------------------
-    
-    async def count_active_reminders(self, whatsapp_id: str) -> int:
-        """Count active reminders for a user"""
-        async with self._lock:
-            def _do() -> int:
-                with sqlite3.connect(self.db_path) as conn:
-                    cursor = conn.execute(
-                        "SELECT COUNT(*) FROM reminders WHERE whatsapp_id = ? AND status = 'active'",
-                        (whatsapp_id,)
-                    )
-                    return cursor.fetchone()[0]
-            
-            return await asyncio.to_thread(_do)
-    
-    async def search_reminders(
-        self,
-        whatsapp_id: str,
-        query: Optional[str] = None,
-        category: Optional[str] = None,
-        status: str = 'active',
-        limit: int = 50
-    ) -> List[Reminder]:
-        """Advanced search with filters"""
-        async with self._lock:
-            def _do() -> List[Reminder]:
-                with sqlite3.connect(self.db_path) as conn:
-                    conn.row_factory = sqlite3.Row
-                    
-                    sql = "SELECT * FROM reminders WHERE whatsapp_id = ? AND status = ?"
-                    params = [whatsapp_id, status]
-                    
-                    if query:
-                        sql += " AND (title LIKE ? OR description LIKE ?)"
-                        params.extend([f'%{query}%', f'%{query}%'])
-                    
-                    if category:
-                        sql += " AND category = ?"
-                        params.append(category)
-                    
-                    sql += " ORDER BY due_datetime ASC LIMIT ?"
-                    params.append(limit)
-                    
-                    cursor = conn.execute(sql, params)
-                    return [self._row_to_reminder(row) for row in cursor.fetchall()]
-            
-            return await asyncio.to_thread(_do)
-    
-    async def bulk_delete(
-        self,
-        whatsapp_id: str,
-        reminder_ids: List[int]
-    ) -> tuple[int, int]:
-        """Bulk delete reminders. Returns (success_count, fail_count)"""
-        success = 0
-        fail = 0
-        
-        for rid in reminder_ids:
-            result = await self.cancel_reminder(rid, whatsapp_id)
-            if result:
-                success += 1
-            else:
-                fail += 1
-        
-        logger.info("reminder.bulk_delete user=%s success=%d fail=%d", whatsapp_id, success, fail)
-        return success, fail
-    
-    # -------------------------------------------------------------------------
-    # Scheduler Query Methods
-    # -------------------------------------------------------------------------
-    
     async def get_due_reminders(self, check_time: Optional[datetime] = None) -> List[Reminder]:
-        """Get reminders that are due now"""
+        """Get reminders that are due now (for scheduler)"""
         if check_time is None:
-            check_time = datetime.now()
+            check_time = datetime.now(UTC)
         
         async with self._lock:
             def _do() -> List[Reminder]:
                 with sqlite3.connect(self.db_path) as conn:
                     conn.row_factory = sqlite3.Row
+                    
+                    # Get active reminders that are due
                     cursor = conn.execute(
                         """
                         SELECT * FROM reminders
@@ -388,6 +349,7 @@ class ReminderManager:
                         """,
                         (check_time.isoformat(),)
                     )
+                    
                     return [self._row_to_reminder(row) for row in cursor.fetchall()]
             
             return await asyncio.to_thread(_do)
@@ -399,7 +361,7 @@ class ReminderManager:
     ) -> List[Reminder]:
         """Get reminders needing advance notification"""
         if check_time is None:
-            check_time = datetime.now()
+            check_time = datetime.now(UTC)
         
         target_time = check_time + timedelta(minutes=minutes_before)
         alert_key = f"advance_{minutes_before}"
@@ -408,6 +370,7 @@ class ReminderManager:
             def _do() -> List[Reminder]:
                 with sqlite3.connect(self.db_path) as conn:
                     conn.row_factory = sqlite3.Row
+                    
                     cursor = conn.execute(
                         """
                         SELECT * FROM reminders
@@ -424,6 +387,7 @@ class ReminderManager:
                             f'%"{alert_key}"%'
                         )
                     )
+                    
                     return [self._row_to_reminder(row) for row in cursor.fetchall()]
             
             return await asyncio.to_thread(_do)
@@ -433,6 +397,7 @@ class ReminderManager:
         async with self._lock:
             def _do():
                 with sqlite3.connect(self.db_path) as conn:
+                    # Get current notifications_sent
                     cursor = conn.execute(
                         "SELECT notifications_sent FROM reminders WHERE id = ?",
                         (reminder_id,)
@@ -447,22 +412,22 @@ class ReminderManager:
                     
                     conn.execute(
                         "UPDATE reminders SET notifications_sent = ?, updated_at = ? WHERE id = ?",
-                        (json.dumps(sent), datetime.now().isoformat(), reminder_id)
+                        (json.dumps(sent), datetime.now(UTC).isoformat(), reminder_id)
                     )
+                    
                     conn.execute(
                         "INSERT INTO reminder_log (reminder_id, action, timestamp, details) VALUES (?, ?, ?, ?)",
-                        (reminder_id, 'notified', datetime.now().isoformat(), json.dumps({'type': notification_type}))
+                        (reminder_id, 'notified', datetime.now(UTC).isoformat(), json.dumps({'type': notification_type}))
                     )
+                    
                     conn.commit()
             
             await asyncio.to_thread(_do)
     
-    # -------------------------------------------------------------------------
-    # Helper Methods
-    # -------------------------------------------------------------------------
+    # Helper methods
     
     def get_reminder_sync(self, reminder_id: int) -> Optional[Reminder]:
-        """Synchronous get for use within transactions"""
+        """Synchronous get (for use within transactions)"""
         with sqlite3.connect(self.db_path) as conn:
             conn.row_factory = sqlite3.Row
             cursor = conn.execute("SELECT * FROM reminders WHERE id = ?", (reminder_id,))
@@ -502,6 +467,8 @@ class ReminderManager:
         elif reminder.recurrence_type == 'weekly':
             return current_due + timedelta(weeks=1)
         elif reminder.recurrence_type == 'monthly':
+            # Approximate: add 30 days
             return current_due + timedelta(days=30)
         else:
+            # Default: same time tomorrow
             return current_due + timedelta(days=1)

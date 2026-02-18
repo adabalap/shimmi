@@ -540,22 +540,3 @@ async def webhook(request: Request):
 @app.get("/healthz")
 async def health():
     return {"status": "ok", "version": "6.0.1"}
-
-@app.get("/health/reminders")
-async def reminder_health():
-    """Health check for reminder system"""
-    if not reminder_scheduler:
-        return JSONResponse({"status": "disabled"}, status_code=503)
-    try:
-        health = await reminder_scheduler.get_health_status()
-        return JSONResponse(health, status_code=200 if health['status']=='healthy' else 503)
-    except Exception as e:
-        return JSONResponse({"status": "error", "error": str(e)}, status_code=500)
-
-@app.get("/metrics/reminders")
-async def reminder_metrics():
-    """Metrics endpoint"""
-    if not reminder_scheduler:
-        return JSONResponse({"error": "not_initialized"}, status_code=503)
-    return JSONResponse(reminder_scheduler.metrics.to_dict())
-
