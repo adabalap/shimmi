@@ -1,380 +1,631 @@
 """
-Agent Integration for Reminder Commands
-Handles user interaction with the reminder system
+Reminder Commands - v3 PRODUCTION
+Full validation, rate limiting, duplicate detection, rich UX
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
-from datetime import datetime
-from typing import Optional, Dict, Any, List
+import time
+from datetime import datetime, timedelta
+from typing import Optional, Tuple, List
+from difflib import SequenceMatcher
 
 from .reminder_manager import ReminderManager, Reminder
-from .reminder_parser import ReminderParser, ReminderData
-from .reminder_scheduler import NOTIFICATION_TEMPLATES
+from .reminder_parser import ReminderParser
 
 logger = logging.getLogger("app.reminder_commands")
 
 
-class ReminderCommands:
-    """Handle reminder-related user commands"""
+# ---------------------------------------------------------------------------
+# Production Configuration
+# ---------------------------------------------------------------------------
+
+class ReminderConfig:
+    MAX_TITLE_LENGTH = 200
+    MAX_DESCRIPTION_LENGTH = 1000
+    MAX_REMINDERS_PER_USER = 100
+    MAX_CREATE_PER_MINUTE = 10
+    MAX_LIST_PER_MINUTE = 20
+    MAX_DELETE_PER_MINUTE = 10
+    DUPLICATE_THRESHOLD_MINUTES = 5
+    DUPLICATE_SIMILARITY_THRESHOLD = 0.85
+    MAX_FUTURE_DAYS = 365
+
+
+# ---------------------------------------------------------------------------
+# Validation Layer
+# ---------------------------------------------------------------------------
+
+class ReminderValidator:
+    """Input validation for all reminder operations"""
     
-    # Command detection patterns
-    COMMAND_PATTERNS = {
-        'create': [
-            r'remind me (?:to |about )?(.+)',
-            r'reminder (?:to |for |about )?(.+)',
-            r'set reminder (?:to |for )?(.+)',
-            r'i need to remember (?:to )?(.+)',
-            r'don\'t let me forget (?:to )?(.+)',
-        ],
-        'list': [
-            r'(?:list |show |what are )?my reminders',
-            r'what reminders (?:do i have|are there)',
-            r'show (?:me )?reminders',
-            r'reminders?$',
-        ],
-        'complete': [
-            r'^(?:done|finished|completed?)$',
-            r'(?:mark |i )?(?:done|finished|completed) (?:the )?(.+)',
-            r'i (?:did|finished) (?:the )?(.+)',
-        ],
-        'snooze': [
-            r'snooze (?:for )?(\d+)?\s*(?:min|minutes?|hours?)?',
-            r'remind (?:me )?later',
-            r'postpone',
-        ],
-        'cancel': [
-            r'cancel (?:the )?reminder (?:for |about )?(.+)',
-            r'delete (?:the )?reminder (?:for |about )?(.+)',
-            r'remove (?:the )?reminder (?:for |about )?(.+)',
-            r'forget (?:about )?(?:the )?(.+)',
+    @staticmethod
+    def validate_title(title: str) -> Tuple[bool, str]:
+        if not title or not title.strip():
+            return False, "❌ Reminder title cannot be empty"
+        
+        title = title.strip()
+        if len(title) > ReminderConfig.MAX_TITLE_LENGTH:
+            return False, f"❌ Title too long (max {ReminderConfig.MAX_TITLE_LENGTH} characters)"
+        
+        # Check for suspicious patterns
+        if title.count('\n') > 5:
+            return False, "❌ Title cannot contain multiple line breaks"
+        
+        return True, ""
+    
+    @staticmethod
+    def validate_datetime(dt: datetime) -> Tuple[bool, str]:
+        now = datetime.now()
+        
+        if dt < now - timedelta(minutes=5):  # Allow 5 min grace period
+            return False, "❌ Reminder time must be in the future"
+        
+        if dt > now + timedelta(days=ReminderConfig.MAX_FUTURE_DAYS):
+            return False, f"❌ Reminder cannot be more than {ReminderConfig.MAX_FUTURE_DAYS} days ahead"
+        
+        return True, ""
+    
+    @staticmethod
+    def sanitize_text(text: str) -> str:
+        """Clean up user input"""
+        # Remove excessive whitespace
+        text = ' '.join(text.split())
+        # Remove control characters
+        text = ''.join(char for char in text if ord(char) >= 32 or char == '\n')
+        return text.strip()
+
+
+# ---------------------------------------------------------------------------
+# Rate Limiter
+# ---------------------------------------------------------------------------
+
+class RateLimiter:
+    """Per-user rate limiting for spam prevention"""
+    
+    def __init__(self):
+        self._operations = {}  # {user_id: {operation: [(timestamp, count)]}}
+    
+    def check_limit(
+        self,
+        user_id: str,
+        operation: str,
+        max_ops: int,
+        window_seconds: int = 60
+    ) -> Tuple[bool, str]:
+        """Check if operation is allowed. Returns (allowed, error_message)"""
+        now = time.time()
+        
+        # Initialize user if needed
+        if user_id not in self._operations:
+            self._operations[user_id] = {}
+        
+        if operation not in self._operations[user_id]:
+            self._operations[user_id][operation] = []
+        
+        # Clean old entries
+        self._operations[user_id][operation] = [
+            (ts, cnt) for ts, cnt in self._operations[user_id][operation]
+            if now - ts < window_seconds
         ]
-    }
+        
+        # Count recent operations
+        recent_count = sum(cnt for ts, cnt in self._operations[user_id][operation])
+        
+        if recent_count >= max_ops:
+            wait_time = int(window_seconds - (now - self._operations[user_id][operation][0][0]))
+            return False, f"⏱️ Too many {operation} operations. Please wait {wait_time}s"
+        
+        # Record this operation
+        self._operations[user_id][operation].append((now, 1))
+        return True, ""
+    
+    def cleanup(self):
+        """Periodic cleanup of old data"""
+        now = time.time()
+        for user_id in list(self._operations.keys()):
+            for operation in list(self._operations[user_id].keys()):
+                self._operations[user_id][operation] = [
+                    (ts, cnt) for ts, cnt in self._operations[user_id][operation]
+                    if now - ts < 120  # Keep 2 minutes of history
+                ]
+                if not self._operations[user_id][operation]:
+                    del self._operations[user_id][operation]
+            if not self._operations[user_id]:
+                del self._operations[user_id]
+
+
+# ---------------------------------------------------------------------------
+# Duplicate Detector
+# ---------------------------------------------------------------------------
+
+class DuplicateDetector:
+    """Detect duplicate reminder creation attempts"""
+    
+    @staticmethod
+    def similarity_ratio(s1: str, s2: str) -> float:
+        """Calculate similarity between two strings (0.0 to 1.0)"""
+        return SequenceMatcher(None, s1.lower(), s2.lower()).ratio()
+    
+    @staticmethod
+    async def check_duplicate(
+        manager: ReminderManager,
+        user_id: str,
+        title: str,
+        due_datetime: datetime
+    ) -> Optional[int]:
+        """
+        Check if similar reminder already exists.
+        Returns reminder_id if duplicate found, None otherwise.
+        """
+        # Get recent reminders (last 7 days)
+        recent = await manager.list_reminders(user_id, status='active', limit=50)
+        
+        for reminder in recent:
+            # Check title similarity
+            similarity = DuplicateDetector.similarity_ratio(title, reminder.title)
+            
+            # Check time proximity
+            time_diff = abs((reminder.due_datetime - due_datetime).total_seconds() / 60)
+            
+            # Consider it a duplicate if:
+            # - Titles are very similar (>85%)
+            # - Due times are within 5 minutes
+            if (similarity >= ReminderConfig.DUPLICATE_SIMILARITY_THRESHOLD and
+                time_diff <= ReminderConfig.DUPLICATE_THRESHOLD_MINUTES):
+                return reminder.id
+        
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Rich Formatting (from v2, enhanced)
+# ---------------------------------------------------------------------------
+
+def format_reminder_card(reminder: Reminder, header: str = "🔔 Reminder") -> str:
+    """Format a reminder as a rich WhatsApp card"""
+    due = reminder.due_datetime
+    date_str = due.strftime("%-d %B %Y")
+    time_str = due.strftime("%I:%M %p").lstrip("0")
+    
+    lines = [f"📍 *{header}:* {reminder.title}"]
+    
+    if reminder.description:
+        lines.append(f"📝 *Note:* {reminder.description}")
+    
+    lines += [
+        f"📅 *Date:* {date_str}",
+        f"⏰ *Time:* {time_str}",
+    ]
+    
+    if reminder.recurrence_type != 'once':
+        lines.append(f"🔄 *Repeats:* {_format_recurrence(reminder)}")
+    
+    return "\n".join(lines)
+
+
+def format_reminder_list(reminders: List[Reminder], total_count: int = None) -> str:
+    """Format numbered list with pagination info"""
+    if not reminders:
+        return (
+            "You have no active reminders.\n\n"
+            "_Try: 'Remind me to water plants every 3 days'_"
+        )
+    
+    count_str = f"{total_count}" if total_count else f"{len(reminders)}"
+    lines = [f"📋 *Your Reminders* ({count_str} active)\n"]
+    
+    for i, r in enumerate(reminders, 1):
+        due = r.due_datetime
+        date_str = due.strftime("%-d %b")
+        time_str = due.strftime("%I:%M %p").lstrip("0")
+        
+        recurrence = ""
+        if r.recurrence_type != 'once':
+            recurrence = f" · 🔄 {_format_recurrence(r)}"
+        
+        lines.append(
+            f"*{i}.* {r.emoji} {r.title}\n"
+            f"    📅 {date_str} · ⏰ {time_str}{recurrence}"
+        )
+    
+    lines.append("\n_Reply 'delete <number>' to remove_")
+    return "\n".join(lines)
+
+
+def format_due_notification(reminder: Reminder) -> str:
+    """Due time notification"""
+    due = reminder.due_datetime
+    date_str = due.strftime("%-d %B %Y")
+    time_str = due.strftime("%I:%M %p").lstrip("0")
+    
+    lines = [
+        f"🔔 *It's time!*\n",
+        f"📍 *Reminder:* {reminder.title}",
+    ]
+    
+    if reminder.description:
+        lines.append(f"📝 *Note:* {reminder.description}")
+    
+    lines += [
+        f"📅 *Date:* {date_str}",
+        f"⏰ *Time:* {time_str}",
+    ]
+    
+    if reminder.recurrence_type != 'once':
+        lines.append(f"\n🔄 _{_format_recurrence(reminder)}_")
+        lines.append("_Reply 'done' to mark complete_")
+    else:
+        lines.append("\n_Reply 'done' to complete_")
+    
+    return "\n".join(lines)
+
+
+def format_advance_notification(reminder: Reminder, minutes_before: int) -> str:
+    """Advance alert"""
+    due = reminder.due_datetime
+    time_str = due.strftime("%I:%M %p").lstrip("0")
+    
+    if minutes_before >= 60:
+        when = f"{minutes_before // 60} hour{'s' if minutes_before > 60 else ''}"
+    else:
+        when = f"{minutes_before} minute{'s' if minutes_before > 1 else ''}"
+    
+    lines = [
+        f"⏰ *Coming up in {when}*\n",
+        f"📍 *Reminder:* {reminder.title}",
+    ]
+    
+    if reminder.description:
+        lines.append(f"📝 *Note:* {reminder.description}")
+    
+    lines.append(f"⏰ *Scheduled:* {time_str}")
+    return "\n".join(lines)
+
+
+def format_overdue_notification(reminder: Reminder) -> str:
+    """Overdue alert"""
+    due = reminder.due_datetime
+    date_str = due.strftime("%-d %B %Y")
+    time_str = due.strftime("%I:%M %p").lstrip("0")
+    
+    return (
+        f"⚠️ *Overdue Reminder*\n\n"
+        f"📍 *Reminder:* {reminder.title}\n"
+        f"📅 *Was due:* {date_str} at {time_str}\n\n"
+        f"_Reply 'done' if completed, 'snooze 30' to delay, or 'delete {reminder.id}' to remove_"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Command Detection
+# ---------------------------------------------------------------------------
+
+COMMAND_PATTERNS = {
+    'create': [
+        r'remind me (?:to |about )?(.+)',
+        r'reminder (?:for |to |about )?(.+)',
+        r'set (?:a )?reminder (?:for |to |about )?(.+)',
+        r'don\'t (?:let me )?forget (?:to )?(.+)',
+    ],
+    'list': [
+        r'^(?:list |show |view )?(?:my )?reminders?$',
+        r'^what(?:\'s| are) (?:my )?reminders?',
+        r'^reminders?$',
+    ],
+    'complete': [
+        r'^done$',
+        r'^completed?$',
+        r'^finished?$',
+    ],
+    'snooze': [
+        r'^snooze(?:\s+(?:for\s+)?(\d+))?',
+        r'^remind (?:me )?later',
+    ],
+    'delete': [
+        r'^(?:delete|remove|cancel|del)\s+(\d+)$',
+        r'^(?:delete|remove|cancel) reminder',
+    ],
+}
+
+
+def detect_command(text: str) -> Optional[str]:
+    """Detect reminder command type"""
+    text_lower = text.lower().strip()
+    for command, patterns in COMMAND_PATTERNS.items():
+        for pattern in patterns:
+            if re.search(pattern, text_lower):
+                return command
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Main Command Handler
+# ---------------------------------------------------------------------------
+
+class ReminderCommands:
+    """Production-grade command handler with all features"""
     
     def __init__(self, manager: ReminderManager):
         self.manager = manager
         self.parser = ReminderParser()
+        self.validator = ReminderValidator()
+        self.rate_limiter = RateLimiter()
+        self.duplicate_detector = DuplicateDetector()
     
-    def detect_command(self, text: str) -> Optional[str]:
-        """Detect which reminder command is being used"""
-        text_lower = text.lower().strip()
-        
-        for command, patterns in self.COMMAND_PATTERNS.items():
-            for pattern in patterns:
-                if re.search(pattern, text_lower):
-                    return command
-        
-        return None
-    
-    async def handle_command(
+    async def handle(
         self,
         command: str,
         text: str,
         whatsapp_id: str,
         chat_id: str
     ) -> Optional[str]:
-        """
-        Route command to appropriate handler
-        Returns response text if handled, None if not a reminder command
-        """
+        """Main entry point - routes to specific handlers"""
+        
         if command == 'create':
-            return await self.create_reminder(text, whatsapp_id, chat_id)
+            return await self._create(text, whatsapp_id, chat_id)
         elif command == 'list':
-            return await self.list_reminders(whatsapp_id)
+            return await self._list(whatsapp_id)
         elif command == 'complete':
-            return await self.complete_reminder(text, whatsapp_id)
+            return await self._complete(whatsapp_id)
         elif command == 'snooze':
-            return await self.snooze_reminder(text, whatsapp_id)
-        elif command == 'cancel':
-            return await self.cancel_reminder(text, whatsapp_id)
+            return await self._snooze(text, whatsapp_id)
+        elif command == 'delete':
+            return await self._delete(text, whatsapp_id)
         
         return None
     
-    async def create_reminder(
-        self,
-        text: str,
-        whatsapp_id: str,
-        chat_id: str
-    ) -> str:
-        """Create a new reminder from natural language"""
+    async def _create(self, text: str, whatsapp_id: str, chat_id: str) -> str:
+        """Create reminder with full validation"""
         try:
-            # Parse the reminder
-            reminder_data = self.parser.parse(text)
+            # Rate limiting
+            allowed, error = self.rate_limiter.check_limit(
+                whatsapp_id,
+                'create',
+                ReminderConfig.MAX_CREATE_PER_MINUTE
+            )
+            if not allowed:
+                return error
             
-            # Create in database
+            # Check user limit
+            active_count = await self.manager.count_active_reminders(whatsapp_id)
+            if active_count >= ReminderConfig.MAX_REMINDERS_PER_USER:
+                return (
+                    f"❌ You've reached the limit of {ReminderConfig.MAX_REMINDERS_PER_USER} active reminders.\n\n"
+                    f"_Delete some reminders first: 'list my reminders'_"
+                )
+            
+            # Parse input
+            data = self.parser.parse(text)
+            
+            # Validate title
+            data.title = self.validator.sanitize_text(data.title)
+            valid, error = self.validator.validate_title(data.title)
+            if not valid:
+                return error
+            
+            # Validate datetime
+            valid, error = self.validator.validate_datetime(data.due_datetime)
+            if not valid:
+                return error
+            
+            # Check for duplicates
+            duplicate_id = await self.duplicate_detector.check_duplicate(
+                self.manager,
+                whatsapp_id,
+                data.title,
+                data.due_datetime
+            )
+            
+            if duplicate_id:
+                return (
+                    f"⚠️ *Duplicate detected!*\n\n"
+                    f"You already have a similar reminder:\n"
+                    f"_{data.title}_\n\n"
+                    f"_Reply 'yes' to create anyway, or 'no' to cancel_"
+                )
+            
+            # Smart advance notifications
+            now = datetime.now()
+            mins_until = (data.due_datetime - now).total_seconds() / 60
+            
+            if mins_until <= 30:
+                advance = []
+            elif mins_until <= 120:
+                advance = [15]
+            elif mins_until <= 480:
+                advance = [30]
+            else:
+                advance = [60]
+            
+            # Create reminder
             reminder_id = await self.manager.create_reminder(
                 whatsapp_id=whatsapp_id,
                 chat_id=chat_id,
-                title=reminder_data.title,
-                due_datetime=reminder_data.due_datetime,
-                recurrence_type=reminder_data.recurrence_type,
-                recurrence_interval=reminder_data.recurrence_interval,
-                recurrence_days=reminder_data.recurrence_days,
-                advance_notifications=reminder_data.advance_notifications,
-                category=reminder_data.category,
-                emoji=reminder_data.emoji,
-                description=reminder_data.description,
+                title=data.title,
+                due_datetime=data.due_datetime,
+                recurrence_type=data.recurrence_type,
+                recurrence_interval=data.recurrence_interval,
+                recurrence_days=data.recurrence_days,
+                advance_notifications=advance,
+                category=data.category,
+                emoji=data.emoji,
+                description=data.description,
             )
             
-            # Format confirmation message
-            due_str = reminder_data.due_datetime.strftime("%b %d at %I:%M %p")
+            # Confirmation
+            reminder = await self.manager.get_reminder(reminder_id)
+            card = format_reminder_card(reminder, header="Reminder Set ✅")
             
-            if reminder_data.recurrence_type == 'once':
-                response = f"✅ Reminder set!\n\n{reminder_data.emoji} {reminder_data.title}\n📅 {due_str}"
-                
-                # Mention advance alerts
-                if reminder_data.advance_notifications:
-                    alerts = []
-                    for mins in sorted(reminder_data.advance_notifications, reverse=True):
-                        if mins >= 60:
-                            alerts.append(f"{mins//60}h")
-                        else:
-                            alerts.append(f"{mins}m")
-                    response += f"\n🔔 Alerts: {', '.join(alerts)} before"
-            
-            else:
-                # Recurring reminder
-                recurrence_text = self._format_recurrence(reminder_data)
-                response = f"✅ Recurring reminder set!\n\n{reminder_data.emoji} {reminder_data.title}\n📅 First: {due_str}\n🔄 {recurrence_text}"
+            if advance:
+                alert_str = f"{advance[0] // 60}h" if advance[0] >= 60 else f"{advance[0]}min"
+                card += f"\n🔔 *Alert:* {alert_str} before"
             
             logger.info(
-                "reminder.created_via_command id=%d user=%s title=%s",
-                reminder_id, whatsapp_id, reminder_data.title
+                "reminder.created id=%d user=%s title=%s",
+                reminder_id, whatsapp_id, data.title
             )
-            
-            return response
-            
+            return card
+        
         except Exception as e:
-            logger.error("reminder.create_failed user=%s err=%s", whatsapp_id, str(e))
-            return "I had trouble creating that reminder. Could you rephrase it?\n\nExample: 'Remind me to water plants every 3 days'"
+            logger.error("reminder.create_failed user=%s err=%s", whatsapp_id, str(e), exc_info=True)
+            return (
+                "❌ I couldn't set that reminder. Try:\n\n"
+                "_'Remind me to water plants every 3 days'_\n"
+                "_'Remind me to call mom at 5 PM today'_"
+            )
     
-    async def list_reminders(self, whatsapp_id: str) -> str:
-        """List active reminders for user"""
+    async def _list(self, whatsapp_id: str) -> str:
+        """List reminders with rate limiting"""
         try:
+            # Rate limiting
+            allowed, error = self.rate_limiter.check_limit(
+                whatsapp_id,
+                'list',
+                ReminderConfig.MAX_LIST_PER_MINUTE
+            )
+            if not allowed:
+                return error
+            
             reminders = await self.manager.list_reminders(
-                whatsapp_id=whatsapp_id,
+                whatsapp_id,
                 status='active',
-                limit=10
+                limit=20
             )
             
-            if not reminders:
-                return "You don't have any active reminders.\n\nTry: 'Remind me to water plants in 3 days'"
-            
-            # Format list
-            lines = ["📋 Your active reminders:\n"]
-            
-            for i, reminder in enumerate(reminders, 1):
-                due_str = reminder.due_datetime.strftime("%b %d, %I:%M %p")
-                
-                if reminder.recurrence_type == 'once':
-                    lines.append(f"{i}. {reminder.emoji} {reminder.title}")
-                    lines.append(f"   📅 {due_str}")
-                else:
-                    rec_text = self._format_recurrence_from_reminder(reminder)
-                    lines.append(f"{i}. {reminder.emoji} {reminder.title}")
-                    lines.append(f"   📅 Next: {due_str}")
-                    lines.append(f"   🔄 {rec_text}")
-                
-                lines.append("")  # Blank line between reminders
-            
-            return "\n".join(lines)
-            
+            total_count = await self.manager.count_active_reminders(whatsapp_id)
+            return format_reminder_list(reminders, total_count)
+        
         except Exception as e:
             logger.error("reminder.list_failed user=%s err=%s", whatsapp_id, str(e))
-            return "I had trouble fetching your reminders. Please try again."
+            return "❌ Couldn't fetch your reminders. Please try again."
     
-    async def complete_reminder(self, text: str, whatsapp_id: str) -> str:
-        """Mark a reminder as complete"""
+    async def _complete(self, whatsapp_id: str) -> str:
+        """Complete most recent reminder"""
         try:
-            # Get active reminders
-            reminders = await self.manager.list_reminders(whatsapp_id, 'active', limit=5)
-            
-            if not reminders:
-                return "You don't have any active reminders to complete."
-            
-            # If just "done" or "completed", complete the most recent
-            if re.match(r'^(done|finished|completed?)$', text.lower().strip()):
-                reminder = reminders[0]  # Most recent
-            else:
-                # Try to match reminder by title
-                text_lower = text.lower()
-                reminder = None
-                for r in reminders:
-                    if r.title.lower() in text_lower or text_lower in r.title.lower():
-                        reminder = r
-                        break
-                
-                if not reminder:
-                    return "I couldn't find that reminder. Try: 'list my reminders'"
-            
-            # Mark as complete
-            success = await self.manager.complete_reminder(reminder.id, whatsapp_id)
-            
-            if not success:
-                return "I couldn't complete that reminder. Please try again."
-            
-            # Format response
-            if reminder.recurrence_type == 'once':
-                return NOTIFICATION_TEMPLATES['once_complete'].format(title=reminder.title)
-            else:
-                # Calculate next due
-                # (This would need to fetch the updated reminder)
-                reminder_updated = await self.manager.get_reminder(reminder.id)
-                next_date = reminder_updated.due_datetime.strftime("%b %d at %I:%M %p")
-                
-                return NOTIFICATION_TEMPLATES['recurring_complete'].format(
-                    title=reminder.title,
-                    next_date=next_date
-                )
-            
-        except Exception as e:
-            logger.error("reminder.complete_failed user=%s err=%s", whatsapp_id, str(e))
-            return "I had trouble marking that as complete. Please try again."
-    
-    async def snooze_reminder(self, text: str, whatsapp_id: str) -> str:
-        """Snooze a reminder"""
-        try:
-            # Extract duration
-            match = re.search(r'(\d+)\s*(min|minutes?|hours?|hr|hrs)?', text.lower())
-            
-            if match:
-                number = int(match.group(1))
-                unit = match.group(2) or 'minutes'
-                
-                if 'hour' in unit or 'hr' in unit:
-                    minutes = number * 60
-                else:
-                    minutes = number
-            else:
-                minutes = 30  # Default: 30 minutes
-            
-            # Get most recent active reminder
             reminders = await self.manager.list_reminders(whatsapp_id, 'active', limit=1)
-            
             if not reminders:
-                return "You don't have any active reminders to snooze."
+                return "No active reminders to complete."
             
             reminder = reminders[0]
+            await self.manager.complete_reminder(reminder.id, whatsapp_id)
             
-            # Snooze it
-            snooze_until = await self.manager.snooze_reminder(
-                reminder.id,
-                whatsapp_id,
-                minutes
-            )
+            if reminder.recurrence_type == 'once':
+                return f"✅ *Done!* _{reminder.title}_ marked as complete."
+            else:
+                updated = await self.manager.get_reminder(reminder.id)
+                next_due = updated.due_datetime
+                date_str = next_due.strftime("%-d %B")
+                time_str = next_due.strftime("%I:%M %p").lstrip("0")
+                return (
+                    f"✅ *Done!* _{reminder.title}_ completed.\n\n"
+                    f"📅 *Next:* {date_str} at {time_str}"
+                )
+        
+        except Exception as e:
+            logger.error("reminder.complete_failed user=%s err=%s", whatsapp_id, str(e))
+            return "❌ Couldn't mark as complete. Try again."
+    
+    async def _snooze(self, text: str, whatsapp_id: str) -> str:
+        """Snooze reminder"""
+        try:
+            match = re.search(r'(\d+)', text)
+            minutes = int(match.group(1)) if match else 30
+            
+            if minutes > 1440:  # Max 24 hours
+                return "❌ Snooze duration cannot exceed 24 hours"
+            
+            reminders = await self.manager.list_reminders(whatsapp_id, 'active', limit=1)
+            if not reminders:
+                return "No active reminders to snooze."
+            
+            reminder = reminders[0]
+            snooze_until = await self.manager.snooze_reminder(reminder.id, whatsapp_id, minutes)
             
             if not snooze_until:
-                return "I couldn't snooze that reminder. Please try again."
+                return "❌ Couldn't snooze that reminder."
             
-            snooze_str = snooze_until.strftime("%I:%M %p")
-            
-            return NOTIFICATION_TEMPLATES['snoozed'].format(
-                title=reminder.title,
-                snooze_time=snooze_str
-            )
-            
+            time_str = snooze_until.strftime("%I:%M %p").lstrip("0")
+            return f"😴 *Snoozed!* _{reminder.title}_ → *{time_str}*"
+        
         except Exception as e:
             logger.error("reminder.snooze_failed user=%s err=%s", whatsapp_id, str(e))
-            return "I had trouble snoozing that reminder. Please try again."
+            return "❌ Couldn't snooze. Try again."
     
-    async def cancel_reminder(self, text: str, whatsapp_id: str) -> str:
-        """Cancel a reminder"""
+    async def _delete(self, text: str, whatsapp_id: str) -> str:
+        """Delete reminder with rate limiting"""
         try:
-            # Get active reminders
-            reminders = await self.manager.list_reminders(whatsapp_id, 'active', limit=5)
+            # Rate limiting
+            allowed, error = self.rate_limiter.check_limit(
+                whatsapp_id,
+                'delete',
+                ReminderConfig.MAX_DELETE_PER_MINUTE
+            )
+            if not allowed:
+                return error
             
-            if not reminders:
-                return "You don't have any active reminders to cancel."
+            # Parse number
+            match = re.search(r'(\d+)', text)
+            if match:
+                index = int(match.group(1))
+                reminders = await self.manager.list_reminders(whatsapp_id, 'active', limit=50)
+                
+                if not reminders:
+                    return "You have no active reminders to delete."
+                
+                if index < 1 or index > len(reminders):
+                    return f"❌ Number must be between 1 and {len(reminders)}"
+                
+                reminder = reminders[index - 1]
+                await self.manager.cancel_reminder(reminder.id, whatsapp_id)
+                return f"🗑️ *Deleted:* _{reminder.title}_"
             
-            # Try to match by title
-            text_lower = text.lower()
-            reminder = None
-            for r in reminders:
-                if r.title.lower() in text_lower or text_lower in r.title.lower():
-                    reminder = r
-                    break
-            
-            if not reminder:
-                # If no match, show list
-                return await self.list_reminders(whatsapp_id) + "\n\nWhich one would you like to cancel?"
-            
-            # Cancel it
-            success = await self.manager.cancel_reminder(reminder.id, whatsapp_id)
-            
-            if not success:
-                return "I couldn't cancel that reminder. Please try again."
-            
-            return NOTIFICATION_TEMPLATES['cancelled'].format(title=reminder.title)
-            
+            # Show list if no number provided
+            reminders = await self.manager.list_reminders(whatsapp_id, 'active', limit=20)
+            return "Which reminder would you like to delete?\n\n" + format_reminder_list(reminders)
+        
         except Exception as e:
-            logger.error("reminder.cancel_failed user=%s err=%s", whatsapp_id, str(e))
-            return "I had trouble cancelling that reminder. Please try again."
-    
-    # Helper methods
-    
-    def _format_recurrence(self, data: ReminderData) -> str:
-        """Format recurrence pattern for display"""
-        if data.recurrence_type == 'daily':
-            return "Every day"
-        elif data.recurrence_type == 'every_n_days':
-            days = data.recurrence_interval
-            return f"Every {days} days"
-        elif data.recurrence_type == 'weekly':
-            if data.recurrence_days:
-                days_str = ', '.join(d.capitalize() for d in data.recurrence_days)
-                return f"Every {days_str}"
-            return "Weekly"
-        elif data.recurrence_type == 'monthly':
-            return "Monthly"
-        else:
-            return "Once"
-    
-    def _format_recurrence_from_reminder(self, reminder: Reminder) -> str:
-        """Format recurrence from Reminder object"""
-        if reminder.recurrence_type == 'daily':
-            return "Every day"
-        elif reminder.recurrence_type == 'every_n_days':
-            return f"Every {reminder.recurrence_interval} days"
-        elif reminder.recurrence_type == 'weekly':
-            return "Weekly"
-        elif reminder.recurrence_type == 'monthly':
-            return "Monthly"
-        else:
-            return "Once"
+            logger.error("reminder.delete_failed user=%s err=%s", whatsapp_id, str(e))
+            return "❌ Couldn't delete. Try again."
 
 
-# Convenience function for easy integration
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+def _format_recurrence(reminder: Reminder) -> str:
+    """Format recurrence pattern"""
+    t = reminder.recurrence_type
+    if t == 'daily':
+        return "Every day"
+    elif t == 'every_n_days':
+        n = reminder.recurrence_interval or 1
+        return f"Every {n} day{'s' if n > 1 else ''}"
+    elif t == 'weekly':
+        return "Every week"
+    elif t == 'monthly':
+        return "Every month"
+    return "Once"
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
 async def handle_reminder_command(
     text: str,
     whatsapp_id: str,
     chat_id: str,
-    manager: ReminderManager
+    manager: ReminderManager,
 ) -> Optional[str]:
     """
-    Quick check if message is a reminder command and handle it
-    
-    Returns response text if it was a reminder command, None otherwise
-    
-    Usage in agent_engine.py:
-        from .reminder_commands import handle_reminder_command
-        
-        # Before running normal agent:
-        reminder_response = await handle_reminder_command(
-            text=user_text,
-            whatsapp_id=sender_key,
-            chat_id=chat_id,
-            manager=reminder_manager
-        )
-        
-        if reminder_response:
-            return AgentResult(reply=ReplyPayload(text=reminder_response), memory_updates=[])
+    Main entry point called from main.py
+    Returns response if this was a reminder command, else None
     """
-    commands = ReminderCommands(manager)
+    command = detect_command(text)
+    if not command:
+        return None
     
-    command = commands.detect_command(text)
-    if command:
-        return await commands.handle_command(command, text, whatsapp_id, chat_id)
-    
-    return None
+    handler = ReminderCommands(manager)
+    return await handler.handle(command, text, whatsapp_id, chat_id)
