@@ -94,8 +94,6 @@ class SQLiteMemory:
                 conn.execute("ALTER TABLE user_memory ADD COLUMN frequency INTEGER DEFAULT 1")
                 logger.info("schema.migration added frequency column")
 
-            #conn.commit()
-
             # --- Safe schema drift migration (no non-constant defaults) ---
             cols = [r[1] for r in conn.execute("PRAGMA table_info(user_memory)").fetchall()]
             if "created_at" not in cols:
@@ -132,17 +130,15 @@ class SQLiteMemory:
 
             return await asyncio.to_thread(_do)
 
-    #async def upsert_fact(self, whatsapp_id: str, key: str, value: str) -> str:
     async def upsert_fact(
         self,
         whatsapp_id: str,
         key: str,
         value: str,
-        importance: float = 0.5,    # ADD
-        source: str = "user_stated", # ADD
-        confidence: float = 1.0      # ADD
-        ) -> str:
-
+        importance: float = 0.5,
+        source: str = "user_stated",
+        confidence: float = 1.0,
+    ) -> str:
         """Upsert a fact"""
         key = (key or "").strip()
         value = (value or "").strip()
@@ -159,36 +155,28 @@ class SQLiteMemory:
                         (whatsapp_id, key),
                     )
                     row = cur.fetchone()
+
                     if row is None:
+                        # Fact does not exist, INSERT it
                         conn.execute(
-                            "INSERT INTO user_memory (whatsapp_id, fact_key, fact_value, created_at, updated_at) "
-                            "VALUES (?,?,?,?,?)",
-                            (whatsapp_id, key, value, now, now),
+                            "INSERT INTO user_memory (whatsapp_id, fact_key, fact_value, importance, source, confidence, frequency, created_at, updated_at) "
+                            "VALUES (?,?,?,?,?,?,?,?,?)",
+                            (whatsapp_id, key, value, importance, source, confidence, 1, now, now),
                         )
                         conn.commit()
                         return "created"
 
+                    # Fact exists, check if update is needed
                     if (row[0] or "").strip() == value:
                         return "unchanged"
 
-                    conn.execute(
-                        "UPDATE user_memory SET fact_value=?, updated_at=? WHERE whatsapp_id=? AND fact_key=?",
-                        (value, now, whatsapp_id, key),
-                    )
-                    conn.commit()
-                    return "updated"
-                    # In INSERT query (line 132-136), add new columns:
-                    conn.execute(
-                        "INSERT INTO user_memory (whatsapp_id, fact_key, fact_value, importance, source, confidence, frequency, created_at, updated_at) "
-                        "VALUES (?,?,?,?,?,?,?,?,?)",
-                        (whatsapp_id, key, value, importance, source, confidence, 1, now, now),
-                        )
-
-                    # In UPDATE query (line 143-147), add:
+                    # Update existing fact, incrementing frequency
                     conn.execute(
                         "UPDATE user_memory SET fact_value=?, importance=?, confidence=?, frequency=frequency+1, updated_at=? WHERE whatsapp_id=? AND fact_key=?",
                         (value, importance, confidence, now, whatsapp_id, key),
                     )
+                    conn.commit()
+                    return "updated"
 
             return await asyncio.to_thread(_do)
 
@@ -427,3 +415,4 @@ def init_stores() -> None:
             collection_name=getattr(settings, "chroma_collection", "shimmi_conversations"),
             embed_model=getattr(settings, "chroma_embed_model", "sentence-transformers/all-MiniLM-L6-v2"),
         )
+

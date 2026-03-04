@@ -180,7 +180,7 @@ class ReminderScheduler:
                 self._check_count += 1
                 now = datetime.now()
                 
-                logger.info(
+                logger.debug(
                     "🔍 reminder_scheduler.check run=%d time=%s",
                     self._check_count, now.strftime("%H:%M:%S")
                 )
@@ -258,7 +258,7 @@ class ReminderScheduler:
         try:
             reminders = await self.manager.get_due_reminders(now)
             
-            logger.info(
+            logger.debug(
                 "reminder_scheduler.due_check found=%d",
                 len(reminders)
             )
