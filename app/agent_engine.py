@@ -52,7 +52,6 @@ def _extract_json(text: str) -> dict:
     """
     s = (text or "").strip()
     
-    # Regex to find a JSON object enclosed in curly braces
     match = re.search(r'\{.*\}', s, re.DOTALL)
     
     if match:
@@ -65,6 +64,32 @@ def _extract_json(text: str) -> dict:
             
     logger.error("agent._extract_json.not_found text='%s'", text[:500])
     raise ValueError("no_json_found")
+
+
+def _handle_simple_greeting(text: str) -> Optional[AgentResult]:
+    """
+    Handles simple greetings and pleasantries to avoid unnecessary LLM calls.
+    Returns an AgentResult if handled, otherwise None.
+    """
+    text_lower = (text or "").lower().strip()
+
+    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
+    thanks = ["thank you", "thanks", "thx"]
+
+    if text_lower in greetings:
+        reply = "Hello! How can I help you today?"
+        return AgentResult(reply=ReplyPayload(type="text", text=reply), memory_updates=[])
+
+    if text_lower in thanks:
+        reply = "You're welcome! Is there anything else I can assist with?"
+        return AgentResult(reply=ReplyPayload(type="text", text=reply), memory_updates=[])
+
+    # If the message is just a greeting word, handle it.
+    if len(text_lower.split()) == 1 and any(g in text_lower for g in greetings):
+        reply = "Hello! How can I help?"
+        return AgentResult(reply=ReplyPayload(type="text", text=reply), memory_updates=[])
+        
+    return None
 
 
 def _answer_from_facts(query: str, facts: Dict[str, str]) -> Optional[str]:
@@ -104,6 +129,13 @@ async def run_agent(
     llm_complete_fn,
     whatsapp_id: str,
 ) -> AgentResult:
+    
+    # NEW: Handle simple greetings first to save tokens and avoid errors
+    greeting_response = _handle_simple_greeting(user_text)
+    if greeting_response:
+        logger.info("🎯 agent.greeting_handler handled='true'")
+        return greeting_response
+
     # Cache
     if should_use_cache(user_text):
         cached_response = response_cache.get(whatsapp_id, user_text, facts)
@@ -185,6 +217,7 @@ async def run_agent(
     result.reply.text = sanitize_for_whatsapp(result.reply.text)
 
     if should_use_cache(user_text):
+        # CORRECTED: Removed the extra dot
         response_cache.set(whatsapp_id, user_text, facts, result.reply.text)
 
     result.memory_updates = proposed + result.memory_updates
