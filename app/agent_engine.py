@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any, Dict, List, Optional
 
 from pydantic import BaseModel, Field
@@ -45,16 +46,25 @@ class AgentResult(BaseModel):
 
 
 def _extract_json(text: str) -> dict:
+    """
+    More robust JSON extractor.
+    Finds a JSON object within a string, even if surrounded by other text.
+    """
     s = (text or "").strip()
-    if not s:
-        raise ValueError("empty")
-    if s.startswith("{"):
-        return json.loads(s)
-    start = s.find("{")
-    end = s.rfind("}")
-    if start != -1 and end != -1 and end > start:
-        return json.loads(s[start : end + 1])
-    raise ValueError("no_json")
+    
+    # Regex to find a JSON object enclosed in curly braces
+    match = re.search(r'\{.*\}', s, re.DOTALL)
+    
+    if match:
+        json_str = match.group(0)
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError as e:
+            logger.error("agent._extract_json.failed text='%s' error='%s'", text[:500], e)
+            raise ValueError("invalid_json_in_string") from e
+            
+    logger.error("agent._extract_json.not_found text='%s'", text[:500])
+    raise ValueError("no_json_found")
 
 
 def _answer_from_facts(query: str, facts: Dict[str, str]) -> Optional[str]:
@@ -204,3 +214,4 @@ async def init_llm() -> None:
 async def close_llm() -> None:
     from .multi_provider_llm import close_llm as llm_close
     await llm_close()
+

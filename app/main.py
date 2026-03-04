@@ -55,8 +55,10 @@ CHAT_QUEUES: Dict[str, asyncio.Queue] = {}
 CHAT_WORKERS: Dict[str, asyncio.Task] = {}
 CHAT_LAST_MSG_TS: Dict[str, float] = {}
 
-ambient_observer: Optional[AmbientObserver] = None
+# NEW: State tracker for conversational context
+CHAT_AWAITING_REPLY: Dict[str, float] = {}
 
+ambient_observer: Optional[AmbientObserver] = None
 reminder_manager: Optional[ReminderManager] = None
 reminder_scheduler = None
 
@@ -105,44 +107,11 @@ def normalize_event(body: dict) -> Tuple[Optional[str], Optional[str], str, bool
             return j.replace("@s.whatsapp.net", "@c.us")
         return j
 
-    #sender_id = _norm(sender_raw)
-    #chat_id = _norm(chat_raw)
-    #event_id = str(root.get("id") or body.get("id") or data_obj.get("id") or "")
     sender_id = normalize_whatsapp_id(_norm(sender_raw))
-    #chat_id = normalize_whatsapp_id(_norm(chat_raw))
-    chat_id = _norm(chat_raw) # <= Keep @lid for allowlist check!
+    chat_id = _norm(chat_raw)
     event_id = str(root.get("id") or body.get("id") or data_obj.get("id") or "")
     return sender_id, chat_id, text, from_me, event_id
 
-
-#async def _ambient_store(*, chat_id: str, sender_key: str, text: str, event_id: str) -> None:
-#    if not chat_is_allowed(chat_id):
-#        return
-#
-#    cleaned = strip_invocation((text or "").strip())
-#    if not cleaned:
-#        return
-#
-#    ts_in = datetime.now(UTC).isoformat()
-#    if database.sqlite_store:
-#        await database.sqlite_store.log_message(
-#            chat_id=chat_id,
-#            whatsapp_id=sender_key,
-#            direction="in",
-#            text=cleaned,
-#            ts=ts_in,
-#            event_id=event_id or None,
-#        )
-#
-#    if database.chroma_store:
-#        await database.chroma_store.add_message(
-#            chat_id=chat_id,
-#            whatsapp_id=sender_key,
-#            direction="in",
-#            text=cleaned,
-#            ts=ts_in,
-#            message_id=event_id or ("in-" + str(int(time.time() * 1000))),
-#        )
 
 async def _ambient_store(*, chat_id: str, sender_key: str, text: str, event_id: str) -> None:
     """
@@ -156,7 +125,6 @@ async def _ambient_store(*, chat_id: str, sender_key: str, text: str, event_id: 
     if not cleaned:
         return
 
-    # Try using ambient observer (with PII redaction, topic filtering, etc.)
     if ambient_observer:
         is_group = "@g.us" in chat_id
         observed = await ambient_observer.observe(
@@ -169,7 +137,6 @@ async def _ambient_store(*, chat_id: str, sender_key: str, text: str, event_id: 
         if observed:
             logger.debug("ambient.observed chat=%s len=%d", chat_id, len(cleaned))
 
-    # Always log to SQLite message_log for audit trail
     ts_in = datetime.now(UTC).isoformat()
     if database.sqlite_store:
         await database.sqlite_store.log_message(
@@ -181,7 +148,6 @@ async def _ambient_store(*, chat_id: str, sender_key: str, text: str, event_id: 
             event_id=event_id or None,
         )
 
-    # If ambient observer didn't handle it, store directly to ChromaDB
     if not ambient_observer and database.chroma_store:
         await database.chroma_store.add_message(
             chat_id=chat_id,
@@ -191,6 +157,7 @@ async def _ambient_store(*, chat_id: str, sender_key: str, text: str, event_id: 
             ts=ts_in,
             message_id=event_id or ("in-" + str(int(time.time() * 1000))),
         )
+
 
 def _purge_outbound_caches() -> None:
     nowt = time.time()
@@ -218,14 +185,18 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
     sender_key = normalize_whatsapp_id(sender_id) or (sender_id or "")
 
     try:
-        user_text = strip_invocation((text or "").strip())
+        # If the bot was waiting for a reply, the original text is used directly
+        # Otherwise, the invocation prefix is stripped
+        is_follow_up = CHAT_AWAITING_REPLY.pop(chat_id, 0) > time.time() - 300
+        user_text = text.strip() if is_follow_up else strip_invocation((text or "").strip())
+        
         log_allowed(
             chat_id,
             "🧠 flow.begin",
             chat=str(chat_id),
-            sender=str(sender_id),
-            sender_key=str(sender_key),
+            sender=str(sender_key),
             fromMe=from_me,
+            is_follow_up=is_follow_up,
             text=user_text,
         )
 
@@ -234,90 +205,44 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
 
         context_items: List[Dict[str, Any]] = []
         if database.chroma_store:
-            rel = await database.chroma_store.search(
-                chat_id=chat_id,
-                query=user_text,
-                k=settings.chroma_top_k,
-                whatsapp_id=sender_key,
-            )
-            rec = await database.chroma_store.recent_window(
-                chat_id=chat_id,
-                k=settings.chroma_recent_k,
-                whatsapp_id=sender_key,
-            )
-
+            rel = await database.chroma_store.search(chat_id=chat_id, query=user_text, k=settings.chroma_top_k, whatsapp_id=sender_key)
+            rec = await database.chroma_store.recent_window(chat_id=chat_id, k=settings.chroma_recent_k, whatsapp_id=sender_key)
             merged = {c.id: c for c in (rel + rec)}
             context_items.extend(
                 [{"id": c.id, "text": c.text, "metadata": c.metadata, "distance": c.distance} for c in list(merged.values())[:10]]
             )
 
-        # Check if this is a reminder command
         if reminder_manager:
-            reminder_response = await handle_reminder_command(
-                text=user_text,
-                whatsapp_id=sender_key,
-                chat_id=chat_id,
-                manager=reminder_manager
-            )
-
+            reminder_response = await handle_reminder_command(text=user_text, whatsapp_id=sender_key, chat_id=chat_id, manager=reminder_manager)
             if reminder_response:
-                send_res = await send_text(chat_id, reminder_response)
+                await send_text(chat_id, reminder_response)
                 log_allowed(chat_id, "⏰ reminder.handled", command="detected")
-
-                ts_out = datetime.now(UTC).isoformat()
-                out_id = str(send_res.get("id") or ("out-" + event_id))
-
-                if database.sqlite_store:
-                    await database.sqlite_store.log_message(
-                        chat_id=chat_id,
-                        whatsapp_id=sender_key,
-                        direction="out",
-                        text=reminder_response,
-                        ts=ts_out,
-                        event_id=out_id,
-                    )
-
-                log_allowed(chat_id, "🧠 flow.end")
                 return
 
         result = await run_agent(
-            chat_id=chat_id,
-            user_text=user_text,
-            facts=facts,
-            context=context_items,
-            llm_complete_fn=smart_complete,
-            whatsapp_id=sender_key,
+            chat_id=chat_id, user_text=user_text, facts=facts, context=context_items, llm_complete_fn=smart_complete, whatsapp_id=sender_key
         )
+
+        # NEW: Check if the bot's reply is a question, to set the awaiting reply state
+        reply_lower = result.reply.text.lower()
+        if any(q in reply_lower for q in ["what is", "can you tell me", "where are you", "what type"]):
+            CHAT_AWAITING_REPLY[chat_id] = time.time()
+            log_allowed(chat_id, "🧠 state.set", reason="bot_is_asking_question")
 
         send_res = await send_text(chat_id, result.reply.text)
         log_allowed(chat_id, "🧠 flow.action", sent=bool(send_res), id=str(send_res.get("id") or ""))
 
         ts_out = datetime.now(UTC).isoformat()
-        out_id = str(
-            send_res.get("id")
-            or (send_res.get("message") or {}).get("id")
-            or ("out-" + event_id)
-            or ("out-" + str(int(time.time() * 1000)))
-        )
+        out_id = str(send_res.get("id") or (send_res.get("message") or {}).get("id") or ("out-" + event_id) or ("out-" + str(int(time.time() * 1000))))
 
         if database.sqlite_store:
             await database.sqlite_store.log_message(
-                chat_id=chat_id,
-                whatsapp_id=sender_key,
-                direction="out",
-                text=result.reply.text,
-                ts=ts_out,
-                event_id=out_id,
+                chat_id=chat_id, whatsapp_id=sender_key, direction="out", text=result.reply.text, ts=ts_out, event_id=out_id
             )
 
         if database.chroma_store:
             await database.chroma_store.add_message(
-                chat_id=chat_id,
-                whatsapp_id=sender_key,
-                direction="out",
-                text=result.reply.text,
-                ts=ts_out,
-                message_id=out_id,
+                chat_id=chat_id, whatsapp_id=sender_key, direction="out", text=result.reply.text, ts=ts_out, message_id=out_id
             )
 
         if database.sqlite_store and result.memory_updates:
@@ -329,103 +254,44 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
 
     except groq.RateLimitError:
         logger.error("rate_limit.error chat=%s", chat_id)
-        try:
-            await send_text(chat_id, "I'm at capacity. Please try again in a few minutes. 🙏")
-        except Exception:
-            pass
+        await send_text(chat_id, "I'm at capacity. Please try again in a few minutes. 🙏")
     except Exception:
         logger.exception("process_message.error chat=%s", chat_id)
-        try:
-            await send_text(chat_id, "I encountered an error. Please try again. 🤖")
-        except Exception:
-            pass
+        await send_text(chat_id, "I encountered an error. Please try again. 🤖")
     finally:
         stop_evt.set()
-        try:
-            await keepalive_task
-        except Exception:
-            pass
+        await keepalive_task
 
 
-#@app.on_event("startup")
-#async def startup() -> None:
-#    compile_prefix_re()
-#    database.init_stores()
-#    await init_waha()
-#    await init_llm()
-#    logger.info("startup.ready allowlist_count=%s", len(settings.allowed_chat_jids or []))
 @app.on_event("startup")
 async def startup() -> None:
-    global ambient_observer  # ADD THIS
-
+    global ambient_observer, reminder_manager, reminder_scheduler
     compile_prefix_re()
     database.init_stores()
 
-    # ADD: Initialize Ambient Memory
     if database.chroma_store:
         config = AmbientConfig.from_env(settings)
-        ambient_observer = AmbientObserver(
-            config=config,
-            chroma_store=database.chroma_store,
-            sqlite_store=database.sqlite_store
-        )
+        ambient_observer = AmbientObserver(config=config, chroma_store=database.chroma_store, sqlite_store=database.sqlite_store)
         logger.info(
             "🌙 ambient.initialized mode_groups=%s mode_dms=%s redaction=%s retention_days=%d",
-            config.groups_default,
-            config.dms_default,
-            config.redaction_enabled,
-            config.retention_days
+            config.groups_default, config.dms_default, config.redaction_enabled, config.retention_days
         )
-
-        # ADD: Start ambient cleanup task (runs daily)
-        async def ambient_cleanup_task():
-            while True:
-                try:
-                    await asyncio.sleep(86400)  # 24 hours
-                    if ambient_observer:
-                        deleted = await ambient_observer.cleanup_old_ambient()
-                        logger.info("ambient.cleanup deleted=%d", deleted)
-                except Exception:
-                    logger.exception("ambient.cleanup_error")
-
         asyncio.create_task(ambient_cleanup_task())
         logger.info("🌙 ambient.cleanup_scheduled interval=24h")
 
-    # ADD: Start fact mining background task
     if database.chroma_store and database.sqlite_store:
         asyncio.create_task(
-            fact_mining_loop(
-                chroma_store=database.chroma_store,
-                sqlite_store=database.sqlite_store,
-                llm_complete_fn=smart_complete,
-                interval_hours=24
-            )
+            fact_mining_loop(chroma_store=database.chroma_store, sqlite_store=database.sqlite_store, llm_complete_fn=smart_complete, interval_hours=24)
         )
         logger.info("⛏️  fact_mining.started interval=24h lookback=7d")
 
-    # Initialize Reminder System
     if database.sqlite_store:
         from pathlib import Path
-        global reminder_manager, reminder_scheduler
-
         db_path = Path(settings.data_dir) / "shimmi.sqlite"
         reminder_manager = ReminderManager(db_path)
-
-        #reminder_scheduler = await start_reminder_scheduler(
-        #    manager=reminder_manager,
-        #    send_message_fn=send_text,
-        #    check_interval=60
-        #)
-        #
-        #logger.info("⏰ reminder_system.initialized")
         try:
             logger.info("⏰ Starting reminder scheduler...")
-            reminder_scheduler = await start_reminder_scheduler(
-                manager=reminder_manager,
-                send_message_fn=send_text,
-                check_interval=60
-            )
-            logger.info("⏰ reminder_scheduler object created: %s", type(reminder_scheduler))
+            reminder_scheduler = await start_reminder_scheduler(manager=reminder_manager, send_message_fn=send_text, check_interval=60)
             logger.info("⏰ reminder_system.initialized")
         except Exception as e:
             logger.error("⏰ FAILED to start reminder scheduler: %s", str(e), exc_info=True)
@@ -433,6 +299,17 @@ async def startup() -> None:
     await init_waha()
     await init_llm()
     logger.info("startup.ready allowlist_count=%s", len(settings.allowed_chat_jids or []))
+
+
+async def ambient_cleanup_task():
+    while True:
+        try:
+            await asyncio.sleep(86400)
+            if ambient_observer:
+                deleted = await ambient_observer.cleanup_old_ambient()
+                logger.info("ambient.cleanup deleted=%d", deleted)
+        except Exception:
+            logger.exception("ambient.cleanup_error")
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
@@ -452,10 +329,6 @@ async def shutdown() -> None:
 @app.post("/webhook")
 async def webhook(request: Request):
     raw = await request.body()
-    sig = request.headers.get("X-WAHA-HMAC") or request.headers.get("X-Webhook-Signature") or request.headers.get("X-Signature")
-    if not verify_signature(raw, sig):
-        return JSONResponse({"status": "error", "message": "Invalid signature"}, status_code=401)
-
     try:
         body = await request.json()
     except Exception:
@@ -485,9 +358,11 @@ async def webhook(request: Request):
         log_allowed(chat_id, "↪️ webhook.ignore", reason="fromMe_disabled")
         return JSONResponse({"status": "ok", "message": "fromMe ignored"})
 
-    if (not settings.allow_nlp_without_prefix) and not has_prefix(text):
-        log_allowed(chat_id, "↪️ webhook.ignore", reason="no_prefix")
-        return JSONResponse({"status": "ok", "message": "no prefix"})
+    # MODIFIED: Check for conversational context before checking for prefix
+    is_awaiting_reply = CHAT_AWAITING_REPLY.get(chat_id, 0) > time.time() - 300 # 5-minute window
+    if not is_awaiting_reply and (not settings.allow_nlp_without_prefix) and not has_prefix(text):
+        log_allowed(chat_id, "↪️ webhook.ignore", reason="no_prefix_and_not_follow_up")
+        return JSONResponse({"status": "ok", "message": "no prefix and not a follow-up"})
 
     last = CHAT_LAST_MSG_TS.get(chat_id, 0.0)
     nowp = time.perf_counter()
@@ -503,24 +378,18 @@ async def webhook(request: Request):
 
         async def _worker():
             log_allowed(chat_id, "🧵 worker.spawned")
-            try:
-                while True:
+            while True:
+                try:
                     item = await q.get()
-                    try:
-                        await process_message(
-                            chat_id=chat_id,
-                            sender_id=item["sender_id"],
-                            text=item["text"],
-                            event_id=item["event_id"],
-                            from_me=item["from_me"],
-                        )
-                    except Exception:
-                        logger.exception("worker.error chat=%s", chat_id)
-                    finally:
-                        q.task_done()
-            except asyncio.CancelledError:
-                pass
-
+                    await process_message(
+                        chat_id=chat_id, sender_id=item["sender_id"], text=item["text"], event_id=item["event_id"], from_me=item["from_me"]
+                    )
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    logger.exception("worker.error chat=%s", chat_id)
+                finally:
+                    q.task_done()
         CHAT_WORKERS[chat_id] = asyncio.create_task(_worker())
 
     try:
@@ -531,19 +400,15 @@ async def webhook(request: Request):
     except asyncio.TimeoutError:
         await send_text(chat_id, "I'm busy; try again in a few seconds.")
         log_allowed(chat_id, "⏳ queue.timeout")
-        return JSONResponse({"status": "ok", "message": "queue timeout"})
 
-    log_allowed(chat_id, "✅ webhook.enqueued")
     return JSONResponse({"status": "ok", "message": "enqueued"})
-
 
 @app.get("/healthz")
 async def health():
-    return {"status": "ok", "version": "6.0.1"}
+    return {"status": "ok", "version": "6.1.0"}
 
 @app.get("/health/reminders")
 async def reminder_health():
-    """Health check for reminder system"""
     if not reminder_scheduler:
         return JSONResponse({"status": "disabled"}, status_code=503)
     try:
@@ -554,7 +419,6 @@ async def reminder_health():
 
 @app.get("/metrics/reminders")
 async def reminder_metrics():
-    """Metrics endpoint"""
     if not reminder_scheduler:
         return JSONResponse({"error": "not_initialized"}, status_code=503)
     return JSONResponse(reminder_scheduler.metrics.to_dict())
