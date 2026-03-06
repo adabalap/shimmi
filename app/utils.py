@@ -6,6 +6,7 @@ Core Utilities
 from __future__ import annotations
 
 import hashlib
+import re
 
 def sha1_hex(data: str | bytes) -> str:
     """Returns SHA1 hex digest of input."""
@@ -32,4 +33,5 @@ def canonical_text(text: str) -> str:
 def sanitize_for_whatsapp(text: str) -> str:
     """Sanitizes text for WhatsApp's formatting."""
     return (text or "").strip()
+
 

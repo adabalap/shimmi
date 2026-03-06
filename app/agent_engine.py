@@ -1,6 +1,6 @@
 """
 Agent Engine
-- Production Grade v7.4
+- Production Grade v8.0 (Definitive)
 """
 from __future__ import annotations
 
@@ -18,15 +18,12 @@ logger = logging.getLogger("app.agent")
 
 # --- Agent-Specific Utilities ---
 
-def estimate_tokens(text: str) -> int:
-    return len(text or "") // 4
-
 def extract_fact_key(query: str) -> Optional[str]:
     q = (query or "").lower()
     patterns = {
         "favorite drink": "favorite_drink", "favourite drink": "favorite_drink",
         "morning drink": "favorite_morning_drink", "bike": "bike_model", "vehicle": "vehicle_model", 
-        "car": "car_model", "city": "city", "where.*live": "city", "location": "location", "name": "name",
+        "car": "car_model", "city": "city", "where.*live": "city", "location": "location", "name": "name", 
     }
     for pattern, fact_key in patterns.items():
         if re.search(pattern, q):
@@ -96,7 +93,7 @@ async def run_agent(
             question = f"I don't know your {fact_key.replace('_', ' ')}. Can you tell me?"
             return AgentResult(reply=ReplyPayload(text=question), question_asked=question)
 
-    # --- Step 3: Handle statements by trying to extract facts ---
+    # --- Step 3: Handle statements by trying to extract new facts ---
     if not _is_question(user_text):
         try:
             raw = await llm_complete_fn(system=MEMORY_EXTRACTOR_PROMPT, user=user_text, temperature=0.0, max_tokens=300)
@@ -118,4 +115,5 @@ async def run_agent(
     except Exception as e:
         logger.error("agent.fallback.failed err=%s", str(e))
         return AgentResult(reply=ReplyPayload(text="I'm having a little trouble thinking right now. Please try again in a moment."))
+
 

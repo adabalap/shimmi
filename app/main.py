@@ -1,6 +1,6 @@
 """
 Main WhatsApp Bot Application
-- Production Grade v7.8 (Synthesis)
+- Production Grade v8.0 (Definitive)
 """
 from __future__ import annotations
 
@@ -29,13 +29,13 @@ from .fact_mining import fact_mining_loop
 from .reminder_manager import ReminderManager
 from .reminder_scheduler import start_reminder_scheduler
 from .reminder_commands import handle_reminder_command, detect_command as detect_reminder_command
-from .structured_actions import init_actions_store
+from .structured_actions import init_actions_store, actions_store
 
 # --- Core Setup ---
 setup_logging()
 logger = logging.getLogger("app")
 UTC = timezone.utc
-app = FastAPI(title="Shimmi Bot", version="7.8.0")
+app = FastAPI(title="Shimmi Bot", version="8.0.0")
 
 # --- In-Memory State ---
 CHAT_QUEUES: Dict[str, asyncio.Queue] = {}
@@ -113,6 +113,24 @@ def _apply_bot_prefix(text: str) -> str:
     if s.startswith(emoji):
         return s
     return f"{emoji} {s}"
+    
+async def handle_list_intent(user_text: str, sender_key: str) -> Optional[str]:
+    text_lower = user_text.lower()
+    if not actions_store: return None
+    create_match = re.search(r'(create|make|start) a (.+?) list with (.+)', text_lower)
+    if create_match:
+        list_name, items_str = create_match.group(2).strip(), create_match.group(3).strip()
+        items = [item.strip() for item in re.split(r',| and ', items_str) if item.strip()]
+        if list_name and items:
+            await actions_store.add_to_list(sender_key, list_name, items)
+            return f"✅ I've created the '{list_name}' list for you with:\n" + "\n".join(f"• {item.capitalize()}" for item in items)
+    view_match = re.search(r'(show|view|get|what\'s on) my (.+?) list', text_lower)
+    if view_match:
+        list_name = view_match.group(2).strip()
+        items = await actions_store.get_list_items(sender_key, list_name)
+        if not items: return f"Your '{list_name}' list is empty."
+        return f"📋 Here's your '{list_name}' list:\n" + "\n".join(f"• {item.capitalize()}" for item in items)
+    return None
 
 # --- Application Lifecycle & Main Logic ---
 
@@ -136,7 +154,7 @@ async def startup() -> None:
             logger.error("⏰ FAILED to start reminder scheduler: %s", e, exc_info=True)
     await init_waha()
     await init_llm()
-    logger.info("✅ Shimmi Bot v7.8 startup complete. Allowed JIDs: %s", len(settings.allowed_chat_jids or []))
+    logger.info("✅ Shimmi Bot v8.0 startup complete. Allowed JIDs: %s", len(settings.allowed_chat_jids or []))
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
@@ -169,6 +187,8 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
         if reminder_manager and (cmd := detect_reminder_command(user_text)):
             if response := await handle_reminder_command(user_text, sender_id, chat_id, reminder_manager):
                 bot_reply_raw = response
+        elif response := await handle_list_intent(user_text, sender_id):
+             bot_reply_raw = response
         else:
             facts = await database.sqlite_store.get_all_facts(sender_id) if database.sqlite_store else {}
             context = []
@@ -197,7 +217,9 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
         # --- Send Logic ---
         final_bot_reply = _apply_bot_prefix(bot_reply_raw)
         OUTBOUND_CACHE_TXT[outbound_hash(chat_id, final_bot_reply)] = time.time()
-        await send_text(chat_id, final_bot_reply)
+        sent_msg = await send_text(chat_id, final_bot_reply)
+        if sent_msg_id := (sent_msg.get("id") or (sent_msg.get("message") or {}).get("id")):
+            OUTBOUND_CACHE_IDS[str(sent_msg_id)] = time.time()
 
     finally:
         final_log_reply = _apply_bot_prefix(bot_reply_raw)
@@ -215,6 +237,7 @@ async def webhook(request: Request):
 
         _purge_outbound_caches()
         if is_echo(chat_id, text):
+            logger.info("↪️ webhook.ignore reason=echo text='%s'", text)
             return JSONResponse({"status": "ok", "message": "echo ignored"})
 
         if ambient_observer:
@@ -255,5 +278,6 @@ async def webhook(request: Request):
 
 @app.get("/healthz")
 async def health():
-    return {"status": "ok", "version": "7.8.0"}
+    return {"status": "ok", "version": "8.0.0"}
+
 
