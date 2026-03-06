@@ -1,6 +1,6 @@
 """
 Main WhatsApp Bot Application
-- Production Grade v7.3
+- Production Grade v7.6 (Definitive)
 """
 from __future__ import annotations
 
@@ -16,25 +16,25 @@ from fastapi.responses import JSONResponse
 
 from .config import settings
 from .logging_setup import setup_logging
-from .utils import normalize_whatsapp_id, canonical_text
+from .utils import normalize_whatsapp_id, canonical_text, sha1_hex
 
 import app.database as database
 from .waha_provider import init_waha, close_waha, send_text, typing_keepalive
 from .multi_provider_llm import init_llm, close_llm, smart_complete
-from .agent_engine import run_agent, extract_fact_key
+from .agent_engine import run_agent
 
 from .ambient_memory import AmbientConfig, AmbientObserver
 from .fact_mining import fact_mining_loop
 from .reminder_manager import ReminderManager
 from .reminder_scheduler import start_reminder_scheduler
 from .reminder_commands import handle_reminder_command, detect_command as detect_reminder_command
-from .structured_actions import init_actions_store, actions_store
+from .structured_actions import init_actions_store
 
 # --- Core Setup ---
 setup_logging()
 logger = logging.getLogger("app")
 UTC = timezone.utc
-app = FastAPI(title="Shimmi Bot", version="7.3.0")
+app = FastAPI(title="Shimmi Bot", version="7.6.0")
 
 # --- In-Memory State ---
 CHAT_QUEUES: Dict[str, asyncio.Queue] = {}
@@ -85,32 +85,45 @@ def normalize_event(body: dict) -> Tuple[str, str, str, bool, str]:
     event_id = str(root.get("id", ""))
     return normalize_whatsapp_id(sender), chat_id, text or "", from_me, event_id
 
-# --- Application Lifecycle ---
+def _purge_outbound_caches() -> None:
+    now = time.time()
+    cutoff = now - OUTBOUND_TTL_SEC
+    for k, ts in list(OUTBOUND_CACHE_IDS.items()):
+        if ts < cutoff: OUTBOUND_CACHE_IDS.pop(k, None)
+    for k, ts in list(OUTBOUND_CACHE_TXT.items()):
+        if ts < cutoff: OUTBOUND_CACHE_TXT.pop(k, None)
+
+def outbound_hash(chat_id: str, msg: str) -> str:
+    return sha1_hex(chat_id + "\n" + canonical_text(msg))
+
+def is_echo(chat_id: str, text: str, event_id: str) -> bool:
+    if event_id and event_id in OUTBOUND_CACHE_IDS: return True
+    if chat_id and text:
+        if outbound_hash(chat_id, text) in OUTBOUND_CACHE_TXT: return True
+    return False
+
+# --- Application Lifecycle & Main Logic ---
 
 @app.on_event("startup")
 async def startup() -> None:
     global ambient_observer, reminder_manager, reminder_scheduler
     database.init_stores()
     init_actions_store(settings.sqlite_path)
-
     if database.chroma_store:
         config = AmbientConfig.from_env(settings)
         ambient_observer = AmbientObserver(config=config, chroma_store=database.chroma_store, sqlite_store=database.sqlite_store)
         asyncio.create_task(ambient_cleanup_task())
-    
     if database.chroma_store and database.sqlite_store:
         asyncio.create_task(fact_mining_loop(chroma_store=database.chroma_store, sqlite_store=database.sqlite_store, llm_complete_fn=smart_complete))
-
     if settings.actions_enabled and database.sqlite_store:
         reminder_manager = ReminderManager(settings.sqlite_path)
         try:
-            reminder_scheduler = await start_reminder_scheduler(manager=reminder_manager, send_message_fn=send_text)
+            reminder_scheduler = await start_reminder_scheduler(manager=reminder_manager, send_message_fn=lambda cid, msg: send_text(cid, msg))
         except Exception as e:
             logger.error("⏰ FAILED to start reminder scheduler: %s", e, exc_info=True)
-
     await init_waha()
     await init_llm()
-    logger.info("✅ Shimmi Bot v7.3 startup complete.")
+    logger.info("✅ Shimmi Bot v7.6 startup complete. Allowed JIDs: %s", len(settings.allowed_chat_jids or []))
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
@@ -120,8 +133,6 @@ async def shutdown() -> None:
     await close_llm()
     logger.info("🛑 Shimmi Bot shutdown complete.")
 
-# --- Background Tasks & Main Logic ---
-
 async def ambient_cleanup_task():
     while True:
         await asyncio.sleep(86400)
@@ -130,21 +141,20 @@ async def ambient_cleanup_task():
             except Exception: logger.exception("ambient.cleanup_error")
 
 async def process_message(chat_id: str, sender_id: str, text: str, event_id: str, from_me: bool) -> None:
-    stop_evt = asyncio.Event()
-    keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
     bot_reply = ""
+    user_text_for_log = ""
     try:
         chat_ctx = get_chat_context(chat_id)
         is_follow_up = chat_ctx.get('awaiting_answer_since', 0) > time.time() - 300
         user_text = text.strip() if is_follow_up else strip_invocation(text)
+        user_text_for_log = user_text
         if not user_text: return
 
-        logger.info("➡️  processing message: user_text='%s'", user_text)
+        logger.info("➡️  processing: user_text='%s'", user_text)
 
         if reminder_manager and (cmd := detect_reminder_command(user_text)):
             if response := await handle_reminder_command(user_text, sender_id, chat_id, reminder_manager):
-                bot_reply = response
-                await send_text(chat_id, bot_reply)
+                bot_reply, _ = await send_text(chat_id, response)
                 return
         
         facts = await database.sqlite_store.get_all_facts(sender_id) if database.sqlite_store else {}
@@ -165,18 +175,19 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
             chat_ctx['awaiting_answer_since'] = time.time()
             chat_ctx['last_question'] = result.question_asked
         
-        bot_reply = result.reply.text
-        await send_text(chat_id, bot_reply)
+        # CORRECTED: Use new return value from send_text to prevent echo loop
+        final_bot_reply, sent_data = await send_text(chat_id, result.reply.text)
+        bot_reply = final_bot_reply
+        
+        if sent_msg_id := (sent_data.get("id") or (sent_data.get("message") or {}).get("id")):
+            OUTBOUND_CACHE_IDS[str(sent_msg_id)] = time.time()
+            OUTBOUND_CACHE_TXT[outbound_hash(chat_id, final_bot_reply)] = time.time()
         
         if database.sqlite_store and result.memory_updates:
             for mu in result.memory_updates:
                 await database.sqlite_store.upsert_fact(sender_id, mu.key, mu.value)
     finally:
-        logger.info("⬅️  finished processing: bot_reply='%s'", bot_reply)
-        stop_evt.set()
-        await keepalive_task
-
-# --- Webhook Endpoint ---
+        logger.info("⬅️  replying to '%s': bot_reply='%s'", user_text_for_log, bot_reply)
 
 @app.post("/webhook")
 async def webhook(request: Request):
@@ -184,15 +195,19 @@ async def webhook(request: Request):
         body = await request.json()
         sender_id, chat_id, text, from_me, event_id = normalize_event(body)
 
-        if not settings.allowed_chat_jids or chat_id not in settings.allowed_chat_jids:
+        if not (settings.allowed_chat_jids and chat_id in settings.allowed_chat_jids):
             return JSONResponse({"status": "ok", "message": "chat not in allowlist"})
         if not text: return JSONResponse({"status": "ok", "message": "empty"})
 
-        if from_me and not settings.allow_fromme:
-            return JSONResponse({"status": "ok", "message": "fromMe ignored"})
+        _purge_outbound_caches()
+        if is_echo(chat_id, text, event_id):
+            return JSONResponse({"status": "ok", "message": "echo ignored"})
 
         if ambient_observer:
             await ambient_observer.observe(chat_id=chat_id, sender_id=sender_id, text=text, is_group="@g.us" in chat_id, event_id=event_id)
+        
+        if from_me and not settings.allow_fromme:
+            return JSONResponse({"status": "ok", "message": "fromMe ignored"})
 
         chat_ctx = get_chat_context(chat_id)
         is_awaiting_reply = chat_ctx.get('awaiting_answer_since', 0) > time.time() - 300
@@ -219,7 +234,6 @@ async def webhook(request: Request):
         await asyncio.wait_for(q.put({"chat_id": chat_id, "sender_id": sender_id, "text": text, "event_id": event_id, "from_me": from_me}), timeout=5.0)
         return JSONResponse({"status": "ok", "message": "enqueued"})
     except asyncio.TimeoutError:
-        logger.warning("⏳ queue.timeout")
         return JSONResponse({"status": "ok", "message": "queue timeout"})
     except Exception:
         logger.exception("webhook.error")
@@ -227,5 +241,5 @@ async def webhook(request: Request):
 
 @app.get("/healthz")
 async def health():
-    return {"status": "ok", "version": "7.3.0"}
+    return {"status": "ok", "version": "7.6.0"}
 
