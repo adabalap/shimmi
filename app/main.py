@@ -1,6 +1,6 @@
 """
 Main WhatsApp Bot Application
-- Production Grade v7.2
+- Production Grade v7.3
 """
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from fastapi.responses import JSONResponse
 
 from .config import settings
 from .logging_setup import setup_logging
-from .utils import normalize_whatsapp_id, canonical_text, sha1_hex
+from .utils import normalize_whatsapp_id, canonical_text
 
 import app.database as database
 from .waha_provider import init_waha, close_waha, send_text, typing_keepalive
@@ -34,7 +34,7 @@ from .structured_actions import init_actions_store, actions_store
 setup_logging()
 logger = logging.getLogger("app")
 UTC = timezone.utc
-app = FastAPI(title="Shimmi Bot", version="7.2.0")
+app = FastAPI(title="Shimmi Bot", version="7.3.0")
 
 # --- In-Memory State ---
 CHAT_QUEUES: Dict[str, asyncio.Queue] = {}
@@ -44,7 +44,6 @@ CHAT_CONTEXT: Dict[str, Dict[str, Any]] = {}
 OUTBOUND_CACHE_IDS: Dict[str, float] = {}
 OUTBOUND_CACHE_TXT: Dict[str, float] = {}
 OUTBOUND_TTL_SEC: float = 300.0
-
 
 # --- Global Components ---
 ambient_observer: Optional[AmbientObserver] = None
@@ -111,7 +110,7 @@ async def startup() -> None:
 
     await init_waha()
     await init_llm()
-    logger.info("✅ Shimmi Bot v7.2 startup complete.")
+    logger.info("✅ Shimmi Bot v7.3 startup complete.")
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
@@ -133,15 +132,19 @@ async def ambient_cleanup_task():
 async def process_message(chat_id: str, sender_id: str, text: str, event_id: str, from_me: bool) -> None:
     stop_evt = asyncio.Event()
     keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
+    bot_reply = ""
     try:
         chat_ctx = get_chat_context(chat_id)
         is_follow_up = chat_ctx.get('awaiting_answer_since', 0) > time.time() - 300
         user_text = text.strip() if is_follow_up else strip_invocation(text)
         if not user_text: return
 
+        logger.info("➡️  processing message: user_text='%s'", user_text)
+
         if reminder_manager and (cmd := detect_reminder_command(user_text)):
             if response := await handle_reminder_command(user_text, sender_id, chat_id, reminder_manager):
-                await send_text(chat_id, response)
+                bot_reply = response
+                await send_text(chat_id, bot_reply)
                 return
         
         facts = await database.sqlite_store.get_all_facts(sender_id) if database.sqlite_store else {}
@@ -162,15 +165,14 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
             chat_ctx['awaiting_answer_since'] = time.time()
             chat_ctx['last_question'] = result.question_asked
         
-        await send_text(chat_id, result.reply.text)
+        bot_reply = result.reply.text
+        await send_text(chat_id, bot_reply)
         
         if database.sqlite_store and result.memory_updates:
             for mu in result.memory_updates:
                 await database.sqlite_store.upsert_fact(sender_id, mu.key, mu.value)
-    except Exception:
-        logger.exception("process_message.error chat=%s", chat_id)
-        await send_text(chat_id, "I encountered an error. Please try again. 🤖")
     finally:
+        logger.info("⬅️  finished processing: bot_reply='%s'", bot_reply)
         stop_evt.set()
         await keepalive_task
 
@@ -188,10 +190,6 @@ async def webhook(request: Request):
 
         if from_me and not settings.allow_fromme:
             return JSONResponse({"status": "ok", "message": "fromMe ignored"})
-        
-        # Simple echo check based on text content
-        if any(text == r.get("text") for r in CHAT_CONTEXT.get(chat_id, {}).get("recent_replies", [])):
-            return JSONResponse({"status": "ok", "message": "echo ignored"})
 
         if ambient_observer:
             await ambient_observer.observe(chat_id=chat_id, sender_id=sender_id, text=text, is_group="@g.us" in chat_id, event_id=event_id)
@@ -229,6 +227,5 @@ async def webhook(request: Request):
 
 @app.get("/healthz")
 async def health():
-    return {"status": "ok", "version": "7.2.0"}
-
+    return {"status": "ok", "version": "7.3.0"}
 
