@@ -1,6 +1,6 @@
 """
 Main WhatsApp Bot Application
-- Production Grade v7.7 (Definitive)
+- Production Grade v7.8 (Synthesis)
 """
 from __future__ import annotations
 
@@ -35,7 +35,7 @@ from .structured_actions import init_actions_store
 setup_logging()
 logger = logging.getLogger("app")
 UTC = timezone.utc
-app = FastAPI(title="Shimmi Bot", version="7.7.0")
+app = FastAPI(title="Shimmi Bot", version="7.8.0")
 
 # --- In-Memory State ---
 CHAT_QUEUES: Dict[str, asyncio.Queue] = {}
@@ -98,15 +98,12 @@ def outbound_hash(chat_id: str, msg: str) -> str:
     return sha1_hex(chat_id + "\n" + canonical_text(msg))
 
 def is_echo(chat_id: str, text: str) -> bool:
-    """Checks if an incoming message is an echo of an outgoing one."""
-    # The text hash check is now the primary defense.
     if chat_id and text:
         if outbound_hash(chat_id, text) in OUTBOUND_CACHE_TXT:
             return True
     return False
 
 def _apply_bot_prefix(text: str) -> str:
-    """Adds the bot emoji prefix to the text."""
     if not str(os.getenv("BOT_EMOJI_PREFIX_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on"):
         return text
     if not (emoji := (os.getenv("BOT_EMOJI") or "").strip()):
@@ -121,13 +118,41 @@ def _apply_bot_prefix(text: str) -> str:
 
 @app.on_event("startup")
 async def startup() -> None:
-    # ... (startup logic remains the same)
-    pass
+    """Initialize all application components."""
+    global ambient_observer, reminder_manager, reminder_scheduler
+    database.init_stores()
+    init_actions_store(settings.sqlite_path)
+    if database.chroma_store:
+        config = AmbientConfig.from_env(settings)
+        ambient_observer = AmbientObserver(config=config, chroma_store=database.chroma_store, sqlite_store=database.sqlite_store)
+        asyncio.create_task(ambient_cleanup_task())
+    if database.chroma_store and database.sqlite_store:
+        asyncio.create_task(fact_mining_loop(chroma_store=database.chroma_store, sqlite_store=database.sqlite_store, llm_complete_fn=smart_complete))
+    if settings.actions_enabled and database.sqlite_store:
+        reminder_manager = ReminderManager(settings.sqlite_path)
+        try:
+            reminder_scheduler = await start_reminder_scheduler(manager=reminder_manager, send_message_fn=lambda cid, msg: send_text(cid, msg))
+        except Exception as e:
+            logger.error("⏰ FAILED to start reminder scheduler: %s", e, exc_info=True)
+    await init_waha()
+    await init_llm()
+    logger.info("✅ Shimmi Bot v7.8 startup complete. Allowed JIDs: %s", len(settings.allowed_chat_jids or []))
 
 @app.on_event("shutdown")
 async def shutdown() -> None:
-    # ... (shutdown logic remains the same)
-    pass
+    """Gracefully shut down all components."""
+    for task in CHAT_WORKERS.values(): task.cancel()
+    if reminder_scheduler: await reminder_scheduler.stop()
+    await close_waha()
+    await close_llm()
+    logger.info("🛑 Shimmi Bot shutdown complete.")
+
+async def ambient_cleanup_task():
+    while True:
+        await asyncio.sleep(86400)
+        if ambient_observer:
+            try: await ambient_observer.cleanup_old_ambient()
+            except Exception: logger.exception("ambient.cleanup_error")
 
 async def process_message(chat_id: str, sender_id: str, text: str, event_id: str, from_me: bool) -> None:
     bot_reply_raw = ""
@@ -144,7 +169,6 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
         if reminder_manager and (cmd := detect_reminder_command(user_text)):
             if response := await handle_reminder_command(user_text, sender_id, chat_id, reminder_manager):
                 bot_reply_raw = response
-                # ... fall through to send logic ...
         else:
             facts = await database.sqlite_store.get_all_facts(sender_id) if database.sqlite_store else {}
             context = []
@@ -170,12 +194,9 @@ async def process_message(chat_id: str, sender_id: str, text: str, event_id: str
                 for mu in result.memory_updates:
                     await database.sqlite_store.upsert_fact(sender_id, mu.key, mu.value)
 
-        # --- Send Logic (centralized) ---
+        # --- Send Logic ---
         final_bot_reply = _apply_bot_prefix(bot_reply_raw)
-        
-        # Add to echo cache BEFORE sending
         OUTBOUND_CACHE_TXT[outbound_hash(chat_id, final_bot_reply)] = time.time()
-        
         await send_text(chat_id, final_bot_reply)
 
     finally:
@@ -193,14 +214,12 @@ async def webhook(request: Request):
         if not text: return JSONResponse({"status": "ok", "message": "empty"})
 
         _purge_outbound_caches()
-        # The text-based echo check is now the primary defense.
         if is_echo(chat_id, text):
             return JSONResponse({"status": "ok", "message": "echo ignored"})
 
         if ambient_observer:
             await ambient_observer.observe(chat_id=chat_id, sender_id=sender_id, text=text, is_group="@g.us" in chat_id, event_id=event_id)
         
-        # We can't trust from_me, so it's only a weak secondary check.
         if from_me and not settings.allow_fromme:
             return JSONResponse({"status": "ok", "message": "fromMe ignored"})
 
@@ -233,4 +252,8 @@ async def webhook(request: Request):
     except Exception:
         logger.exception("webhook.error")
         return JSONResponse({"status": "error", "message": "internal server error"}, status_code=500)
+
+@app.get("/healthz")
+async def health():
+    return {"status": "ok", "version": "7.8.0"}
 
