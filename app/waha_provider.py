@@ -4,40 +4,18 @@ import asyncio
 import logging
 import os
 import time
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional
 
 import httpx
 
 from .config import settings
 from .retry import async_retry
-from .utils import canonical_text, sanitize_for_whatsapp, sha1_hex
+from .utils import sanitize_for_whatsapp
 
 logger = logging.getLogger("app.waha")
 
 HTTPX_WAHA: Optional[httpx.AsyncClient] = None
 _init_lock = asyncio.Lock()
-
-# These will be managed in main.py but are declared here for clarity
-OUTBOUND_CACHE_IDS: Dict[str, float] = {}
-OUTBOUND_CACHE_TXT: Dict[str, float] = {}
-OUTBOUND_TTL_SEC: float = 300.0
-
-_NEWLINE = chr(10)
-
-def outbound_hash(chat_id: str, msg: str) -> str:
-    return sha1_hex(chat_id + _NEWLINE + canonical_text(msg))
-
-def _emoji_prefix(text: str) -> str:
-    """Applies the bot emoji prefix if it's enabled in the settings."""
-    if not str(os.getenv("BOT_EMOJI_PREFIX_ENABLED", "0")).strip().lower() in ("1", "true", "yes", "on"):
-        return text
-    if not (emoji := (os.getenv("BOT_EMOJI") or "").strip()):
-        return text
-    if not (s := (text or "").lstrip()):
-        return s
-    if s.startswith(emoji):
-        return s
-    return f"{emoji} {s}"
 
 async def init_waha() -> None:
     global HTTPX_WAHA
@@ -93,20 +71,18 @@ async def _post(path: str, payload: dict) -> dict:
         return resp.json() or {}
     return await async_retry(_do, max_attempts=3, base_delay=0.4, max_delay=4.0)
 
-async def send_text(chat_id: str, text: str) -> Tuple[str, dict]:
-    """Sends text and returns the final message sent AND the API response."""
+async def send_text(chat_id: str, text: str) -> dict:
+    """Sends the exact text provided to the user."""
     if not HTTPX_WAHA: await init_waha()
-    if not HTTPX_WAHA: return "", {}
+    if not HTTPX_WAHA: return {}
 
-    final_msg = _emoji_prefix(sanitize_for_whatsapp(text or ""))
-    if not final_msg: return "", {}
+    sanitized_msg = sanitize_for_whatsapp(text or "")
+    if not sanitized_msg: return {}
 
-    payload = {"session": settings.waha_session, "chatId": chat_id, "text": final_msg}
+    payload = {"session": settings.waha_session, "chatId": chat_id, "text": sanitized_msg}
     try:
-        response_data = await _post("sendText", payload)
-        return final_msg, response_data
+        return await _post("sendText", payload)
     except Exception as e:
         logger.error("waha.send_text.failed error=%s", str(e))
-        return final_msg, {}
-
+        return {}
 
