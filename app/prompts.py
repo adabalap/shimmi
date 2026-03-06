@@ -71,6 +71,19 @@ Examples:
 You MUST return a single valid JSON object. If no facts are found, return {"memory_updates":[]}. NO OTHER TEXT.
 """.strip()
 
+# NEW: Dedicated prompt for extracting a direct answer to a question.
+DIRECT_ANSWER_EXTRACTOR_PROMPT = """
+The user is directly answering a question you asked. Extract the value.
+
+Your Question: "{question}"
+User's Answer: "{answer}"
+
+Extract the value for the key '{key}'.
+You MUST return a single valid JSON object. NO OTHER TEXT.
+Format: {{"value": "..."}}
+""".strip()
+
+
 # Fact-only answer prompt (most used, ultra-compact)
 FACT_ONLY_PROMPT = """Answer using ONLY the FACTS provided.
 

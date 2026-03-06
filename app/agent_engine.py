@@ -1,6 +1,6 @@
 """
 Token-Optimized Agent Engine
-90% token reduction + Zero hallucinations
+- Production Grade v7.1
 """
 from __future__ import annotations
 
@@ -13,39 +13,52 @@ from pydantic import BaseModel, Field
 
 from .prompts import (
     SYSTEM_PROMPT,
-    PLANNER_PROMPT,
+    DIRECT_ANSWER_EXTRACTOR_PROMPT,
     MEMORY_EXTRACTOR_PROMPT,
-    FACT_ONLY_PROMPT,
 )
-from .utils import (
-    response_cache,
-    should_use_cache,
-    needs_context,
-    extract_fact_key,
-    compress_context,
-    estimate_tokens,
-    sanitize_for_whatsapp,
-)
+from .utils import sanitize_for_whatsapp
 
 logger = logging.getLogger("app.agent")
 
+# --- Utilities moved from utils.py for code locality ---
+
+def estimate_tokens(text: str) -> int:
+    """Roughly estimate the number of tokens in a string."""
+    return len(text or "") // 4
+
+def extract_fact_key(query: str) -> Optional[str]:
+    """Extract a potential fact key from a user query."""
+    q = (query or "").lower()
+    patterns = {
+        "favorite drink": "favorite_drink", "favourite drink": "favorite_drink",
+        "morning drink": "favorite_morning_drink", "bike": "bike_model",
+        "vehicle": "vehicle_model", "car": "vehicle_model", "city": "city",
+        "where.*live": "city", "location": "location", "name": "name",
+    }
+    for pattern, fact_key in patterns.items():
+        if re.search(pattern, q):
+            return fact_key
+    return None
+
+# --- Pydantic Models ---
 
 class MemoryUpdate(BaseModel):
     key: str = Field(..., min_length=1)
     value: str = Field(..., min_length=1)
 
-
 class ReplyPayload(BaseModel):
     type: str = Field("text", pattern=r"^(text)$")
     text: str = Field(..., min_length=1)
 
-
 class AgentResult(BaseModel):
     reply: ReplyPayload
     memory_updates: List[MemoryUpdate] = Field(default_factory=list)
+    question_asked: Optional[str] = None
 
+# --- Core Agent Logic ---
 
 def _extract_json(text: str) -> dict:
+    """Finds and parses a JSON object within a string, even if surrounded by other text."""
     s = (text or "").strip()
     match = re.search(r'\{.*\}', s, re.DOTALL)
     if match:
@@ -53,16 +66,13 @@ def _extract_json(text: str) -> dict:
         try:
             return json.loads(json_str)
         except json.JSONDecodeError as e:
-            logger.error("agent._extract_json.failed text='%s' error='%s'", text[:500], e)
-            raise ValueError("invalid_json_in_string") from e
-    logger.error("agent._extract_json.not_found text='%s'", text[:500])
-    raise ValueError("no_json_found")
+            raise ValueError("Invalid JSON found in string") from e
+    raise ValueError("No JSON object found in string")
 
 def _is_question(text: str) -> bool:
     """Check if the text is likely a question."""
     text_lower = text.lower().strip()
-    # Common question words
-    question_words = ['what', 'who', 'when', 'where', 'why', 'how', 'which', 'whose', 'do', 'does', 'did', 'is', 'are', 'was', 'were', 'can', 'could', 'will', 'would', 'should']
+    question_words = ['what', 'who', 'when', 'where', 'why', 'how', 'which', 'whose', 'do', 'does', 'did', 'is', 'are', 'was', 'were', 'can', 'could', 'will', 'would', 'should', 'tell me']
     if any(text_lower.startswith(word) for word in question_words):
         return True
     if text_lower.endswith('?'):
@@ -70,166 +80,74 @@ def _is_question(text: str) -> bool:
     return False
 
 def _handle_simple_greeting(text: str) -> Optional[AgentResult]:
+    """Handles simple greetings and pleasantries to avoid unnecessary LLM calls."""
     text_lower = (text or "").lower().strip()
-    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening"]
-    thanks = ["thank you", "thanks", "thx"]
+    greetings = ["hi", "hello", "hey", "good morning", "good afternoon", "good evening", "spock"]
+    thanks = ["thank you", "thanks", "thx", "ok", "okay", "got it"]
+
     if text_lower in greetings:
         reply = "Hello! How can I help you today?"
-        return AgentResult(reply=ReplyPayload(type="text", text=reply), memory_updates=[])
+        return AgentResult(reply=ReplyPayload(type="text", text=reply))
     if text_lower in thanks:
         reply = "You're welcome! Is there anything else I can assist with?"
-        return AgentResult(reply=ReplyPayload(type="text", text=reply), memory_updates=[])
-    if len(text_lower.split()) == 1 and any(g in text_lower for g in greetings):
-        reply = "Hello! How can I help?"
-        return AgentResult(reply=ReplyPayload(type="text", text=reply), memory_updates=[])
+        return AgentResult(reply=ReplyPayload(type="text", text=reply))
     return None
-
-
-def _answer_from_facts(query: str, facts: Dict[str, str]) -> Optional[str]:
-    query_lower = (query or "").lower()
-    fact_key = extract_fact_key(query)
-    if fact_key:
-        if fact_key in facts:
-            return facts[fact_key]
-        for key, value in facts.items():
-            if fact_key in key or key in fact_key:
-                return value
-    if "name" in query_lower and "name" in facts:
-        return f"My name is {facts['name']}."
-    if ("city" in query_lower or "live" in query_lower) and "city" in facts:
-        return f"I live in {facts['city']}."
-    if "bike" in query_lower:
-        if "bike_model" in facts:
-            return f"I have a {facts['bike_model']} bike."
-        if "bike_brand" in facts:
-            return f"I have a {facts['bike_brand']} bike."
-    if "drink" in query_lower and "favorite" in query_lower:
-        if "favorite_drink" in facts:
-            return f"My favorite drink is {facts['favorite_drink']}."
-        if "favorite_morning_drink" in facts:
-            return f"My favorite morning drink is {facts['favorite_morning_drink']}."
-    return None
-
 
 async def run_agent(
     *,
-    chat_id: str,
     user_text: str,
     facts: Dict[str, str],
-    context: List[Dict[str, Any]],
+    context: List[str],
     llm_complete_fn,
-    whatsapp_id: str,
+    is_follow_up: bool = False,
+    last_question: Optional[str] = None
 ) -> AgentResult:
     
-    greeting_response = _handle_simple_greeting(user_text)
-    if greeting_response:
+    if greeting_response := _handle_simple_greeting(user_text):
         logger.info("🎯 agent.greeting_handler handled='true'")
         return greeting_response
 
-    if should_use_cache(user_text):
-        cached_response = response_cache.get(whatsapp_id, user_text, facts)
-        if cached_response:
-            logger.info("🎯 cache.hit user=%s tokens_saved=~2500", whatsapp_id[:10])
-            return AgentResult(reply=ReplyPayload(type="text", text=cached_response), memory_updates=[])
-        logger.info("cache.miss user=%s", whatsapp_id[:10])
-
-    fact_answer = _answer_from_facts(user_text, facts)
-    if fact_answer:
-        logger.info("🎯 fact.direct_answer user=%s tokens_saved=~2500", whatsapp_id[:10])
-        response_text = sanitize_for_whatsapp(fact_answer)
-        response_cache.set(whatsapp_id, user_text, facts, response_text)
-        return AgentResult(reply=ReplyPayload(type="text", text=response_text), memory_updates=[])
-
-    use_context = needs_context(user_text)
-    if not use_context:
-        context = []
-        logger.info("🎯 context.skipped user=%s tokens_saved=~8000", whatsapp_id[:10])
-    else:
-        context_text = compress_context(context, max_tokens=500)
-        context = [{"text": context_text}]
-        logger.info(
-            "🎯 context.compressed user=%s original=%d compressed=%d",
-            whatsapp_id[:10], len(context), estimate_tokens(context_text)
-        )
+    if is_follow_up and last_question:
+        logger.info("🎯 agent.follow_up_handler triggered")
+        if fact_key := extract_fact_key(last_question):
+            try:
+                prompt = DIRECT_ANSWER_EXTRACTOR_PROMPT.format(question=last_question, answer=user_text, key=fact_key)
+                raw = await llm_complete_fn(system="You are a data extraction tool.", user=prompt, temperature=0.0, max_tokens=100)
+                if data := _extract_json(raw):
+                    if value := data.get('value'):
+                        memory_update = MemoryUpdate(key=fact_key, value=value)
+                        reply_text = f"Got it. I'll remember that your {fact_key.replace('_', ' ')} is {value}."
+                        return AgentResult(reply=ReplyPayload(type="text", text=reply_text), memory_updates=[memory_update])
+            except Exception as e:
+                logger.error("agent.follow_up_handler.failed err=%s", str(e))
+    
+    if (fact_key := extract_fact_key(user_text)) and (answer := facts.get(fact_key)):
+        response_text = sanitize_for_whatsapp(answer)
+        return AgentResult(reply=ReplyPayload(type="text", text=response_text))
 
     proposed = []
-    # If the text is NOT a question, try to extract memory.
     if not _is_question(user_text):
         try:
-            raw = await llm_complete_fn(
-                system=MEMORY_EXTRACTOR_PROMPT,
-                user=user_text,
-                temperature=0.0,
-                max_tokens=300,
-            )
-            data = _extract_json(raw)
-            proposed = [MemoryUpdate.model_validate(m) for m in data.get("memory_updates", [])]
-        except Exception as e:
-            logger.info("memory.extract_failed err=%s", str(e)[:100])
-            proposed = []
-    else:
-        logger.info("memory.skipped reason=is_question")
+            raw = await llm_complete_fn(system=MEMORY_EXTRACTOR_PROMPT, user=user_text, temperature=0.0, max_tokens=300)
+            if data := _extract_json(raw):
+                proposed = [MemoryUpdate.model_validate(m) for m in data.get("memory_updates", [])]
+        except Exception:
+            logger.info("memory.extract_failed")
 
-    logger.info("memory.extracted count=%d", len(proposed))
-
-    fact_key = extract_fact_key(user_text)
-    if fact_key and fact_key not in facts:
+    if (fact_key := extract_fact_key(user_text)) and fact_key not in facts:
         question = f"I don't know your {fact_key.replace('_', ' ')}. Can you tell me?"
-        return AgentResult(reply=ReplyPayload(type="text", text=question), memory_updates=proposed)
+        return AgentResult(reply=ReplyPayload(type="text", text=question), memory_updates=proposed, question_asked=question)
 
-    bundle = {"user": user_text, "facts": facts, "context": context[:3] if context else []}
-    payload_str = json.dumps(bundle, ensure_ascii=False)
-    tokens_sent = estimate_tokens(SYSTEM_PROMPT) + estimate_tokens(payload_str)
-    logger.info("llm.call tokens_sent=%d", tokens_sent)
-
+    bundle = {"user": user_text, "facts": facts, "context": "\n".join(context)}
+    
     try:
-        raw = await llm_complete_fn(
-            system=SYSTEM_PROMPT,
-            user=json.dumps(bundle, ensure_ascii=False),
-            temperature=0.1,
-            max_tokens=400,
-        )
+        raw = await llm_complete_fn(system=SYSTEM_PROMPT, user=json.dumps(bundle, ensure_ascii=False), temperature=0.1, max_tokens=400)
         data = _extract_json(raw)
     except Exception as e:
-        logger.error("agent.failed err=%s", str(e)[:200])
-        return AgentResult(reply=ReplyPayload(type="text", text="I had trouble processing that. Could you rephrase?"), memory_updates=proposed)
+        logger.error("agent.failed err=%s", str(e))
+        return AgentResult(reply=ReplyPayload(type="text", text="I had trouble processing that. Could you rephrase?"))
 
     result = AgentResult.model_validate(data)
-
-    if _contains_hallucination(result.reply.text, facts):
-        logger.error("🔴 hallucination.detected response=%s", result.reply.text[:100])
-        result.reply.text = "I don't have that information. Can you tell me more?"
-
-    result.reply.text = sanitize_for_whatsapp(result.reply.text)
-
-    if should_use_cache(user_text):
-        response_cache.set(whatsapp_id, user_text, facts, result.reply.text)
-
-    result.memory_updates = proposed + result.memory_updates
-
-    tokens_response = estimate_tokens(result.reply.text)
-    logger.info("llm.response tokens=%d total=%d", tokens_response, tokens_sent + tokens_response)
+    result.memory_updates.extend(proposed)
     return result
-
-
-def _contains_hallucination(response: str, facts: Dict[str, str]) -> bool:
-    response_lower = (response or "").lower()
-    claim_phrases = ["my favorite route", "i love driving", "irani chai", "my route is", "i prefer"]
-    for phrase in claim_phrases:
-        if phrase in response_lower:
-            has_support = any(phrase in (v or "").lower() for v in facts.values())
-            if not has_support:
-                return True
-    return False
-
-
-async def init_llm() -> None:
-    from .multi_provider_llm import init_llm as llm_init
-    await llm_init()
-
-
-async def close_llm() -> None:
-    from .multi_provider_llm import close_llm as llm_close
-    await llm_close()
-
 
