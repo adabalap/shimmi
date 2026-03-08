@@ -37,8 +37,7 @@ class Settings:
     bot_persona_name: str = os.getenv("BOT_PERSONA_NAME", "Shimmi")
     bot_command_prefix: str = os.getenv("BOT_COMMAND_PREFIX", "@shimmi,shimmi")
 
-    # FIX #13: default now matches .env.example (false = require prefix)
-    allow_nlp_without_prefix: bool = _bool(os.getenv("ALLOW_NLP_WITHOUT_PREFIX"), False)
+    allow_nlp_without_prefix: bool = _bool(os.getenv("ALLOW_NLP_WITHOUT_PREFIX", "1"), True)
     allow_fromme: bool = _bool(os.getenv("ALLOW_FROMME", "0"), False)
 
     waha_api_url: str = os.getenv("WAHA_API_URL", "").rstrip("/")
@@ -46,6 +45,9 @@ class Settings:
     waha_session: str = os.getenv("WAHA_SESSION", "default")
     webhook_secret: str = os.getenv("WEBHOOK_SECRET", "")
 
+    # ALLOW_ALL_CHATS=true → accept every chat (open/public mode).
+    # Default (false) → only JIDs in ALLOWED_GROUP_JIDS are accepted.
+    allow_all_chats: bool = _bool(os.getenv("ALLOW_ALL_CHATS", "0"), False)
     allowed_chat_jids: Optional[List[str]] = None
 
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
@@ -54,14 +56,15 @@ class Settings:
     groq_max_inflight: int = _int(os.getenv("GROQ_MAX_INFLIGHT", "5"), 5)
 
     live_search_enabled: bool = _bool(os.getenv("LIVE_SEARCH_ENABLED", "1"), True)
-    # FIX #7: correct Groq SDK model IDs — "compound-beta" or "compound-beta-mini"
+    # Valid Groq compound models: compound-beta  |  compound-beta-mini
     live_search_model: str = os.getenv("LIVE_SEARCH_MODEL", "compound-beta-mini")
+
+    # Max agentic loop turns before forcing an answer (2-6 recommended)
+    agent_max_turns: int = _int(os.getenv("AGENT_MAX_TURNS", "4"), 4)
 
     chroma_enabled: bool = _bool(os.getenv("CHROMA_ENABLED", "1"), True)
     chroma_collection: str = os.getenv("CHROMA_COLLECTION", "shimmi_conversations")
-    chroma_embed_model: str = os.getenv(
-        "CHROMA_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2"
-    )
+    chroma_embed_model: str = os.getenv("CHROMA_EMBED_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
     chroma_top_k: int = _int(os.getenv("CHROMA_TOP_K", "10"), 10)
     chroma_recent_k: int = _int(os.getenv("CHROMA_RECENT_K", "10"), 10)
 
@@ -69,37 +72,22 @@ class Settings:
     llm_max_queue_per_chat: int = _int(os.getenv("LLM_MAX_QUEUE_PER_CHAT", "3"), 3)
     llm_queue_wait_sec: int = _int(os.getenv("LLM_QUEUE_WAIT_SEC", "20"), 20)
 
-    # FIX #4/#11: idle TTL for worker GC (seconds of silence before worker exits)
-    worker_idle_ttl_sec: int = _int(os.getenv("WORKER_IDLE_TTL_SEC", "300"), 300)
-    # How many recent SQL turns to inject as conversation history
-    history_turns: int = _int(os.getenv("HISTORY_TURNS", "10"), 10)
-
     facts_verification: bool = _bool(os.getenv("FACTS_VERIFICATION", "1"), True)
     facts_min_conf: float = _float(os.getenv("FACTS_MIN_CONF", "0.85"), 0.85)
-    allow_freeform_memory_keys: bool = _bool(
-        os.getenv("ALLOW_FREEFORM_MEMORY_KEYS", "1"), True
-    )
+    allow_freeform_memory_keys: bool = _bool(os.getenv("ALLOW_FREEFORM_MEMORY_KEYS", "1"), True)
 
     debug_agent: bool = _bool(os.getenv("DEBUG_AGENT", "0"), False)
 
+    # Set TRACE_LEVEL=DEBUG to get verbose TRACE lines in logs.
+    # Default INFO already includes all TRACE lines.
+    trace_enabled: bool = _bool(os.getenv("TRACE_ENABLED", "1"), True)
+
     def __post_init__(self):
         self.data_dir.mkdir(parents=True, exist_ok=True)
-        allow = [
-            s.strip()
-            for s in os.getenv("ALLOWED_GROUP_JIDS", "").split(",")
-            if s.strip()
-        ]
+        allow = [s.strip() for s in os.getenv("ALLOWED_GROUP_JIDS", "").split(",") if s.strip()]
         object.__setattr__(self, "allowed_chat_jids", allow or None)
-        pool = [
-            s.strip()
-            for s in os.getenv("GROQ_MODEL_POOL", "").split(",")
-            if s.strip()
-        ]
-        object.__setattr__(
-            self,
-            "groq_model_pool",
-            pool or ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"],
-        )
+        pool = [s.strip() for s in os.getenv("GROQ_MODEL_POOL", "").split(",") if s.strip()]
+        object.__setattr__(self, "groq_model_pool", pool or ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"])
 
     @property
     def sqlite_path(self) -> Path:
