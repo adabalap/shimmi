@@ -1,20 +1,10 @@
 """
 logging_setup.py — Shimmi v2.8.0
 
-Silenced (CRITICAL — never shown):
-  uvicorn.access               — POST /webhook 200 OK noise
-  uvicorn.protocols.*          — "Invalid HTTP request received" (port scanners)
-  chromadb.*                   — posthog telemetry API mismatch
-  httpx / httpcore             — internal WAHA + Groq request lines
-  sentence_transformers.*      — model-load chatter
-  groq.* / openai.*            — SDK internals
-
-Kept at INFO (shows startup/shutdown + application ready line):
-  uvicorn / uvicorn.error      — shows "Uvicorn running on http://..." ✓
-
-Always at INFO:
-  app.trace                    — per-message waterfall
-  app.tx                       — TX summary lines
+Changes vs v2.7.0:
+  - uvicorn.error set to INFO (not WARNING) so the startup "Uvicorn running on…"
+    message appears — this is the startup listener log the user needs.
+  - uvicorn.protocols.* stays at CRITICAL (port-scanner noise unchanged)
 """
 from __future__ import annotations
 
@@ -40,19 +30,26 @@ def setup_logging() -> None:
         "uvicorn.protocols.http.httptools_impl",
         "uvicorn.protocols.websockets",
         "uvicorn.protocols.websockets.websockets_impl",
-        "chromadb", "chromadb.telemetry",
-        "chromadb.telemetry.product", "chromadb.telemetry.product.posthog",
-        "httpx", "httpcore", "httpcore.connection", "httpcore.http11",
-        "sentence_transformers", "sentence_transformers.SentenceTransformer",
-        "groq", "groq._base_client",
-        "openai", "openai._base_client",
+        "chromadb",
+        "chromadb.telemetry",
+        "chromadb.telemetry.product",
+        "chromadb.telemetry.product.posthog",
+        "httpx",
+        "httpcore",
+        "httpcore.connection",
+        "httpcore.http11",
+        "sentence_transformers",
+        "sentence_transformers.SentenceTransformer",
+        "groq",
+        "groq._base_client",
+        "openai",
+        "openai._base_client",
     ]
     for name in _silence:
         logging.getLogger(name).setLevel(logging.CRITICAL)
 
-    # ── show uvicorn startup message ("Uvicorn running on http://…") ──────
-    # Setting to INFO here means you'll see the "Listening on" line at startup
-    # plus any warnings/errors. Access log (200 OK) is silenced above.
+    # ── uvicorn server lifecycle — INFO so startup message appears ────────
+    # This lets through: "Uvicorn running on http://0.0.0.0:6000 (Press CTRL+C to quit)"
     logging.getLogger("uvicorn").setLevel(logging.INFO)
     logging.getLogger("uvicorn.error").setLevel(logging.INFO)
 

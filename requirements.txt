@@ -1,9 +1,50 @@
+# ============================================================
+# Shimmi — WhatsApp AI Bot
+# requirements.txt  (Python 3.12+)
+# ============================================================
+
+# ── Web framework ────────────────────────────────────────────
 fastapi==0.115.6
-uvicorn==0.30.6
+uvicorn[standard]==0.30.6          # [standard] adds WebSocket + faster event loop
+
+# ── Configuration ────────────────────────────────────────────
 python-dotenv==1.0.1
-httpx==0.27.2
+
+# ── Data validation ──────────────────────────────────────────
 pydantic==2.9.2
-chromadb==0.5.20
-sentence-transformers==2.7.0
-numpy==1.26.4
+
+# ── LLM (Groq) ───────────────────────────────────────────────
 groq==0.13.1
+
+# ── HTTP client (WAHA API calls) ─────────────────────────────
+httpx==0.27.2
+
+# ── Vector database (semantic context) ───────────────────────
+chromadb==0.5.20
+
+# ── Embeddings (ChromaDB default embedding function) ─────────
+# NOTE: sentence-transformers pulls in PyTorch (~2GB on CPU).
+# If bandwidth / disk is a concern, first install CPU-only torch:
+#   pip install torch --index-url https://download.pytorch.org/whl/cpu
+sentence-transformers==2.7.0
+numpy==1.26.4                      # Required by sentence-transformers; pin to avoid numpy 2.x breakage
+
+# ── Scheduler (proactive reminder delivery) ──────────────────
+# Used to fire timed reminders (60s poll loop).
+# Re-implement scheduler.py using AsyncIOScheduler.
+APScheduler==3.10.4
+
+# ── Stock / financial data (optional live-data enrichment) ───
+# Only needed if you implement a custom live_data.py with Yahoo Finance.
+# The default live-search path uses Groq compound-beta-mini (no yfinance needed).
+# Uncomment to enable direct Yahoo Finance queries:
+# yfinance==0.2.54
+
+# ── News data (optional legacy live-data enrichment) ─────────
+# Only needed if you replace compound-beta-mini with a custom news API path.
+# Uncomment to enable direct GNews queries:
+# gnews==0.3.7
+
+# ── Utilities ────────────────────────────────────────────────
+anyio>=4.4.0                       # Async primitives (transitive from fastapi/httpx, pinned for compatibility)
+certifi>=2024.2.2                  # Up-to-date CA certificates for HTTPS
