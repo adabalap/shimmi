@@ -38,12 +38,12 @@ APScheduler==3.10.4
 # Only needed if you implement a custom live_data.py with Yahoo Finance.
 # The default live-search path uses Groq compound-beta-mini (no yfinance needed).
 # Uncomment to enable direct Yahoo Finance queries:
-# yfinance==0.2.54
+yfinance==0.2.54
 
 # ── News data (optional legacy live-data enrichment) ─────────
 # Only needed if you replace compound-beta-mini with a custom news API path.
 # Uncomment to enable direct GNews queries:
-# gnews==0.3.7
+gnews==0.3.7
 
 # ── Utilities ────────────────────────────────────────────────
 anyio>=4.4.0                       # Async primitives (transitive from fastapi/httpx, pinned for compatibility)
