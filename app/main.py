@@ -1,17 +1,19 @@
 """
-main.py — Shimmi v2.7.0
+main.py — Shimmi v2.8.0
 
-Key improvements vs v2.5.0 (production):
-  - store_out is fire-and-forget (never blocks reply latency; was 480ms+)
-  - memory_save errors are isolated per-key — one failure doesn't abort others
-    and does NOT crash the worker (reply was already sent successfully)
-  - _integrity_check() warns on invalid Groq model names at startup
-  - Worker error handling distinguishes processing failures from queue failures
+Key changes vs v2.7.0:
+  - Startup "ready" log line with host:port (answers Q1)
+  - Reminder scheduler started/stopped in lifespan
+  - Reminders from orchestrator output saved to DB and scheduled
+  - chat_id threaded through to reminder saves
+  - store_out is fire-and-forget (never blocks reply latency)
+  - memory_save errors are isolated per-key
 """
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -34,6 +36,7 @@ from .waha_provider import (
 from .agent_engine import init_llm, close_llm, run_agent, VALID_GROQ_PREFIXES
 from .trace import Trace
 from .signature import append_signature
+from .scheduler import ReminderScheduler
 
 setup_logging()
 logger = logging.getLogger("app")
@@ -50,6 +53,8 @@ CHAT_LAST_MSG_TS: Dict[str, float]          = {}
 _WORKER_IDLE_TIMEOUT_SEC: float = 3_600.0
 BOT_IDENTITY = "shimmi-bot"
 
+_scheduler: Optional[ReminderScheduler] = None
+
 
 # ---------------------------------------------------------------------------
 # Startup integrity check
@@ -57,7 +62,6 @@ BOT_IDENTITY = "shimmi-bot"
 
 def _integrity_check() -> None:
     issues: List[str] = []
-
     if not settings.groq_api_key:
         issues.append("GROQ_API_KEY is not set — LLM will be disabled")
     if not settings.waha_api_url:
@@ -67,48 +71,42 @@ def _integrity_check() -> None:
             "ALLOWED_GROUP_JIDS is empty and ALLOW_ALL_CHATS=false — "
             "ALL messages will be ignored"
         )
-    if settings.live_search_enabled and not settings.live_search_model:
-        issues.append("LIVE_SEARCH_ENABLED=1 but LIVE_SEARCH_MODEL is empty")
-
     for m in (settings.groq_model_pool or []):
         if not any(m.startswith(p) for p in VALID_GROQ_PREFIXES):
             issues.append(
                 f"GROQ_MODEL_POOL contains invalid model {m!r}. "
                 "Valid names start with: llama-, compound-beta, mixtral-, gemma-. "
-                "Fix GROQ_MODEL_POOL in .env before restarting."
+                "Remove it from GROQ_MODEL_POOL in .env"
             )
-
     for issue in issues:
         logger.warning("⚠️  CONFIG: %s", issue)
-
     if not issues:
         logger.info("✅ integrity_check — all config OK")
 
 
 # ---------------------------------------------------------------------------
-# Webhook event normalisation
+# Event normalisation
 # ---------------------------------------------------------------------------
 
 def normalize_event(body: dict) -> Tuple[Optional[str], Optional[str], str, bool, str]:
-    root      = body.get("payload") or body.get("data") or body
-    data_obj  = root.get("_data") or {}
-    key       = data_obj.get("key") or {}
-    text      = (
+    root       = body.get("payload") or body.get("data") or body
+    data_obj   = root.get("_data") or {}
+    key        = data_obj.get("key") or {}
+    text       = (
         root.get("body")
         or (root.get("message") or {}).get("text")
         or (root.get("message") or {}).get("conversation")
-        or data_obj.get("body")
-        or ""
+        or data_obj.get("body") or ""
     )
     from_me    = bool(root.get("fromMe") or root.get("from_me") or False)
     key_remote = key.get("remoteJid")
     remote_jid = root.get("remoteJid") or root.get("chatId") or root.get("chat_id")
     from_field = root.get("from")
     to_field   = root.get("to")
-    participant = root.get("participant") or data_obj.get("author")
-    sender_obj  = root.get("sender") or {}
-    sender_raw  = sender_obj.get("id") or participant or from_field or remote_jid
-    chat_raw    = key_remote or remote_jid or from_field or to_field
+    participant= root.get("participant") or data_obj.get("author")
+    sender_obj = root.get("sender") or {}
+    sender_raw = sender_obj.get("id") or participant or from_field or remote_jid
+    chat_raw   = key_remote or remote_jid or from_field or to_field
 
     def _norm(j: Optional[str]) -> Optional[str]:
         return j.replace("@s.whatsapp.net", "@c.us") if j else None
@@ -129,11 +127,6 @@ def normalize_event(body: dict) -> Tuple[Optional[str], Optional[str], str, bool
 async def _store_out_bg(
     *, chat_id: str, text: str, ts: str, out_id: str,
 ) -> None:
-    """
-    Persist bot's outgoing message in SQLite + Chroma.
-    Runs as a fire-and-forget background task after send() returns,
-    so it never adds latency to the user-visible reply time.
-    """
     try:
         if database.sqlite_store:
             await database.sqlite_store.log_message(
@@ -146,7 +139,7 @@ async def _store_out_bg(
                 direction="out", text=text, ts=ts, message_id=out_id,
             )
     except Exception:
-        logger.exception("store_out_bg.error  chat=%s  out_id=%s", chat_id, out_id)
+        logger.exception("store_out_bg.error  chat=%s", chat_id)
 
 
 async def _ambient_store(
@@ -190,15 +183,11 @@ def _is_echo(chat_id: str, text: str, event_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# Core message processor — fully traced
+# Core message processor
 # ---------------------------------------------------------------------------
 
 async def process_message(
-    chat_id:   str,
-    sender_id: str,
-    text:      str,
-    event_id:  str,
-    from_me:   bool,
+    chat_id: str, sender_id: str, text: str, event_id: str, from_me: bool,
 ) -> None:
     async with Trace(event_id=event_id, chat_id=chat_id, sender_id=sender_id) as trace:
 
@@ -209,29 +198,24 @@ async def process_message(
         user_text  = strip_invocation((text or "").strip())
 
         trace.tag(
-            from_me=from_me,
-            sender_key=sender_key,
-            text_len=len(user_text),
-            text_preview=user_text[:100],
+            from_me=from_me, sender_key=sender_key,
+            text_len=len(user_text), text_preview=user_text[:100],
         )
-
         logger.info(
             "📨 msg.in  event=%s  chat=%s  sender=%s  text=%r",
             event_id, chat_id, sender_key, user_text[:120],
         )
 
         try:
-            # ── 1. load user facts ──────────────────────────────────────────
+            # ── 1. load facts ───────────────────────────────────────────────
             with trace.step("facts_load"):
                 facts = (
                     await database.sqlite_store.get_all_facts(sender_key)
                     if database.sqlite_store else {}
                 )
-                trace.tag(
-                    facts_count=len(facts),
-                    facts=", ".join(f"{k}={v!r}" for k, v in list(facts.items())[:15])
-                    if facts else "∅",
-                )
+                trace.tag(facts_count=len(facts), facts=", ".join(
+                    f"{k}={v!r}" for k, v in list(facts.items())[:15]
+                ) if facts else "∅")
                 if facts:
                     logger.info(
                         "📋 facts.loaded  sender=%s  count=%d  %s",
@@ -239,9 +223,7 @@ async def process_message(
                         "  ".join(f"{k}={v!r}" for k, v in facts.items()),
                     )
                 else:
-                    logger.info(
-                        "📋 facts.new_user  sender=%s  (no facts yet)", sender_key,
-                    )
+                    logger.info("📋 facts.new_user  sender=%s", sender_key)
 
             # ── 2. build context ────────────────────────────────────────────
             context_items: List[Dict[str, Any]] = []
@@ -258,17 +240,11 @@ async def process_message(
                     rec_count = len(rec)
                     merged_ctx = {c.id: c for c in (rel + rec)}
                     context_items = [
-                        {
-                            "id":       c.id,
-                            "text":     c.text,
-                            "metadata": c.metadata,
-                            "distance": c.distance,
-                        }
+                        {"id": c.id, "text": c.text, "metadata": c.metadata, "distance": c.distance}
                         for c in list(merged_ctx.values())[:20]
                     ]
                 trace.tag(
-                    context_relevant=rel_count,
-                    context_recent=rec_count,
+                    context_relevant=rel_count, context_recent=rec_count,
                     context_total=len(context_items),
                     top_snippet=(context_items[0]["text"][:80] if context_items else "∅"),
                 )
@@ -277,63 +253,77 @@ async def process_message(
                     rel_count, rec_count, len(context_items),
                 )
 
-            # ── 3. run agentic loop ─────────────────────────────────────────
+            # ── 3. run agent ────────────────────────────────────────────────
             with trace.step("agent_run"):
                 result = await run_agent(
-                    chat_id=chat_id,
-                    user_text=user_text,
-                    facts=facts,
-                    context=context_items,
-                    trace=trace,
+                    chat_id=chat_id, user_text=user_text,
+                    facts=facts, context=context_items, trace=trace,
                 )
                 trace.tag(
                     agent_iterations=result.iterations,
                     reply_len=len(result.reply.text),
                     reply_preview=result.reply.text[:100],
                     memory_updates=len(result.memory_updates),
+                    reminders_scheduled=len(result.reminders),
                 )
                 logger.info(
-                    "🤖 agent.done  iterations=%d  reply_len=%d  "
-                    "memory_updates=%d  preview=%r",
-                    result.iterations,
-                    len(result.reply.text),
-                    len(result.memory_updates),
+                    "🤖 agent.done  iter=%d  reply_len=%d  "
+                    "memory_updates=%d  reminders=%d  preview=%r",
+                    result.iterations, len(result.reply.text),
+                    len(result.memory_updates), len(result.reminders),
                     result.reply.text[:100],
                 )
 
-            # ── 4. append signature ─────────────────────────────────────────
+            # ── 4. signature ────────────────────────────────────────────────
             with trace.step("signature"):
                 reply_with_sig = append_signature(result.reply.text, chat_id)
                 trace.tag(final_len=len(reply_with_sig))
 
-            # ── 5. send to WhatsApp ─────────────────────────────────────────
+            # ── 5. send ─────────────────────────────────────────────────────
             with trace.step("send"):
                 send_res = await send_text(chat_id, reply_with_sig)
-                msg_id   = str(
-                    send_res.get("id")
-                    or (send_res.get("message") or {}).get("id")
-                    or ""
-                )
+                msg_id   = str(send_res.get("id") or "")
                 trace.tag(sent=bool(send_res), msg_id=msg_id[:40] if msg_id else "")
                 logger.info(
                     "📤 msg.sent  chat=%s  msg_id=%s  len=%d",
                     chat_id,
-                    msg_id if msg_id else "(see waha DEBUG log for raw response)",
+                    msg_id if msg_id else "(see waha DEBUG for raw response)",
                     len(reply_with_sig),
                 )
 
-            # ── 6. store outgoing — FIRE AND FORGET ─────────────────────────
-            # Never blocks user-visible reply time.
+            # ── 6. store out (fire-and-forget) ──────────────────────────────
             ts_out = datetime.now(UTC).isoformat()
             out_id = msg_id or ("out-" + event_id) or ("out-" + str(int(time.time() * 1000)))
             asyncio.create_task(
                 _store_out_bg(chat_id=chat_id, text=result.reply.text, ts=ts_out, out_id=out_id)
             )
 
-            # ── 7. persist memory facts ─────────────────────────────────────
+            # ── 7. save structured reminders ────────────────────────────────
+            if database.sqlite_store and result.reminders:
+                user_name = facts.get("name") or None
+                for rem in result.reminders:
+                    if rem.trigger_iso and rem.text:
+                        try:
+                            rid = await database.sqlite_store.add_reminder(
+                                chat_id=chat_id,
+                                whatsapp_id=sender_key,
+                                user_name=user_name,
+                                reminder_text=rem.text,
+                                trigger_iso=rem.trigger_iso,
+                            )
+                            logger.info(
+                                "🔔 reminder.scheduled  id=%d  chat=%s  "
+                                "trigger=%s  text=%.60s",
+                                rid, chat_id, rem.trigger_iso, rem.text,
+                            )
+                        except Exception as exc:
+                            logger.error(
+                                "reminder.save_failed  chat=%s  err=%s", chat_id, exc,
+                            )
+
+            # ── 8. save facts ────────────────────────────────────────────────
             with trace.step("memory_save"):
                 saved = created = updated = 0
-                save_errors: List[str] = []
 
                 if database.sqlite_store and result.memory_updates:
                     for mu in result.memory_updates:
@@ -353,41 +343,23 @@ async def process_message(
                                     "🧠 memory.updated  sender=%s  key=%s  value=%r",
                                     sender_key, mu.key, mu.value,
                                 )
-                            else:
-                                logger.debug(
-                                    "memory.unchanged  sender=%s  key=%s  value=%r",
-                                    sender_key, mu.key, mu.value,
-                                )
                             saved += 1
                         except Exception as exc:
-                            # Isolated per-key — one failure doesn't abort the rest
-                            err_msg = f"{type(exc).__name__}: {exc}"
-                            save_errors.append(f"{mu.key}: {err_msg}")
                             logger.error(
                                 "🧠 memory.save_failed  sender=%s  key=%s  err=%s",
                                 sender_key, mu.key, exc,
                             )
-
                 trace.tag(
-                    facts_saved=saved,
-                    facts_created=created,
-                    facts_updated=updated,
-                    facts_attempted=len(result.memory_updates),
-                    **({"save_errors": "; ".join(save_errors)} if save_errors else {}),
+                    facts_saved=saved, facts_created=created,
+                    facts_updated=updated, facts_attempted=len(result.memory_updates),
                 )
-
                 if result.memory_updates:
                     logger.info(
-                        "🧠 memory.summary  sender=%s  attempted=%d  "
-                        "created=%d  updated=%d  errors=%d",
-                        sender_key,
-                        len(result.memory_updates),
-                        created, updated, len(save_errors),
+                        "🧠 memory.summary  sender=%s  attempted=%d  created=%d  updated=%d",
+                        sender_key, len(result.memory_updates), created, updated,
                     )
                 else:
-                    logger.info(
-                        "🧠 memory.none  sender=%s  (no new facts this turn)", sender_key,
-                    )
+                    logger.info("🧠 memory.none  sender=%s", sender_key)
 
         finally:
             stop_evt.set()
@@ -398,7 +370,7 @@ async def process_message(
 
 
 # ---------------------------------------------------------------------------
-# Per-chat worker — self-cleaning on idle timeout
+# Per-chat worker
 # ---------------------------------------------------------------------------
 
 async def _chat_worker(chat_id: str, q: asyncio.Queue) -> None:
@@ -419,7 +391,6 @@ async def _chat_worker(chat_id: str, q: asyncio.Queue) -> None:
                     from_me=item["from_me"],
                 )
             except Exception:
-                # Log but do NOT re-raise — worker must survive per-message failures
                 logger.exception("worker.msg_error  chat=%s", chat_id)
             finally:
                 q.task_done()
@@ -437,22 +408,45 @@ async def _chat_worker(chat_id: str, q: asyncio.Queue) -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _scheduler
+
     compile_prefix_re()
     _integrity_check()
     database.init_stores()
     await init_waha()
     await init_llm()
+
+    # Start the reminder scheduler
+    if database.sqlite_store:
+        _scheduler = ReminderScheduler(
+            db=database.sqlite_store,
+            send_fn=send_text,
+        )
+        await _scheduler.start()
+
+    host = os.getenv("HOST", "0.0.0.0")
+    port = os.getenv("PORT", "6000")
     logger.info(
-        "🚀 startup.ready  allowlist=%d  allow_all=%s  "
-        "live_search=%s  chroma=%s  model_pool=%s",
+        "🚀 startup.ready  http://%s:%s  pid=%d  "
+        "allowlist=%d  allow_all=%s  live_search=%s  chroma=%s  model_pool=%s",
+        host, port, os.getpid(),
         len(settings.allowed_chat_jids or []),
         settings.allow_all_chats,
         settings.live_search_enabled,
         settings.chroma_enabled,
         settings.groq_model_pool,
     )
+    logger.info(
+        "ℹ️   To see the uvicorn 'Listening on' line, run with: "
+        "uvicorn app.main:app --host %s --port %s",
+        host, port,
+    )
+
     yield
+
     logger.info("🛑 shutdown.begin")
+    if _scheduler:
+        await _scheduler.stop()
     for _, t in list(CHAT_WORKERS.items()):
         try:
             t.cancel()
@@ -490,9 +484,7 @@ async def webhook(request: Request):
     try:
         body = await request.json()
     except Exception:
-        return JSONResponse(
-            {"status": "error", "message": "Invalid JSON"}, status_code=400,
-        )
+        return JSONResponse({"status": "error", "message": "Invalid JSON"}, status_code=400)
 
     sender_id, chat_id, text, from_me, event_id = normalize_event(body)
 
@@ -540,15 +532,13 @@ async def webhook(request: Request):
     try:
         await asyncio.wait_for(
             q.put({
-                "text":      text or "",
-                "sender_id": sender_id,
-                "event_id":  event_id,
-                "from_me":   from_me,
+                "text": text or "", "sender_id": sender_id,
+                "event_id": event_id, "from_me": from_me,
             }),
             timeout=settings.llm_queue_wait_sec,
         )
     except asyncio.TimeoutError:
-        await send_text(chat_id, "I'm busy — please try again in a few seconds.")
+        await send_text(chat_id, "I'm a bit busy right now — please try again in a moment.")
         logger.warning("⏳ queue.timeout  chat=%s  event=%s", chat_id, event_id)
         return JSONResponse({"status": "ok", "message": "queue timeout"})
 
@@ -566,10 +556,9 @@ async def webhook(request: Request):
 @app.get("/healthz")
 async def health():
     return {
-        "status":      "ok",
-        "workers":     len(CHAT_WORKERS),
-        "queues":      {cid: q.qsize() for cid, q in CHAT_QUEUES.items()},
-        "live_search": settings.live_search_enabled,
-        "chroma":      settings.chroma_enabled,
-        "model_pool":  settings.groq_model_pool,
+        "status":    "ok",
+        "workers":   len(CHAT_WORKERS),
+        "queues":    {cid: q.qsize() for cid, q in CHAT_QUEUES.items()},
+        "scheduler": _scheduler is not None,
+        "model_pool": settings.groq_model_pool,
     }
