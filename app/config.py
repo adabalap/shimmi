@@ -34,6 +34,11 @@ def _float(v: Optional[str], default: float) -> float:
 class Settings:
     data_dir: Path = Path(os.getenv("DATA_DIR", "./data"))
     app_timezone: str = os.getenv("APP_TIMEZONE", "UTC")
+
+    # Server binding — used only for the startup log line
+    port: int = _int(os.getenv("PORT", "6000"), 6000)
+    host: str = os.getenv("HOST", "0.0.0.0")
+
     bot_persona_name: str = os.getenv("BOT_PERSONA_NAME", "Shimmi")
     bot_command_prefix: str = os.getenv("BOT_COMMAND_PREFIX", "@shimmi,shimmi")
 
@@ -45,21 +50,22 @@ class Settings:
     waha_session: str = os.getenv("WAHA_SESSION", "default")
     webhook_secret: str = os.getenv("WEBHOOK_SECRET", "")
 
-    # ALLOW_ALL_CHATS=true → accept every chat (open/public mode).
-    # Default (false) → only JIDs in ALLOWED_GROUP_JIDS are accepted.
     allow_all_chats: bool = _bool(os.getenv("ALLOW_ALL_CHATS", "0"), False)
     allowed_chat_jids: Optional[List[str]] = None
 
     groq_api_key: str = os.getenv("GROQ_API_KEY", "")
     groq_model_pool: Optional[List[str]] = None
-    groq_timeout: float = _float(os.getenv("GROQ_TIMEOUT", "60"), 60.0)
+    groq_timeout: float = _float(os.getenv("GROQ_TIMEOUT", "45"), 45.0)
     groq_max_inflight: int = _int(os.getenv("GROQ_MAX_INFLIGHT", "5"), 5)
 
+    # Model routing — orchestrator gets the best model; extraction/verify use a fast small model
+    # Override these in .env for different performance/cost tradeoffs
+    orchestrator_model: str = os.getenv("ORCHESTRATOR_MODEL", "llama-3.3-70b-versatile")
+    extraction_model: str = os.getenv("EXTRACTION_MODEL", "llama-3.1-8b-instant")
+
     live_search_enabled: bool = _bool(os.getenv("LIVE_SEARCH_ENABLED", "1"), True)
-    # Valid Groq compound models: compound-beta  |  compound-beta-mini
     live_search_model: str = os.getenv("LIVE_SEARCH_MODEL", "compound-beta-mini")
 
-    # Max agentic loop turns before forcing an answer (2-6 recommended)
     agent_max_turns: int = _int(os.getenv("AGENT_MAX_TURNS", "4"), 4)
 
     chroma_enabled: bool = _bool(os.getenv("CHROMA_ENABLED", "1"), True)
@@ -76,10 +82,10 @@ class Settings:
     facts_min_conf: float = _float(os.getenv("FACTS_MIN_CONF", "0.85"), 0.85)
     allow_freeform_memory_keys: bool = _bool(os.getenv("ALLOW_FREEFORM_MEMORY_KEYS", "1"), True)
 
-    debug_agent: bool = _bool(os.getenv("DEBUG_AGENT", "0"), False)
+    # Reminder background task interval (seconds). Default: check every 60 seconds.
+    reminder_check_interval_sec: int = _int(os.getenv("REMINDER_CHECK_INTERVAL_SEC", "60"), 60)
 
-    # Set TRACE_LEVEL=DEBUG to get verbose TRACE lines in logs.
-    # Default INFO already includes all TRACE lines.
+    debug_agent: bool = _bool(os.getenv("DEBUG_AGENT", "0"), False)
     trace_enabled: bool = _bool(os.getenv("TRACE_ENABLED", "1"), True)
 
     def __post_init__(self):

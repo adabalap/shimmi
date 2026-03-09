@@ -1,20 +1,20 @@
 """
-logging_setup.py — Shimmi v2.7.0
+logging_setup.py — Shimmi v2.8.0
 
-Silenced loggers (CRITICAL — never appear in logs):
-  uvicorn.access                   — POST /webhook 200 OK noise
-  uvicorn.protocols.*              — "Invalid HTTP request received" (port scanners)
-  chromadb.*                       — posthog telemetry API mismatch (not our bug)
-  httpx / httpcore                 — internal WAHA + Groq request lines
-  sentence_transformers.*          — model-load chatter
-  groq.* / openai.*                — SDK internals
+Silenced (CRITICAL — never shown):
+  uvicorn.access               — POST /webhook 200 OK noise
+  uvicorn.protocols.*          — "Invalid HTTP request received" (port scanners)
+  chromadb.*                   — posthog telemetry API mismatch
+  httpx / httpcore             — internal WAHA + Groq request lines
+  sentence_transformers.*      — model-load chatter
+  groq.* / openai.*            — SDK internals
 
-Kept at WARNING:
-  uvicorn / uvicorn.error          — server lifecycle (startup/shutdown)
+Kept at INFO (shows startup/shutdown + application ready line):
+  uvicorn / uvicorn.error      — shows "Uvicorn running on http://..." ✓
 
-Always at INFO (regardless of LOG_LEVEL):
-  app.trace                        — per-message waterfall
-  app.tx                           — TX summary lines
+Always at INFO:
+  app.trace                    — per-message waterfall
+  app.tx                       — TX summary lines
 """
 from __future__ import annotations
 
@@ -33,42 +33,28 @@ def setup_logging() -> None:
 
     # ── completely silence noisy third-party loggers ──────────────────────
     _silence = [
-        # uvicorn HTTP access log (200 OK lines)
         "uvicorn.access",
-        # uvicorn protocol layer — "Invalid HTTP request received"
-        # These come from port scanners / TLS probes on a plain HTTP port.
-        # They are harmless and entirely actionless — pure noise.
         "uvicorn.protocols",
         "uvicorn.protocols.http",
         "uvicorn.protocols.http.h11_impl",
         "uvicorn.protocols.http.httptools_impl",
         "uvicorn.protocols.websockets",
         "uvicorn.protocols.websockets.websockets_impl",
-        # chromadb posthog telemetry (capture() positional arg mismatch)
-        "chromadb",
-        "chromadb.telemetry",
-        "chromadb.telemetry.product",
-        "chromadb.telemetry.product.posthog",
-        # httpx / httpcore — internal WAHA + Groq API call lines
-        "httpx",
-        "httpcore",
-        "httpcore.connection",
-        "httpcore.http11",
-        # sentence_transformers model-loading verbosity
-        "sentence_transformers",
-        "sentence_transformers.SentenceTransformer",
-        # Groq and openai SDK internals
-        "groq",
-        "groq._base_client",
-        "openai",
-        "openai._base_client",
+        "chromadb", "chromadb.telemetry",
+        "chromadb.telemetry.product", "chromadb.telemetry.product.posthog",
+        "httpx", "httpcore", "httpcore.connection", "httpcore.http11",
+        "sentence_transformers", "sentence_transformers.SentenceTransformer",
+        "groq", "groq._base_client",
+        "openai", "openai._base_client",
     ]
     for name in _silence:
         logging.getLogger(name).setLevel(logging.CRITICAL)
 
-    # ── keep uvicorn server lifecycle messages (startup / shutdown) ────────
-    logging.getLogger("uvicorn").setLevel(logging.WARNING)
-    logging.getLogger("uvicorn.error").setLevel(logging.WARNING)
+    # ── show uvicorn startup message ("Uvicorn running on http://…") ──────
+    # Setting to INFO here means you'll see the "Listening on" line at startup
+    # plus any warnings/errors. Access log (200 OK) is silenced above.
+    logging.getLogger("uvicorn").setLevel(logging.INFO)
+    logging.getLogger("uvicorn.error").setLevel(logging.INFO)
 
     # ── trace + tx always visible ──────────────────────────────────────────
     logging.getLogger("app.trace").setLevel(logging.INFO)
