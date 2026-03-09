@@ -1,0 +1,114 @@
+{
+  "timestamp": "2026-03-09T23:53:50.148090",
+  "config": {
+    "webhook_url": "http://129.159.226.51:6000/webhook",
+    "user_phone": "4930656034916@lid",
+    "user_name": "Sarah TestUser",
+    "bot_phone": "919573717667@c.us",
+    "session": "default",
+    "delay": 2,
+    "message_delay": 10,
+    "timeout": 30
+  },
+  "total_messages": 8,
+  "successful": 3,
+  "failed": 5,
+  "results": [
+    {
+      "message_num": 1,
+      "phase": "Memory Recall Tests - Immediate Recall",
+      "test": "Tests all memory types - CRITICAL",
+      "message": "Spock what's my coffee order?",
+      "full_message": "Spock what's my coffee order?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+      "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+      "timestamp": "2026-03-09T23:50:02.238362"
+    },
+    {
+      "message_num": 2,
+      "phase": "Memory Recall Tests - Immediate Recall",
+      "test": "Tests all memory types - CRITICAL",
+      "message": "Spock what podcasts do I listen to?",
+      "full_message": "Spock what podcasts do I listen to?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+      "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+      "timestamp": "2026-03-09T23:50:14.354008"
+    },
+    {
+      "message_num": 3,
+      "phase": "Memory Recall Tests - Immediate Recall",
+      "test": "Tests all memory types - CRITICAL",
+      "message": "Spock where am I planning to travel next summer?",
+      "full_message": "Spock where am I planning to travel next summer?",
+      "status_code": 200,
+      "success": true,
+      "response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+      "full_response": "{\"status\":\"ok\",\"message\":\"enqueued\"}",
+      "timestamp": "2026-03-09T23:50:26.844352"
+    },
+    {
+      "message_num": 4,
+      "phase": "Memory Recall Tests - Medium-term Recall",
+      "test": "Tests all memory types - CRITICAL",
+      "message": "Spock what are my pets' names and ages?",
+      "full_message": "Spock what are my pets' names and ages?",
+      "status_code": 0,
+      "success": false,
+      "response": "HTTPConnectionPool(host='129.159.226.51', port=6000): Read timed out. (read timeout=30)",
+      "full_response": "HTTPConnectionPool(host='129.159.226.51', port=6000): Read timed out. (read timeout=30)",
+      "timestamp": "2026-03-09T23:51:12.740596"
+    },
+    {
+      "message_num": 5,
+      "phase": "Memory Recall Tests - Medium-term Recall",
+      "test": "Tests all memory types - CRITICAL",
+      "message": "Spock what's my favorite hiking trail?",
+      "full_message": "Spock what's my favorite hiking trail?",
+      "status_code": 0,
+      "success": false,
+      "response": "HTTPConnectionPool(host='129.159.226.51', port=6000): Read timed out. (read timeout=30)",
+      "full_response": "HTTPConnectionPool(host='129.159.226.51', port=6000): Read timed out. (read timeout=30)",
+      "timestamp": "2026-03-09T23:51:44.942310"
+    },
+    {
+      "message_num": 6,
+      "phase": "Memory Recall Tests - Medium-term Recall",
+      "test": "Tests all memory types - CRITICAL",
+      "message": "Spock what project am I currently working on?",
+      "full_message": "Spock what project am I currently working on?",
+      "status_code": 0,
+      "success": false,
+      "response": "HTTPConnectionPool(host='129.159.226.51', port=6000): Read timed out. (read timeout=30)",
+      "full_response": "HTTPConnectionPool(host='129.159.226.51', port=6000): Read timed out. (read timeout=30)",
+      "timestamp": "2026-03-09T23:52:15.140197"
+    },
+    {
+      "message_num": 7,
+      "phase": "Memory Recall Tests - Long-term Recall",
+      "test": "Tests all memory types - CRITICAL",
+      "message": "Spock what's my name and age?",
+      "full_message": "Spock what's my name and age?",
+      "status_code": 0,
+      "success": false,
+      "response": "HTTPConnectionPool(host='129.159.226.51', port=6000): Read timed out. (read timeout=30)",
+      "full_response": "HTTPConnectionPool(host='129.159.226.51', port=6000): Read timed out. (read timeout=30)",
+      "timestamp": "2026-03-09T23:52:45.364203"
+    },
+    {
+      "message_num": 8,
+      "phase": "Memory Recall Tests - Long-term Recall",
+      "test": "Tests all memory types - CRITICAL",
+      "message": "Spock where do I live and what do I do for work?",
+      "full_message": "Spock where do I live and what do I do for work?",
+      "status_code": 0,
+      "success": false,
+      "response": "HTTPConnectionPool(host='129.159.226.51', port=6000): Read timed out. (read timeout=30)",
+      "full_response": "HTTPConnectionPool(host='129.159.226.51', port=6000): Read timed out. (read timeout=30)",
+      "timestamp": "2026-03-09T23:53:17.338167"
+    }
+  ]
+}

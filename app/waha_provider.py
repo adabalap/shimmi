@@ -162,21 +162,52 @@ async def typing_keepalive(chat_id: str, stop_event: asyncio.Event) -> None:
 
 
 async def _post(path: str, payload: dict) -> dict:
+    """
+    POST to WAHA with smart retry:
+      - 4xx (client errors): raise immediately, no retry — our payload is wrong
+      - 5xx (server errors): retry up to 3x with exponential backoff — WAHA transient
+      - Network errors: retry normally
+    """
     if not HTTPX_WAHA:
         raise RuntimeError("waha not initialized")
 
-    async def _do() -> dict:
-        resp = await HTTPX_WAHA.post(
-            f"{settings.waha_api_url}/{path.lstrip('/')}",
-            json=payload,
-        )
-        resp.raise_for_status()
+    attempt = 0
+    last_exc: Optional[Exception] = None
+    while attempt < 3:
+        attempt += 1
         try:
-            return resp.json() or {}
-        except Exception:
-            return {}
+            resp = await HTTPX_WAHA.post(
+                f"{settings.waha_api_url}/{path.lstrip('/')}",
+                json=payload,
+            )
+            if 400 <= resp.status_code < 500:
+                # Client error — don't retry, our request is malformed
+                resp.raise_for_status()
+            if resp.status_code >= 500:
+                # Server error — log and retry with back-off
+                logger.warning(
+                    "⚠️  waha.server_error  path=%s  status=%d  attempt=%d/3",
+                    path, resp.status_code, attempt,
+                )
+                if attempt >= 3:
+                    resp.raise_for_status()
+                await asyncio.sleep(1.5 * attempt)
+                continue
+            try:
+                return resp.json() or {}
+            except Exception:
+                return {}
+        except httpx.HTTPStatusError:
+            raise
+        except Exception as exc:
+            last_exc = exc
+            if attempt >= 3:
+                raise
+            await asyncio.sleep(0.5 * attempt)
 
-    return await async_retry(_do, max_attempts=3, base_delay=0.4, max_delay=4.0)
+    if last_exc:
+        raise last_exc
+    raise RuntimeError("waha._post: exhausted retries")
 
 
 async def send_text(chat_id: str, text: str) -> dict:

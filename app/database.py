@@ -1,9 +1,11 @@
 """
-database.py — Shimmi v2.8.0
+database.py — Shimmi v2.9.2
 
-New in v2.8.0:
-  • reminders table — stores structured trigger data for the scheduler
-  • add_reminder(), get_due_reminders(), mark_reminder_sent() methods
+Changes vs v2.7.0:
+  ① reminders table + ReminderStore methods
+     - add_reminder(), get_due_reminders(), mark_reminder_sent()
+     - get_user_reminders(), cancel_reminder()
+  ② Dataclass Reminder for typed reminder records
 """
 from __future__ import annotations
 
@@ -11,7 +13,7 @@ import asyncio
 import logging
 import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -28,20 +30,22 @@ UTC    = timezone.utc
 # ---------------------------------------------------------------------------
 
 _KEY_ALIASES: Dict[str, str] = {
-    "user_name": "name", "username": "name",
-    "first_name": "name", "full_name": "name",
-    "user_city": "city", "user_location": "city",
-    "location": "city", "hometown": "city",
+    "user_name": "name", "username": "name", "first_name": "name", "full_name": "name",
+    "user_city": "city", "user_location": "city", "location": "city", "hometown": "city",
     "user_country": "country",
-    "user_favorite_drink": "favorite_drink",
-    "preferred_drink": "favorite_drink",
+    "user_favorite_drink": "favorite_drink", "preferred_drink": "favorite_drink",
     "user_drink": "favorite_drink", "drink": "favorite_drink",
     "user_interests": "interests", "user_interest": "interests",
     "user_hobby": "hobbies", "user_hobbies": "hobbies",
     "user_occupation": "occupation", "user_job": "occupation", "job": "occupation",
     "user_age": "age",
     "user_language": "preferred_language", "language": "preferred_language",
+    "grocery": "grocery_list", "groceries": "grocery_list",
+    "shopping": "shopping_list",
+    "todo": "todo_list", "todos": "todo_list",
 }
+
+_SPECIAL_PREFIXES = ("_reminder", "_cancel_reminder")
 
 
 def normalize_key(raw: str) -> str:
@@ -64,17 +68,29 @@ def normalize_key(raw: str) -> str:
 @dataclass
 class Reminder:
     id:            int
-    chat_id:       str
     whatsapp_id:   str
-    user_name:     Optional[str]
+    chat_id:       str
     reminder_text: str
-    trigger_iso:   str
-    status:        str
+    trigger_iso:   str          # ISO 8601 with tz offset, e.g. "2026-03-09T06:00+05:30"
     created_at:    str
+    sent_at:       Optional[str] = None
+    cancelled:     bool          = False
+    failed:        bool          = False
+    user_name:     str           = ""  # populated from facts at send time
+
+    @property
+    def status(self) -> str:
+        if self.cancelled:
+            return "cancelled"
+        if self.failed:
+            return "failed"
+        if self.sent_at:
+            return "sent"
+        return "pending"
 
 
 # ---------------------------------------------------------------------------
-# SQLite memory store
+# SQLite memory + reminder store
 # ---------------------------------------------------------------------------
 
 class SQLiteMemory:
@@ -90,6 +106,7 @@ class SQLiteMemory:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=5000")
 
+            # ── user facts KV ──────────────────────────────────────────────
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_memory (
                     whatsapp_id  TEXT NOT NULL,
@@ -102,6 +119,7 @@ class SQLiteMemory:
             """)
             self._migrate(conn)
 
+            # ── message log ───────────────────────────────────────────────
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS message_log (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -119,23 +137,26 @@ class SQLiteMemory:
                 "ON message_log(chat_id, ts DESC)"
             )
 
-            # ── reminders table ────────────────────────────────────────────
+            # ── reminders ─────────────────────────────────────────────────
+            # NOTE: _migrate() may have already rebuilt this table from an older
+            # schema. CREATE TABLE IF NOT EXISTS is a no-op in that case — the
+            # migrated table with the correct schema is already in place.
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS reminders (
-                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                    chat_id       TEXT NOT NULL,
-                    whatsapp_id   TEXT NOT NULL,
-                    user_name     TEXT,
-                    reminder_text TEXT NOT NULL,
-                    trigger_iso   TEXT NOT NULL,
-                    status        TEXT NOT NULL DEFAULT 'pending',
-                    created_at    TEXT NOT NULL,
-                    sent_at       TEXT
+                    id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                    whatsapp_id    TEXT NOT NULL,
+                    chat_id        TEXT NOT NULL,
+                    reminder_text  TEXT NOT NULL,
+                    trigger_iso    TEXT NOT NULL,
+                    created_at     TEXT NOT NULL,
+                    sent_at        TEXT,
+                    cancelled      INTEGER NOT NULL DEFAULT 0,
+                    failed         INTEGER NOT NULL DEFAULT 0
                 )
             """)
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_reminders_trigger "
-                "ON reminders(trigger_iso, status)"
+                "ON reminders(trigger_iso) WHERE sent_at IS NULL AND cancelled=0 AND failed=0"
             )
             conn.commit()
 
@@ -143,11 +164,12 @@ class SQLiteMemory:
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
-        existing = {
+        # ── user_memory migrations ─────────────────────────────────────────
+        um_cols = {
             row[1]
             for row in conn.execute("PRAGMA table_info(user_memory)").fetchall()
         }
-        if "created_at" not in existing:
+        if "created_at" not in um_cols:
             logger.info("🗄️  migrate — adding created_at to user_memory")
             conn.execute("ALTER TABLE user_memory ADD COLUMN created_at TEXT")
             conn.execute(
@@ -155,18 +177,83 @@ class SQLiteMemory:
             )
             conn.commit()
             logger.info("🗄️  migrate — created_at back-filled ✓")
-        if "updated_at" not in existing:
+        if "updated_at" not in um_cols:
             now = datetime.now(UTC).isoformat()
             conn.execute(
                 f"ALTER TABLE user_memory ADD COLUMN updated_at TEXT DEFAULT '{now}'"
             )
             conn.commit()
 
-    # ── facts ──────────────────────────────────────────────────────────────
+        # ── reminders table migration ──────────────────────────────────────
+        # v2.9.0 canonical schema uses cancelled/failed INTEGER booleans.
+        # Any prior variant (no trigger_iso, status TEXT, user_name TEXT, etc.)
+        # must be rebuilt. We check for the EXACT v2.9.0 columns; anything
+        # missing triggers a rename+rebuild so queries never hit missing columns.
+        tables = {
+            row[0]
+            for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table'"
+            ).fetchall()
+        }
+        if "reminders" in tables:
+            rem_cols = {
+                row[1]
+                for row in conn.execute("PRAGMA table_info(reminders)").fetchall()
+            }
+            # v2.9.0 requires cancelled + failed boolean columns.
+            # Any older schema (status TEXT, missing trigger_iso, etc.) is rebuilt.
+            required = {"cancelled", "failed", "trigger_iso",
+                        "chat_id", "whatsapp_id", "reminder_text", "created_at"}
+            if not required.issubset(rem_cols):
+                logger.info(
+                    "🗄️  migrate — reminders schema outdated (missing: %s), rebuilding",
+                    ", ".join(sorted(required - rem_cols)),
+                )
+                # Drop any partial index that references missing columns
+                conn.execute("DROP INDEX IF EXISTS idx_reminders_trigger")
+                # Rename old table so we can recreate with new schema
+                conn.execute("ALTER TABLE reminders RENAME TO reminders_old")
+                # Create the new schema (v2.9.0: cancelled/failed booleans)
+                conn.execute("""
+                    CREATE TABLE reminders (
+                        id             INTEGER PRIMARY KEY AUTOINCREMENT,
+                        whatsapp_id    TEXT NOT NULL,
+                        chat_id        TEXT NOT NULL,
+                        reminder_text  TEXT NOT NULL,
+                        trigger_iso    TEXT NOT NULL,
+                        created_at     TEXT NOT NULL,
+                        sent_at        TEXT,
+                        cancelled      INTEGER NOT NULL DEFAULT 0,
+                        failed         INTEGER NOT NULL DEFAULT 0
+                    )
+                """)
+                # Copy rows that have the columns we need (best-effort).
+                # If old table has trigger_iso we copy it; otherwise use a
+                # sentinel past-date so the scheduler marks it stale+drops it.
+                if "chat_id" in rem_cols and "reminder_text" in rem_cols:
+                    now_iso     = datetime.now(UTC).isoformat()
+                    wa_col      = "whatsapp_id" if "whatsapp_id" in rem_cols else "''"
+                    ca_col      = "created_at"  if "created_at"  in rem_cols else f"'{now_iso}'"
+                    trigger_col = "trigger_iso" if "trigger_iso" in rem_cols else "'2000-01-01T00:00:00+00:00'"
+                    conn.execute(
+                        f"""INSERT INTO reminders
+                            (whatsapp_id, chat_id, reminder_text,
+                             trigger_iso, created_at, failed)
+                           SELECT {wa_col}, chat_id, reminder_text,
+                                  {trigger_col}, {ca_col}, 1
+                           FROM reminders_old
+                           WHERE reminder_text IS NOT NULL"""
+                    )
+                    logger.info("🗄️  migrate — reminders rows copied (marked failed/stale)")
+                conn.execute("DROP TABLE reminders_old")
+                conn.commit()
+                logger.info("🗄️  migrate — reminders table rebuilt ✓")
+
+    # ── facts API ──────────────────────────────────────────────────────────
 
     async def get_all_facts(self, whatsapp_id: str) -> Dict[str, str]:
         async with self._lock:
-            def _do() -> Dict[str, str]:
+            def _do():
                 with sqlite3.connect(self.path) as conn:
                     cur = conn.execute(
                         "SELECT fact_key, fact_value FROM user_memory "
@@ -186,13 +273,13 @@ class SQLiteMemory:
         value = (value or "").strip()
         if not key or not value:
             return "unchanged"
-
         async with self._lock:
-            def _do() -> str:
+            def _do():
                 now = datetime.now(UTC).isoformat()
                 with sqlite3.connect(self.path) as conn:
                     cur = conn.execute(
-                        "SELECT fact_value FROM user_memory WHERE whatsapp_id=? AND fact_key=?",
+                        "SELECT fact_value FROM user_memory "
+                        "WHERE whatsapp_id=? AND fact_key=?",
                         (whatsapp_id, key),
                     )
                     row = cur.fetchone()
@@ -216,16 +303,13 @@ class SQLiteMemory:
                     return "updated"
             return await asyncio.to_thread(_do)
 
-    # ── message log ────────────────────────────────────────────────────────
-
     async def log_message(
-        self, *, chat_id: str, whatsapp_id: Optional[str],
-        direction: str, text: str, ts: str, event_id: Optional[str] = None,
+        self, *, chat_id, whatsapp_id, direction, text, ts, event_id=None,
     ) -> None:
         if not chat_id or not (text or "").strip():
             return
         async with self._lock:
-            def _do() -> None:
+            def _do():
                 with sqlite3.connect(self.path) as conn:
                     try:
                         conn.execute(
@@ -236,75 +320,135 @@ class SQLiteMemory:
                         )
                         conn.commit()
                     except sqlite3.IntegrityError:
-                        pass  # duplicate event_id
+                        pass
             await asyncio.to_thread(_do)
 
-    # ── reminders ──────────────────────────────────────────────────────────
+    # ── reminders API ──────────────────────────────────────────────────────
 
     async def add_reminder(
         self,
-        *,
-        chat_id:       str,
-        whatsapp_id:   str,
-        user_name:     Optional[str],
-        reminder_text: str,
-        trigger_iso:   str,
+        whatsapp_id: str,
+        chat_id:     str,
+        text:        str,
+        trigger_iso: str,
     ) -> int:
-        """
-        Save a scheduled reminder. Returns the new row id.
-        trigger_iso must be an ISO 8601 string with timezone offset.
-        """
+        """Insert a new reminder. Returns its auto-increment id."""
         async with self._lock:
             def _do() -> int:
                 now = datetime.now(UTC).isoformat()
                 with sqlite3.connect(self.path) as conn:
                     cur = conn.execute(
                         "INSERT INTO reminders "
-                        "(chat_id, whatsapp_id, user_name, reminder_text, trigger_iso, created_at) "
-                        "VALUES (?,?,?,?,?,?)",
-                        (chat_id, whatsapp_id, user_name, reminder_text, trigger_iso, now),
+                        "(whatsapp_id, chat_id, reminder_text, trigger_iso, created_at) "
+                        "VALUES (?,?,?,?,?)",
+                        (whatsapp_id, chat_id, text.strip(), trigger_iso.strip(), now),
                     )
                     conn.commit()
                     return cur.lastrowid
             return await asyncio.to_thread(_do)
 
-    async def get_due_reminders(self) -> List[Reminder]:
-        """Return pending reminders whose trigger_iso <= now (UTC ISO)."""
+    async def get_user_reminders(
+        self, whatsapp_id: str, include_sent: bool = False,
+    ) -> List[Reminder]:
+        """Return reminders for a user (pending by default, or all)."""
         async with self._lock:
             def _do() -> List[Reminder]:
-                now_iso = datetime.now(UTC).isoformat()
+                with sqlite3.connect(self.path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    base = (
+                        "SELECT * FROM reminders WHERE whatsapp_id=? "
+                        "ORDER BY trigger_iso ASC"
+                    )
+                    rows = conn.execute(base, (whatsapp_id,)).fetchall()
+                    out = []
+                    for row in rows:
+                        r = Reminder(
+                            id=row["id"], whatsapp_id=row["whatsapp_id"],
+                            chat_id=row["chat_id"], reminder_text=row["reminder_text"],
+                            trigger_iso=row["trigger_iso"], created_at=row["created_at"],
+                            sent_at=row["sent_at"], cancelled=bool(row["cancelled"]),
+                            failed=bool(row["failed"]),
+                        )
+                        if include_sent or r.status == "pending":
+                            out.append(r)
+                    return out
+            return await asyncio.to_thread(_do)
+
+    async def cancel_reminder(self, reminder_id: int) -> bool:
+        """Mark a reminder as cancelled. Returns True if found."""
+        async with self._lock:
+            def _do() -> bool:
                 with sqlite3.connect(self.path) as conn:
                     cur = conn.execute(
-                        "SELECT id, chat_id, whatsapp_id, user_name, reminder_text, "
-                        "trigger_iso, status, created_at "
-                        "FROM reminders "
-                        "WHERE status='pending' AND trigger_iso <= ? "
-                        "ORDER BY trigger_iso ASC",
-                        (now_iso,),
+                        "UPDATE reminders SET cancelled=1 WHERE id=? AND sent_at IS NULL",
+                        (reminder_id,),
                     )
-                    rows = cur.fetchall()
-                return [Reminder(*row) for row in rows]
+                    conn.commit()
+                    return cur.rowcount > 0
+            return await asyncio.to_thread(_do)
+
+    async def get_due_reminders(self) -> List[Reminder]:
+        """Return all unfired, non-cancelled reminders whose trigger time <= now (UTC).
+
+        IMPORTANT: Uses timezone-aware Python comparison, NOT SQL string comparison.
+        SQL string comparison of ISO timestamps with different offsets is incorrect:
+          '2026-03-09T13:00:00+05:30' > '2026-03-09T11:49:00+00:00'  ← string says NOT due
+        but 13:00 IST = 07:30 UTC which IS before 11:49 UTC.
+        """
+        async with self._lock:
+            def _do() -> List[Reminder]:
+                now_utc = datetime.now(UTC)
+                with sqlite3.connect(self.path) as conn:
+                    conn.row_factory = sqlite3.Row
+                    rows = conn.execute(
+                        "SELECT * FROM reminders "
+                        "WHERE sent_at IS NULL AND cancelled=0 AND failed=0 "
+                        "ORDER BY trigger_iso ASC",
+                    ).fetchall()
+                    result = []
+                    for row in rows:
+                        try:
+                            # Parse ISO with timezone offset (e.g. +05:30)
+                            trigger_dt = datetime.fromisoformat(row["trigger_iso"])
+                            if trigger_dt.tzinfo is None:
+                                trigger_dt = trigger_dt.replace(tzinfo=UTC)
+                            # Convert to UTC for correct comparison
+                            trigger_utc = trigger_dt.astimezone(UTC)
+                            if trigger_utc <= now_utc:
+                                result.append(Reminder(
+                                    id=row["id"], whatsapp_id=row["whatsapp_id"],
+                                    chat_id=row["chat_id"], reminder_text=row["reminder_text"],
+                                    trigger_iso=row["trigger_iso"], created_at=row["created_at"],
+                                    sent_at=row["sent_at"],
+                                ))
+                        except (ValueError, TypeError):
+                            # Bad trigger_iso — still return it so scheduler can mark failed
+                            result.append(Reminder(
+                                id=row["id"], whatsapp_id=row["whatsapp_id"],
+                                chat_id=row["chat_id"], reminder_text=row["reminder_text"],
+                                trigger_iso=row["trigger_iso"], created_at=row["created_at"],
+                                sent_at=row["sent_at"],
+                            ))
+                    return result
             return await asyncio.to_thread(_do)
 
     async def mark_reminder_sent(self, reminder_id: int) -> None:
         async with self._lock:
-            def _do() -> None:
-                sent_at = datetime.now(UTC).isoformat()
+            def _do():
+                now = datetime.now(UTC).isoformat()
                 with sqlite3.connect(self.path) as conn:
                     conn.execute(
-                        "UPDATE reminders SET status='sent', sent_at=? WHERE id=?",
-                        (sent_at, reminder_id),
+                        "UPDATE reminders SET sent_at=? WHERE id=?", (now, reminder_id)
                     )
                     conn.commit()
             await asyncio.to_thread(_do)
 
     async def mark_reminder_failed(self, reminder_id: int) -> None:
         async with self._lock:
-            def _do() -> None:
+            def _do():
                 with sqlite3.connect(self.path) as conn:
                     conn.execute(
-                        "UPDATE reminders SET status='failed' WHERE id=?",
-                        (reminder_id,),
+                        "UPDATE reminders SET failed=1 WHERE id=?", (reminder_id,)
                     )
                     conn.commit()
             await asyncio.to_thread(_do)
@@ -351,10 +495,7 @@ class ChromaAmbient:
             str(persist_dir), collection_name,
         )
 
-    async def add_message(
-        self, *, chat_id: str, whatsapp_id: str, direction: str,
-        text: str, ts: str, message_id: str,
-    ) -> None:
+    async def add_message(self, *, chat_id, whatsapp_id, direction, text, ts, message_id):
         if not (chat_id and (text or "").strip()):
             return
         doc_id = f"{chat_id}:{message_id}:{direction}"
@@ -363,33 +504,31 @@ class ChromaAmbient:
             lambda: self.collection.upsert(ids=[doc_id], documents=[text], metadatas=[meta])
         )
 
-    async def search(self, *, chat_id: str, query: str, k: int) -> List[ContextSnippet]:
+    async def search(self, *, chat_id, query, k):
         res = await asyncio.to_thread(
-            lambda: self.collection.query(
-                query_texts=[query], n_results=k, where={"chat_id": chat_id}
-            )
+            lambda: self.collection.query(query_texts=[query], n_results=k, where={"chat_id": chat_id})
         )
-        out: List[ContextSnippet] = []
-        ids   = res.get("ids",       [[]])[0]
-        docs  = res.get("documents", [[]])[0]
-        metas = res.get("metadatas", [[]])[0]
-        dists = res.get("distances", [[None] * len(ids)])[0]
-        for _id, doc, meta, dist in zip(ids, docs, metas, dists):
-            out.append(ContextSnippet(id=_id, text=doc, metadata=meta or {}, distance=dist))
-        return out
+        return [
+            ContextSnippet(id=_id, text=doc, metadata=meta or {}, distance=dist)
+            for _id, doc, meta, dist in zip(
+                res.get("ids",[[]])[0], res.get("documents",[[]])[0],
+                res.get("metadatas",[[]])[0], res.get("distances",[[None]*k])[0],
+            )
+        ]
 
-    async def recent_window(self, *, chat_id: str, k: int) -> List[ContextSnippet]:
+    async def recent_window(self, *, chat_id, k):
         res = await asyncio.to_thread(
             lambda: self.collection.get(
                 where={"chat_id": chat_id}, limit=max(50, k * 5),
                 include=["documents", "metadatas"],
             )
         )
-        items: List[ContextSnippet] = []
-        for _id, doc, meta in zip(
-            res.get("ids", []), res.get("documents", []), res.get("metadatas", [])
-        ):
-            items.append(ContextSnippet(id=_id, text=doc, metadata=meta or {}, distance=None))
+        items = [
+            ContextSnippet(id=_id, text=doc, metadata=meta or {})
+            for _id, doc, meta in zip(
+                res.get("ids", []), res.get("documents", []), res.get("metadatas", [])
+            )
+        ]
         items.sort(key=lambda x: x.metadata.get("ts", ""), reverse=True)
         return items[:k]
 
