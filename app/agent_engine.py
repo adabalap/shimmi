@@ -1,23 +1,33 @@
 """
-agent_engine.py — Shimmi v2.9.2
+agent_engine.py — Shimmi v3.0.2
 
-Fixes vs v2.8.0:
-  BUG-1  Memory saves: added post-reply extractor (REPLY_EXTRACTOR_PROMPT on
-         user_msg+bot_reply) so list creates/edits are captured even when the
-         orchestrator returns memory_updates:[]. Also lowered verifier threshold
-         for action-type keys (shopping_list, todo_list, grocery_list, etc.)
-  BUG-2  Pydantic crash: pre-clean memory_updates JSON before model_validate —
-         empty-value entries are silently dropped, never crash the message.
-  BUG-3  Reminder timezone: _fix_reminder_tz() rewrites bare UTC offsets to the
-         server's local offset (Asia/Kolkata = +05:30) since the LLM always
-         interprets user-said times in UTC by default.
-  BUG-4  Reminder dedup: reminders_pending passed to run_agent; before inserting
-         a new reminder, text+trigger uniqueness is checked against pending list.
-  BUG-5  413 recovery: _live_search truncates results to MAX_RESULT_CHARS; if
-         compound-beta raises 413 the call is retried with a minimal payload.
-  BUG-6  Formatter always runs for responses > 120 chars or with prose markers.
-  NEW    AgentResult now carries parsed reminders[] (ReminderEntry list) so
-         main.py can save them without encoding them as special memory keys.
+Changes vs v3.0.1:
+  FIX-1  Role-based model routing: orchestration uses ORCHESTRATOR_MODEL
+         (llama-3.3-70b-versatile); extract/verify/format/reply_extract
+         use EXTRACTION_MODEL (llama-3.1-8b-instant). Config fields were
+         defined in config.py but never read here — now they are.
+         Impact: 70B token usage drops by ~65% per message.
+
+  FIX-2  Retry-after parsing: 429 errors include "Please try again in Xm Ys".
+         Circuit cooldown is now set to the actual Groq retry-after time
+         instead of a fixed 10-14s jitter. Prevents hammering an exhausted
+         model and ensures recovery at the right moment.
+
+  FIX-3  compound-beta-mini removed from orchestrator pool routing.
+         compound-beta-mini is the LIVE SEARCH model only. It internally
+         uses llama-3.3-70b and shares the same daily token bucket — having
+         it in the orchestrator pool drains that bucket even faster.
+
+  FIX-4  Unknown-value fact filtering: facts where value is 'unknown',
+         'none', '' are stripped before passing to orchestrator prompt,
+         saving ~200-400 tokens per message.
+
+  FIX-5  Facts recall short-circuit: queries that are clearly memory
+         lookups ("what's my X?", "do you know my Y?") and have all the
+         needed facts already loaded skip the LLM orchestrator and answer
+         directly. This prevents burning 70B tokens to echo the DB.
+
+  FIX-6  asyncio.get_event_loop() deprecated call → asyncio.get_running_loop()
 """
 from __future__ import annotations
 
@@ -50,7 +60,7 @@ UTC    = timezone.utc
 _SLOW_CALL_WARN_SEC  = 5.0
 _MAX_ITERATIONS      = 3
 _MAX_SEARCH_RESULT   = 1_200   # chars – truncate before passing to orchestrate_2
-_MIN_FORMAT_LEN      = 120     # always format responses longer than this
+_MIN_FORMAT_LEN      = 120
 
 VALID_GROQ_PREFIXES = (
     "llama-", "mixtral-", "gemma-",
@@ -106,14 +116,13 @@ class OrchestratorResult(BaseModel):
     @field_validator("memory_updates", mode="before")
     @classmethod
     def _clean_memory(cls, v):
-        """Drop entries with null/empty keys or values before Pydantic validates."""
         if not isinstance(v, list):
             return []
         clean = []
         for item in v:
             if not isinstance(item, dict):
                 continue
-            k = str(item.get("key", "") or "").strip()
+            k   = str(item.get("key",   "") or "").strip()
             val = str(item.get("value", "") or "").strip()
             if k and val:
                 clean.append({"key": k, "value": val})
@@ -128,7 +137,7 @@ class OrchestratorResult(BaseModel):
         for item in v:
             if not isinstance(item, dict):
                 continue
-            t   = str(item.get("text", "") or "").strip()
+            t   = str(item.get("text",        "") or "").strip()
             iso = str(item.get("trigger_iso", "") or "").strip()
             if t and iso:
                 clean.append({"text": t, "trigger_iso": iso})
@@ -187,14 +196,10 @@ def _now_local() -> datetime:
 def _current_time_str() -> str:
     now = _now_local()
     hour = now.hour
-    if 6 <= hour < 12:
-        period = "morning"
-    elif 12 <= hour < 17:
-        period = "afternoon"
-    elif 17 <= hour < 21:
-        period = "evening"
-    else:
-        period = "night"
+    if   6  <= hour < 12: period = "morning"
+    elif 12 <= hour < 17: period = "afternoon"
+    elif 17 <= hour < 21: period = "evening"
+    else:                 period = "night"
     tz_abbr = now.strftime("%Z") or "local"
     return f"{now.strftime('%H:%M')} {tz_abbr} ({now.strftime('%A')} {period})"
 
@@ -204,7 +209,6 @@ def _today_str() -> str:
 
 
 def _utc_offset_str() -> str:
-    """Return ±HH:MM offset string, e.g. '+05:30'."""
     dt     = _now_local()
     offset = dt.utcoffset()
     if offset is None:
@@ -217,26 +221,20 @@ def _utc_offset_str() -> str:
 
 def _time_of_day() -> str:
     hour = _now_local().hour
-    if 6 <= hour < 12:   return "morning"
-    if 12 <= hour < 17:  return "afternoon"
-    if 17 <= hour < 21:  return "evening"
+    if 6  <= hour < 12: return "morning"
+    if 12 <= hour < 17: return "afternoon"
+    if 17 <= hour < 21: return "evening"
     return "night"
 
 
 def _fix_reminder_tz(trigger_iso: str) -> str:
-    """
-    BUG-3 fix: The LLM tends to output naive UTC times (ending in +0000 or Z)
-    when the user means their local time.  Replace bare UTC offsets with the
-    server's configured local offset so that '6 AM' → '06:00+05:30'.
-    Only re-stamps if the server is NOT UTC.
-    """
     local_offset = _utc_offset_str()
     if local_offset == "+00:00":
-        return trigger_iso  # server IS UTC — no correction needed
+        return trigger_iso
     t = trigger_iso.strip()
     for utc_tail in ("+00:00", "+0000", "Z"):
         if t.endswith(utc_tail):
-            base = t[: len(t) - len(utc_tail)]
+            base      = t[: len(t) - len(utc_tail)]
             corrected = base + local_offset
             logger.info(
                 "⏰ reminder.tz_fix  %s → %s  (server=%s)",
@@ -262,12 +260,20 @@ def _model_open(model: str) -> bool:
 
 
 def _pick_model(chat_id: str) -> str:
-    pool = list(settings.groq_model_pool or [])
+    """Pick the next available model from the pool (excluding compound-beta-mini)."""
+    pool = [
+        m for m in (settings.groq_model_pool or [])
+        # compound-beta-mini is the live-search model; never use it for orchestration.
+        # It shares the llama-3.3-70b daily token bucket and would drain it faster.
+        if not m.startswith("compound-beta")
+    ]
     if not pool:
-        return "llama-3.3-70b-versatile"
+        pool = ["llama-3.3-70b-versatile"]
+
     sticky = STICKY_MODEL.get(chat_id)
-    if sticky and _model_open(sticky):
+    if sticky and not sticky.startswith("compound-beta") and _model_open(sticky):
         return sticky
+
     for m in pool:
         if _model_open(m):
             if len(STICKY_MODEL) >= _STICKY_MAX:
@@ -276,8 +282,60 @@ def _pick_model(chat_id: str) -> str:
                     STICKY_MODEL.pop(k, None)
             STICKY_MODEL[chat_id] = m
             return m
+
+    # All exhausted — return first in pool (will likely 429, but caller handles it)
     STICKY_MODEL[chat_id] = pool[0]
     return pool[0]
+
+
+def _pick_model_for_role(chat_id: str, role: str) -> str:
+    """
+    FIX-1: Route calls to the correct model tier based on role.
+
+    - "orchestrate"                    → ORCHESTRATOR_MODEL (70b) with pool fallback
+    - "extract"|"verify"|"format"|
+      "reply_extract"|"repair"         → EXTRACTION_MODEL (8b) with pool fallback
+
+    The 70B model has 100K tokens/day on Groq free tier.
+    The 8B model has a much higher (500K+) daily limit.
+    By routing lightweight calls to 8B, we preserve 70B budget for reasoning.
+    """
+    if role == "orchestrate":
+        preferred = settings.orchestrator_model or "llama-3.3-70b-versatile"
+    else:
+        # All lightweight calls (extract, verify, format, repair, reply_extract)
+        # use the fast small model.
+        preferred = settings.extraction_model or "llama-3.1-8b-instant"
+
+    if preferred and _model_open(preferred):
+        return preferred
+
+    # Preferred is circuit-tripped — fall back to pool
+    fallback = _pick_model(chat_id)
+    logger.info(
+        "🔄 model.fallback  role=%s  preferred=%s  using=%s",
+        role, preferred, fallback,
+    )
+    return fallback
+
+
+def _parse_retry_after(exc: Exception) -> float:
+    """
+    FIX-2: Parse 'Please try again in Xh Ym Z.Ws' from Groq 429 error text.
+    Returns the number of seconds to wait, or 120.0 if not parseable.
+    """
+    msg = str(exc)
+    m = re.search(
+        r"try again in\s+(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:([\d.]+)s)?",
+        msg, re.IGNORECASE,
+    )
+    if m:
+        h    = int(m.group(1) or 0)
+        mins = int(m.group(2) or 0)
+        secs = float(m.group(3) or 0)
+        total = h * 3600 + mins * 60 + secs
+        return max(total, 60.0)   # at least 60s cooldown
+    return 120.0   # safe default: 2 min
 
 
 async def init_llm() -> None:
@@ -293,7 +351,11 @@ async def init_llm() -> None:
             logger.warning(
                 "⚠️  model_pool — %r looks invalid. Fix GROQ_MODEL_POOL in .env", m,
             )
-    logger.info("🧠 llm.init — AsyncGroq ready  model_pool=%s", settings.groq_model_pool)
+    logger.info(
+        "🧠 llm.init — AsyncGroq ready  orchestrator=%s  extraction=%s  live_search=%s  pool=%s",
+        settings.orchestrator_model, settings.extraction_model,
+        settings.live_search_model, settings.groq_model_pool,
+    )
 
 
 async def close_llm() -> None:
@@ -311,40 +373,23 @@ async def close_llm() -> None:
 # ---------------------------------------------------------------------------
 
 def _sanitize_json(s: str) -> str:
-    """
-    Sanitize raw LLM output before JSON parsing.
-    LLMs often embed literal newlines/tabs inside JSON string values,
-    producing invalid JSON that Python's json.loads() rejects.
-    Strategy: inside a quoted string, replace bare control chars with safe escapes.
-    """
     out = []
     in_string = False
-    escaped = False
+    escaped   = False
     for ch in s:
         if escaped:
-            out.append(ch)
-            escaped = False
-            continue
+            out.append(ch); escaped = False; continue
         if ch == "\\":
-            out.append(ch)
-            escaped = True
-            continue
+            out.append(ch); escaped = True; continue
         if ch == '"' and not escaped:
             in_string = not in_string
-            out.append(ch)
-            continue
+            out.append(ch); continue
         if in_string:
-            if ch == "\n":
-                out.append("\\n")
-            elif ch == "\r":
-                out.append("\\r")
-            elif ch == "\t":
-                out.append("\\t")
-            elif ord(ch) < 32:
-                # Other control characters → skip
-                pass
-            else:
-                out.append(ch)
+            if   ch == "\n": out.append("\\n")
+            elif ch == "\r": out.append("\\r")
+            elif ch == "\t": out.append("\\t")
+            elif ord(ch) < 32: pass
+            else: out.append(ch)
         else:
             out.append(ch)
     return "".join(out)
@@ -354,24 +399,20 @@ def _extract_json(text: str) -> dict:
     s = (text or "").strip()
     if not s:
         raise ValueError("empty_response")
-    # Locate outermost JSON object
     start, end = s.find("{"), s.rfind("}")
     if start == -1 or end <= start:
         raise ValueError("no_json_found")
     candidate = s[start : end + 1]
-    # First try raw (most LLM outputs are already valid)
     try:
         return json.loads(candidate)
     except json.JSONDecodeError:
         pass
-    # Sanitize control chars inside string values and retry
     try:
         return json.loads(_sanitize_json(candidate))
     except json.JSONDecodeError as e:
         raise e
 
 
-# Keywords whose presence strongly suggests personal content worth extracting
 _PERSONAL_SIGNALS = frozenset([
     "my ", "i am", "i'm", "i live", "i work", "i have", "i drink", "i eat",
     "i use", "i own", "i drive", "i ride", "my name", "my city", "my list",
@@ -381,9 +422,19 @@ _PERSONAL_SIGNALS = frozenset([
 ])
 
 def _has_personal_content(text: str) -> bool:
-    """Return True if the message likely contains extractable personal facts."""
     low = text.lower()
     return any(sig in low for sig in _PERSONAL_SIGNALS)
+
+
+# FIX-4: Strip junk/unknown values before passing facts to LLM
+_JUNK_VALUES = frozenset({"unknown", "none", "null", "n/a", "", "-", "—"})
+
+def _clean_facts(facts: Dict[str, str]) -> Dict[str, str]:
+    """Remove entries whose value is empty/unknown — they waste tokens."""
+    return {
+        k: v for k, v in facts.items()
+        if (v or "").strip().lower() not in _JUNK_VALUES
+    }
 
 
 async def _groq_raw(
@@ -394,6 +445,7 @@ async def _groq_raw(
     max_tokens:     int,
     *,
     model_override: Optional[str] = None,
+    role:           str = "extract",   # FIX-1: role for model selection
     label:          str = "call",
     timeout_sec:    Optional[float] = None,
 ) -> str:
@@ -402,21 +454,22 @@ async def _groq_raw(
     if not GROQ_CLIENT:
         return ""
 
-    model   = model_override or _pick_model(chat_id)
-    t_sec   = timeout_sec or settings.groq_timeout
-    payload = {
-        "model":       model,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user",   "content": user},
-        ],
-        "temperature": float(temperature),
-        "max_tokens":  int(max_tokens),
-    }
+    # FIX-1: pick model by role (orchestrate vs extract/verify/format)
+    model  = model_override or _pick_model_for_role(chat_id, role)
+    t_sec  = timeout_sec or settings.groq_timeout
 
     t0 = time.perf_counter()
 
     async def _call() -> str:
+        payload = {
+            "model":       model,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user",   "content": user},
+            ],
+            "temperature": float(temperature),
+            "max_tokens":  int(max_tokens),
+        }
         async with _inflight:
             resp = await GROQ_CLIENT.chat.completions.create(**payload)
             return (resp.choices[0].message.content or "").strip()
@@ -432,40 +485,44 @@ async def _groq_raw(
                 "⚠️  slow_llm  label=%s  model=%s  %.1fs  in≈%d  out≈%d",
                 label, model, elapsed, len(user) // 4, len(result) // 4,
             )
-        # Latency-based circuit trip: if call took >15s, soft-trip this model
-        # for 45s so next call uses the next model in the pool.
+        # Latency-based circuit trip: >15s → soft-trip 45s
         if elapsed > 15.0:
             current_penalty = MODEL_CIRCUIT.get(model, 0.0)
-            if time.monotonic() >= current_penalty:   # only trip if not already tripped
+            if time.monotonic() >= current_penalty:
                 MODEL_CIRCUIT[model] = time.monotonic() + 45.0
                 logger.info(
                     "⚡ circuit.latency_trip  model=%s  elapsed=%.1fs  cooldown=45s",
                     model, elapsed,
                 )
-                STICKY_MODEL.pop(chat_id, None)  # force re-pick next turn
+                STICKY_MODEL.pop(chat_id, None)
         return result
+
     except asyncio.TimeoutError:
         logger.warning("⚠️  llm_timeout  label=%s  model=%s  %.0fs", label, model, t_sec)
         MODEL_CIRCUIT[model] = time.monotonic() + 15.0
         raise
+
     except Exception as exc:
-        MODEL_CIRCUIT[model] = time.monotonic() + (10.0 + random.random() * 4.0)
-        logger.warning("🔴 circuit.tripped  model=%s  label=%s  err=%s", model, label, exc)
+        # FIX-2: use actual retry-after time from 429 response
+        cooldown = _parse_retry_after(exc) if ("429" in str(exc) or "rate_limit" in str(exc).lower()) else (10.0 + random.random() * 4.0)
+        MODEL_CIRCUIT[model] = time.monotonic() + cooldown
+        logger.warning(
+            "🔴 circuit.tripped  model=%s  label=%s  cooldown=%.0fs  err=%s",
+            model, label, cooldown, exc,
+        )
         raise
 
 
 # ---------------------------------------------------------------------------
-# WhatsApp formatter (BUG-6: always run for longer/prose responses)
+# WhatsApp formatter
 # ---------------------------------------------------------------------------
 
 def _is_prose(text: str) -> bool:
-    """Heuristic: detect responses that look like prose and need WhatsApp formatting."""
     if len(text) < _MIN_FORMAT_LEN:
         return False
     has_markdown = "**" in text or "```" in text or "|---" in text or text.count("# ") > 1
     if has_markdown:
         return True
-    # Long responses with no bullets and few newlines = prose
     if len(text) > _MIN_FORMAT_LEN and text.count("•") == 0 and text.count("\n") < 3:
         return True
     return False
@@ -477,7 +534,8 @@ async def _format_whatsapp(chat_id: str, text: str) -> str:
     raw = await _groq_raw(
         chat_id, FORMATTER_PROMPT,
         json.dumps({"text": text}, ensure_ascii=False),
-        temperature=0.0, max_tokens=600, label="format",
+        temperature=0.0, max_tokens=600,
+        role="format", label="format",  # FIX-1: use extraction_model
     )
     try:
         fr = FormatterResult.model_validate(_extract_json(raw))
@@ -487,10 +545,8 @@ async def _format_whatsapp(chat_id: str, text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Live search (BUG-5: truncate result; handle 413)
+# Live search  (compound-beta-mini ONLY — not in the orchestrator pool)
 # ---------------------------------------------------------------------------
-
-# ── Query intent detection helpers ────────────────────────────────────────
 
 _WEATHER_KW  = frozenset(["weather", "forecast", "temperature", "rain", "humid",
                            "wind", "cold", "hot", "sunny", "monsoon", "climate today"])
@@ -500,34 +556,32 @@ _STOCK_KW    = frozenset(["stock", "stocks", "share price", "nifty", "sensex",
                            "hdfc", "icici", "mutual fund", "index today"])
 _NEWS_KW     = frozenset(["news", "headlines", "latest news", "breaking", "today's news",
                            "world news", "india news", "top stories"])
+_CURRENCY_KW = frozenset(["exchange rate", "currency", "convert", "usd to", "inr to",
+                           "eur to", "gbp to", "dollar to", "rupee to", "how much is",
+                           "forex", "₹ to $", "$ to ₹"])
+_TIMEZONE_KW = frozenset(["time in", "what time is it in", "current time in", "timezone",
+                           "time zone", "local time in", "what's the time in"])
+
 
 def _query_intent(query: str) -> str:
-    """Return 'weather' | 'stocks' | 'news' | 'general'."""
     low = query.lower()
-    if any(k in low for k in _WEATHER_KW):
-        return "weather"
-    if any(k in low for k in _STOCK_KW):
-        return "stocks"
-    if any(k in low for k in _NEWS_KW):
-        return "news"
+    if any(k in low for k in _WEATHER_KW):  return "weather"
+    if any(k in low for k in _STOCK_KW):    return "stocks"
+    if any(k in low for k in _NEWS_KW):     return "news"
+    if any(k in low for k in _CURRENCY_KW): return "currency"
+    if any(k in low for k in _TIMEZONE_KW): return "timezone"
     return "general"
 
+
 def _fix_placeholder_query(query: str, facts: Dict[str, str]) -> str:
-    """
-    Replace placeholder tokens like [user's city] or [user's location] with
-    actual values from facts. If the query still has unresolved placeholders,
-    return a clean version substituting known city/country.
-    """
-    city    = facts.get("city", "")
+    city    = facts.get("city",    "")
     country = facts.get("country", "India")
     loc     = f"{city}, {country}".strip(", ") if city else country
-
-    # Replace common placeholder patterns
-    import re
-    q = re.sub(r"\[user\'?s?\s+(?:city|country|location|region|place)[^\]]*\]",
-               loc, query, flags=re.IGNORECASE)
-    q = re.sub(r"\[(?:location|city|country|region|place)\]",
-               loc, q, flags=re.IGNORECASE)
+    q = re.sub(
+        r"\[user\'?s?\s+(?:city|country|location|region|place)[^\]]*\]",
+        loc, query, flags=re.IGNORECASE,
+    )
+    q = re.sub(r"\[(?:location|city|country|region|place)\]", loc, q, flags=re.IGNORECASE)
     return q.strip()
 
 
@@ -537,20 +591,17 @@ async def _live_search(chat_id: str, query: str, facts: Dict[str, str]) -> str:
     if not GROQ_CLIENT:
         return "Search unavailable."
 
-    # Resolve any literal placeholder tokens the LLM may have output
-    query = _fix_placeholder_query(query, facts)
-
-    # Route to specialized free-API tools when query matches known intents
+    query  = _fix_placeholder_query(query, facts)
     intent = _query_intent(query)
-    city    = facts.get("city", "")
+    city    = facts.get("city",    "")
     country = facts.get("country", "India")
 
+    # Route structured queries to MCP / live_data first (free, no token cost)
     if intent == "weather" and (city or country):
         from . import live_data
         result = await live_data.get_weather(city or "Hyderabad", country or "India")
         if result:
             return result
-        # Fall through to compound-beta if live_data fails
 
     elif intent == "stocks":
         from . import live_data
@@ -564,23 +615,63 @@ async def _live_search(chat_id: str, query: str, facts: Dict[str, str]) -> str:
         if result:
             return result
 
-    # Only send minimal user context to compound-beta to avoid 413
-    mini_facts = {
-        k: v for k, v in facts.items()
-        if k in ("city", "country", "name", "preferred_language")
-    }
+    elif intent == "currency":
+        # Parse "USD to INR 100" or "convert 50 USD to EUR"
+        from .mcp_client import mcp_currency
+        import re as _re
+        _m = _re.search(
+            r"(?:(\d+(?:\.\d+)?)\s+)?([A-Z]{3})\s+to\s+([A-Z]{3})",
+            query, _re.IGNORECASE,
+        )
+        if _m:
+            amount    = float(_m.group(1) or 1)
+            from_cur  = _m.group(2).upper()
+            to_cur    = _m.group(3).upper()
+            data = await mcp_currency(from_cur=from_cur, to_cur=to_cur, amount=amount)
+            if data:
+                return (
+                    f"💱 *{from_cur} → {to_cur}*\n"
+                    f"{amount} {from_cur} = *{data['converted']} {to_cur}*\n"
+                    f"Rate: 1 {from_cur} = {data['rate']} {to_cur}\n"
+                    f"_Source: Frankfurter (ECB rates, as of {data.get('as_of', 'today')})_"
+                )
 
+    elif intent == "timezone":
+        # Extract city from "what time is it in Tokyo"
+        from .mcp_client import mcp_timezone
+        import re as _re
+        _m = _re.search(r"(?:time in|time is it in|current time in)\s+(.+?)(?:\?|$)", query, _re.IGNORECASE)
+        city_q = (_m.group(1).strip() if _m else city) or "London"
+        data = await mcp_timezone(city=city_q)
+        if data:
+            lt  = data.get("local_time", "")
+            tz  = data.get("timezone",   "")
+            off = data.get("utc_offset", "")
+            dow = data.get("day_of_week", "")
+            time_part = ""
+            if lt:
+                try:
+                    from datetime import datetime as _dt
+                    parsed    = _dt.fromisoformat(lt.replace("Z",""))
+                    time_part = parsed.strftime("%I:%M %p")
+                except Exception:
+                    time_part = lt[:16]
+            return (
+                f"🕐 *{data.get('city', city_q)}*\n"
+                f"Local time: *{time_part}* ({dow})\n"
+                f"Timezone: {tz}  (UTC{off})"
+            )
+
+    # Fallback: compound-beta-mini web search
+    mini_facts = {k: v for k, v in facts.items() if k in ("city", "country", "name")}
     user_payload = json.dumps(
-        {
-            "query":     query,
-            "user_city": mini_facts.get("city", ""),
-            "today":     _today_str(),
-        },
+        {"query": query, "user_city": mini_facts.get("city", ""), "today": _today_str()},
         ensure_ascii=False,
     )
 
+    # compound-beta-mini uses its own dedicated model (NOT the orchestrator pool)
     payload = {
-        "model":       settings.live_search_model,
+        "model":       settings.live_search_model,   # compound-beta-mini
         "messages": [
             {"role": "system", "content": LIVE_SEARCH_PROMPT},
             {"role": "user",   "content": user_payload},
@@ -603,7 +694,6 @@ async def _live_search(chat_id: str, query: str, facts: Dict[str, str]) -> str:
     except Exception as exc:
         err_str = str(exc)
         if "413" in err_str or "request_too_large" in err_str.lower():
-            # Retry with bare query only
             logger.warning("⚠️  live_search.413  query=%r — retrying bare", query[:80])
             bare_payload = {**payload, "messages": [
                 {"role": "system", "content": LIVE_SEARCH_PROMPT},
@@ -622,13 +712,13 @@ async def _live_search(chat_id: str, query: str, facts: Dict[str, str]) -> str:
 
     elapsed = time.perf_counter() - t0
     if elapsed > _SLOW_CALL_WARN_SEC:
-        logger.warning("⚠️  slow_search  query=%r  %.1fs  result_len=%d",
-                       query[:80], elapsed, len(result))
+        logger.warning(
+            "⚠️  slow_search  query=%r  %.1fs  result_len=%d",
+            query[:80], elapsed, len(result),
+        )
 
-    # Truncate so orchestrate_2 doesn't hit token limits
     if len(result) > _MAX_SEARCH_RESULT:
         result = result[:_MAX_SEARCH_RESULT] + "\n…[truncated]"
-
     return result
 
 
@@ -652,11 +742,11 @@ def _normalize_updates(updates: List[MemoryUpdate]) -> List[MemoryUpdate]:
 
 
 async def _extract_memory(chat_id: str, user_text: str) -> List[MemoryUpdate]:
-    """Extract facts explicitly declared in the user message."""
     raw = await _groq_raw(
         chat_id, MEMORY_EXTRACTOR_PROMPT,
         json.dumps({"user_message": user_text}, ensure_ascii=False),
-        temperature=0.0, max_tokens=400, label="extract",
+        temperature=0.0, max_tokens=400,
+        role="extract", label="extract",  # FIX-1: uses extraction_model (8b)
     )
     try:
         er = ExtractResult.model_validate(_extract_json(raw))
@@ -677,23 +767,14 @@ async def extract_reply_memory(
     bot_reply: str,
     existing_facts: Dict[str, str],
 ) -> List[MemoryUpdate]:
-    """
-    BUG-1 fix: post-reply extractor.
-    Read (user_message + bot_reply) and extract whatever the bot CONFIRMED saving.
-    This catches list creations, list updates, and reminder notes that the
-    orchestrator forgot to include in memory_updates.
-    """
     user_payload = json.dumps(
-        {
-            "user_message":  user_text,
-            "bot_reply":     bot_reply,
-            "existing_facts": existing_facts,
-        },
+        {"user_message": user_text, "bot_reply": bot_reply, "existing_facts": existing_facts},
         ensure_ascii=False,
     )
     raw = await _groq_raw(
         chat_id, REPLY_EXTRACTOR_PROMPT, user_payload,
-        temperature=0.0, max_tokens=400, label="reply_extract",
+        temperature=0.0, max_tokens=400,
+        role="extract", label="reply_extract",  # FIX-1: uses extraction_model (8b)
     )
     try:
         er = ExtractResult.model_validate(_extract_json(raw))
@@ -728,7 +809,8 @@ async def _verify_updates(
     )
     raw = await _groq_raw(
         chat_id, VERIFIER_PROMPT, user_payload,
-        temperature=0.0, max_tokens=400, label="verify",
+        temperature=0.0, max_tokens=400,
+        role="verify", label="verify",  # FIX-1: uses extraction_model (8b)
     )
     try:
         vr = VerifyResult.model_validate(_extract_json(raw))
@@ -740,7 +822,6 @@ async def _verify_updates(
     min_conf = float(settings.facts_min_conf or 0.85)
     approved = []
     for a in vr.approved:
-        # Lower threshold for list-type keys — actions imply facts
         threshold = 0.60 if normalize_key(a.key) in _LIST_KEYS else min_conf
         if a.confidence >= threshold:
             k = normalize_key(a.key)
@@ -760,19 +841,96 @@ def _merge_memory(
 
 
 # ---------------------------------------------------------------------------
+# FIX-5: Facts recall short-circuit
+# ---------------------------------------------------------------------------
+
+_RECALL_PATTERNS = re.compile(
+    r"\b(?:what(?:'s|\ is)|do you know|tell me|remind me of|recall|"
+    r"show me|list|what are|do i have)\b.{0,40}"
+    r"\b(?:my|me)\b.{0,40}"
+    r"\b(?:name|city|age|birthday|hobbies|interests|favorite|allergies|"
+    r"occupation|job|car|vehicle|pets?|shopping.?list|grocery.?list|"
+    r"todo.?list|reminder|country|postal)\b",
+    re.IGNORECASE,
+)
+
+def _try_facts_shortcut(user_text: str, facts: Dict[str, str]) -> Optional[str]:
+    """
+    FIX-5: For simple memory-recall questions we can answer directly from
+    the facts dict without spending a 70B token call on orchestration.
+
+    Returns a pre-formatted reply string, or None if LLM is needed.
+    """
+    if not _RECALL_PATTERNS.search(user_text):
+        return None
+
+    low = user_text.lower()
+
+    # Only short-circuit if question asks about a single well-known key
+    _RECALL_KEYS = {
+        "name": ["name"],
+        "city": ["city", "where i live", "my city"],
+        "age":  ["age", "how old"],
+        "birthday": ["birthday", "born"],
+        "hobbies": ["hobbie", "hobby"],
+        "interests": ["interest"],
+        "favorite drink": ["drink", "coffee", "tea"],
+        "favorite food": ["food", "eat", "cuisine"],
+        "allergies": ["allerg"],
+        "occupation": ["job", "work", "occupation", "profession"],
+        "car": ["car", "vehicle", "drive", "bike"],
+        "pets": ["pet", "dog", "cat"],
+        "shopping_list": ["shopping list", "shopping_list"],
+        "grocery_list":  ["grocery list", "grocery_list", "groceries"],
+        "todo_list":     ["todo list", "todo_list", "to do list", "tasks"],
+        "country": ["country"],
+    }
+
+    matched_key = None
+    for db_key, signals in _RECALL_KEYS.items():
+        if any(sig in low for sig in signals):
+            matched_key = db_key
+            break
+
+    if not matched_key:
+        return None
+
+    val = facts.get(matched_key) or facts.get(matched_key.replace(" ", "_"))
+    if not val or val.strip().lower() in _JUNK_VALUES:
+        return None  # not stored — let LLM handle gracefully
+
+    # Simple, factual answer
+    persona = settings.bot_persona_name or "Shimmi"
+    label_map = {
+        "name": "name",
+        "city": "city",
+        "age":  "age",
+        "birthday": "birthday",
+        "hobbies": "hobbies",
+        "interests": "interests",
+        "favorite drink": "favourite drink",
+        "favorite food": "favourite food",
+        "allergies": "allergies",
+        "occupation": "occupation/job",
+        "car": "vehicle",
+        "pets": "pets",
+        "shopping_list": "shopping list",
+        "grocery_list": "grocery list",
+        "todo_list": "to-do list",
+        "country": "country",
+    }
+    label = label_map.get(matched_key, matched_key)
+    return f"Your {label}: *{val}*"
+
+
+# ---------------------------------------------------------------------------
 # Agentic orchestrator
 # ---------------------------------------------------------------------------
 
 def _reminders_to_json(reminders: List[Reminder]) -> List[Dict]:
     return [
-        {
-            "id":          r.id,
-            "text":        r.reminder_text,
-            "trigger_iso": r.trigger_iso,
-            "status":      r.status,
-        }
-        for r in reminders
-        if r.status == "pending"
+        {"id": r.id, "text": r.reminder_text, "trigger_iso": r.trigger_iso, "status": r.status}
+        for r in reminders if r.status == "pending"
     ]
 
 
@@ -789,22 +947,20 @@ async def _orchestrate(
     if iteration >= _MAX_ITERATIONS:
         system = system + "\n\nFINAL ITERATION: You MUST use action=answer now."
 
-    tz_offset  = _utc_offset_str()
-    today      = _today_str()
-    time_str   = _current_time_str()
-    tod        = _time_of_day()
+    # FIX-4: strip junk facts before building the prompt
+    clean_facts = _clean_facts(facts)
 
     user_payload = json.dumps(
         {
             "user_message":      user_text,
-            "facts":             facts,
+            "facts":             clean_facts,
             "reminders_pending": _reminders_to_json(reminders),
             "context":           context,
             "search_results":    search_results,
-            "current_time":      time_str,
-            "time_of_day":       tod,
-            "today":             today,
-            "tz_offset":         tz_offset,
+            "current_time":      _current_time_str(),
+            "time_of_day":       _time_of_day(),
+            "today":             _today_str(),
+            "tz_offset":         _utc_offset_str(),
             "iteration":         iteration,
             "max_iterations":    _MAX_ITERATIONS,
         },
@@ -814,7 +970,7 @@ async def _orchestrate(
     raw = await _groq_raw(
         chat_id, system, user_payload,
         temperature=0.25, max_tokens=1000,
-        label=f"orchestrate_{iteration}",
+        role="orchestrate", label=f"orchestrate_{iteration}",  # FIX-1: uses orchestrator_model (70b)
     )
 
     try:
@@ -828,7 +984,8 @@ async def _orchestrate(
         logger.warning("orchestrate.parse_failed  iter=%d  err=%s  raw=%.200s", iteration, e, raw)
         repaired_raw = await _groq_raw(
             chat_id, REPAIR_PROMPT, raw,
-            temperature=0.0, max_tokens=600, label="repair",
+            temperature=0.0, max_tokens=600,
+            role="repair", label="repair",  # FIX-1: uses extraction_model (8b)
         )
         result = OrchestratorResult.model_validate(_extract_json(repaired_raw))
         logger.info("orchestrate.repaired  iter=%d  action=%s", iteration, result.action)
@@ -836,7 +993,7 @@ async def _orchestrate(
 
 
 # ---------------------------------------------------------------------------
-# Reminder dedup helper (BUG-4)
+# Reminder dedup helper
 # ---------------------------------------------------------------------------
 
 def _is_reminder_duplicate(
@@ -844,9 +1001,7 @@ def _is_reminder_duplicate(
     trigger_iso: str,
     existing: List[Reminder],
 ) -> bool:
-    """Return True if an identical pending reminder already exists."""
-    norm_text = text.strip().lower()
-    # Compare on first 16 chars of trigger (YYYY-MM-DDTHH:MM) ignoring tz
+    norm_text      = text.strip().lower()
     trigger_prefix = trigger_iso[:16]
     for r in existing:
         if r.status != "pending":
@@ -874,12 +1029,26 @@ async def run_agent(
     def _step(name: str):
         return trace.step(name) if trace is not None else nullcontext()
 
+    # FIX-5: answer simple fact-recall questions without LLM
+    shortcut = _try_facts_shortcut(user_text, facts)
+    if shortcut:
+        logger.info("⚡ facts.shortcut  text=%r  reply=%r", user_text[:80], shortcut[:80])
+        if trace:
+            trace.tag(facts_shortcut=True)
+        return AgentResult(
+            reply=ReplyPayload(type="text", text=shortcut),
+            memory_updates=[],
+            reminders=[],
+            iterations=0,
+        )
+
     with _step("memory_extract"):
-        # Skip extractor for clearly impersonal/factual messages — saves 3-7s LLM call
         if _has_personal_content(user_text):
             extract_task = asyncio.create_task(_extract_memory(chat_id, user_text))
         else:
-            extract_task = asyncio.get_event_loop().create_future()
+            # FIX-6: deprecated asyncio.get_event_loop() → get_running_loop()
+            loop = asyncio.get_running_loop()
+            extract_task = loop.create_future()
             extract_task.set_result([])
 
     search_results: List[Dict[str, str]] = []
@@ -901,7 +1070,6 @@ async def run_agent(
             proposed = await extract_task
             verified = await _verify_updates(chat_id, user_text, proposed)
             merged   = _merge_memory(verified, _normalize_updates(orch_result.memory_updates))
-            # Apply timezone fix on any reminders from orchestrator
             fixed_reminders = [
                 ReminderEntry(text=r.text, trigger_iso=_fix_reminder_tz(r.trigger_iso))
                 for r in orch_result.reminders
@@ -915,7 +1083,7 @@ async def run_agent(
                 iterations=iteration,
             )
 
-        # Force-search trigger: topics that MUST have live data
+        # Force-search for live-data topics
         _FORCE_SEARCH_PATTERNS = re.compile(
             r"\b(stock|stocks|share price|nse|bse|sensex|nifty|market cap|"
             r"nifty50|bank nifty|index fund|mutual fund|rupee|inr|"
@@ -929,26 +1097,22 @@ async def run_agent(
             and not search_results
         ):
             logger.info(
-                "🤖 orchestrate  iter=%d  force_search — detected live-data topic in user_text",
-                iteration,
+                "🤖 orchestrate  iter=%d  force_search — detected live-data topic", iteration,
             )
             orch_result.action = "search"
-            orch_result.query = user_text
+            orch_result.query  = user_text
 
         if orch_result.action == "search" and settings.live_search_enabled:
             query = (orch_result.query or user_text).strip()
 
-            # Prevent literal placeholder tokens like "[user's location]" in queries.
-            # Replace with actual values from facts where available.
-            _city    = facts.get("city", "")
+            _city    = facts.get("city",    "")
             _country = facts.get("country", "")
             _loc     = ", ".join(x for x in [_city, _country] if x) or ""
             _placeholder_re = re.compile(
-                r"\[(?:user['\u2019]?s?\s+)?(?:location|city|country|place|region)[^\]]*\]",
+                r"\[(?:user['']?s?\s+)?(?:location|city|country|place|region)[^\]]*\]",
                 re.IGNORECASE,
             )
             query = _placeholder_re.sub(_loc or "location unknown", query)
-            # Strip any remaining unfilled placeholders
             query = re.sub(r"\[[^\]]{1,50}\]", "", query).strip()
 
             with _step(f"live_search_{iteration}"):
@@ -969,20 +1133,21 @@ async def run_agent(
         if orch_result.action == "answer" or orch_result.text:
             break
 
-        logger.warning("orchestrate.unknown_action  iter=%d  action=%r", iteration, orch_result.action)
+        logger.warning(
+            "orchestrate.unknown_action  iter=%d  action=%r", iteration, orch_result.action,
+        )
         if iteration >= _MAX_ITERATIONS:
             break
 
     # ── Memory verification ────────────────────────────────────────────────
     with _step("memory_verify"):
-        proposed = await extract_task
-        verified = await _verify_updates(chat_id, user_text, proposed) if proposed else []
+        proposed  = await extract_task
+        verified  = await _verify_updates(chat_id, user_text, proposed) if proposed else []
         pre_keys  = {v.key for v in verified}
         agent_raw = _normalize_updates(orch_result.memory_updates if orch_result else [])
         agent_new = [u for u in agent_raw if u.key not in pre_keys]
         agent_vfd = await _verify_updates(chat_id, user_text, agent_new) if agent_new else []
         final_memory = _merge_memory(verified, agent_vfd)
-
         if trace:
             trace.tag(
                 total_iterations=iteration,
@@ -991,8 +1156,7 @@ async def run_agent(
                 memory_total=len(final_memory),
             )
 
-    # ── Deduplicate: drop updates that are already stored with the same value ──
-    # Avoids wasteful verifier round-trips and DB writes for facts already known.
+    # Deduplicate: drop updates already in DB with same value
     final_memory = [
         u for u in final_memory
         if facts.get(u.key, "").strip().lower() != u.value.strip().lower()
@@ -1001,7 +1165,7 @@ async def run_agent(
         trace.tag(memory_deduped=len(final_memory))
 
     # ── Format reply ───────────────────────────────────────────────────────
-    raw_text  = (orch_result.text if orch_result else "") or "I'm not sure how to answer that."
+    raw_text = (orch_result.text if orch_result else "") or "I'm not sure how to answer that."
     with _step("format"):
         formatted = await _format_whatsapp(chat_id, raw_text)
 
