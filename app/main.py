@@ -1,18 +1,19 @@
 """
-main.py — Shimmi v2.9.2
+main.py — Shimmi v3.0.2
 
-Changes vs v2.7.0:
-  - Background reminder scheduler started in lifespan
-  - _reminder / _cancel_reminder special memory keys parsed and routed to reminders table
-  - Startup log shows PORT for visibility
-  - User reminders loaded alongside facts and passed to run_agent
-  - worker.msg_error no longer re-raises — worker survives any per-message failure
+Changes vs v3.0.1:
+  FIX-7  User-facing error reply on total LLM failure: when all models are
+         rate-limited (Groq 429 / TPD exhausted) the user previously saw
+         silence. Now they receive a short informational message and a
+         retry hint, including how long to wait when parseable from the error.
+  NOTE   main.py version header updated; all other logic from v2.9.2 preserved.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import os
+import re
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -79,14 +80,45 @@ def _integrity_check() -> None:
     if pool and pool[0] == "llama-3.1-8b-instant":
         issues.append(
             "GROQ_MODEL_POOL starts with llama-3.1-8b-instant (8B model). "
-            "Recommend putting llama-3.3-70b-versatile first for faster, higher-quality responses. "
-            "Current: GROQ_MODEL_POOL=llama-3.1-8b-instant,llama-3.3-70b-versatile — "
-            "Recommended: GROQ_MODEL_POOL=llama-3.3-70b-versatile,llama-3.1-8b-instant"
+            "Recommend putting llama-3.3-70b-versatile first."
+        )
+    if any(m.startswith("compound-beta") for m in pool):
+        issues.append(
+            "GROQ_MODEL_POOL contains compound-beta-mini. This model shares the "
+            "llama-3.3-70b daily token bucket. Remove it from GROQ_MODEL_POOL — "
+            "it is used automatically for live search via LIVE_SEARCH_MODEL."
         )
     for issue in issues:
         logger.warning("⚠️  CONFIG: %s", issue)
     if not issues:
         logger.info("✅ integrity_check — all config OK")
+
+
+# ---------------------------------------------------------------------------
+# FIX-7: User-facing error messages
+# ---------------------------------------------------------------------------
+
+def _rate_limit_reply(exc: Exception) -> str:
+    """Compose a user-friendly reply when all LLM models are rate-limited."""
+    msg = str(exc)
+    # Try to extract wait time from Groq message
+    m = re.search(
+        r"try again in\s+(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:([\d.]+)s)?",
+        msg, re.IGNORECASE,
+    )
+    wait_str = ""
+    if m:
+        h    = int(m.group(1) or 0)
+        mins = int(m.group(2) or 0)
+        if h:
+            wait_str = f" (about {h}h {mins}m)"
+        elif mins:
+            wait_str = f" (about {mins} min)"
+
+    return (
+        f"⚡ I've hit my daily AI quota{wait_str}. "
+        "Please try again later — I'll be back to full speed soon!"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -96,13 +128,9 @@ def _integrity_check() -> None:
 async def _save_reminders(
     sender_key:  str,
     chat_id:     str,
-    reminders:   list,         # List[ReminderEntry] from AgentResult
-    existing:    list,         # List[Reminder] already in DB (pending)
+    reminders:   list,
+    existing:    list,
 ) -> int:
-    """
-    Save new reminders to DB.  Skips duplicates (BUG-4 fix).
-    Returns count of reminders actually saved.
-    """
     saved = 0
     for r in reminders:
         text        = (r.text or "").strip()
@@ -110,7 +138,6 @@ async def _save_reminders(
         if not text or not trigger_iso:
             logger.warning("reminder.skip — blank  text=%r  trigger=%r", text[:50], trigger_iso[:30])
             continue
-        # Dedup: skip if matching pending reminder already exists
         if _is_reminder_duplicate(text, trigger_iso, existing):
             logger.info("🔔 reminder.dedup  trigger=%s  text=%r", trigger_iso, text[:60])
             continue
@@ -121,8 +148,10 @@ async def _save_reminders(
                 text=text,
                 trigger_iso=trigger_iso,
             )
-            logger.info("🔔 reminder.scheduled  id=%d  chat=%s  trigger=%s  text=%r",
-                        rid, chat_id, trigger_iso, text[:60])
+            logger.info(
+                "🔔 reminder.scheduled  id=%d  chat=%s  trigger=%s  text=%r",
+                rid, chat_id, trigger_iso, text[:60],
+            )
             saved += 1
         except Exception as exc:
             logger.error("reminder.save_failed  err=%s  text=%r", exc, text[:60])
@@ -136,11 +165,6 @@ async def _reply_extract_and_save_bg(
     bot_reply:   str,
     known_facts: dict,
 ) -> None:
-    """
-    BUG-1 fix: fire-and-forget task that runs AFTER the reply is sent.
-    Extracts structured data (lists, names, etc.) that the bot confirmed
-    in its reply text, then saves anything new to the facts DB.
-    """
     try:
         updates = await extract_reply_memory(
             chat_id=chat_id,
@@ -179,11 +203,11 @@ def normalize_event(body: dict) -> Tuple[Optional[str], Optional[str], str, bool
         or data_obj.get("body")
         or ""
     )
-    from_me    = bool(root.get("fromMe") or root.get("from_me") or False)
-    key_remote = key.get("remoteJid")
-    remote_jid = root.get("remoteJid") or root.get("chatId") or root.get("chat_id")
-    from_field = root.get("from")
-    to_field   = root.get("to")
+    from_me     = bool(root.get("fromMe") or root.get("from_me") or False)
+    key_remote  = key.get("remoteJid")
+    remote_jid  = root.get("remoteJid") or root.get("chatId") or root.get("chat_id")
+    from_field  = root.get("from")
+    to_field    = root.get("to")
     participant = root.get("participant") or data_obj.get("author")
     sender_obj  = root.get("sender") or {}
     sender_raw  = sender_obj.get("id") or participant or from_field or remote_jid
@@ -333,20 +357,34 @@ async def process_message(
                         for c in list(merged_ctx.values())[:20]
                     ]
                 trace.tag(context_total=len(context_items))
-                logger.info(
-                    "📚 context.built  total=%d", len(context_items),
-                )
+                logger.info("📚 context.built  total=%d", len(context_items))
 
             # ── 4. run agentic loop ─────────────────────────────────────────
             with trace.step("agent_run"):
-                result = await run_agent(
-                    chat_id=chat_id,
-                    user_text=user_text,
-                    facts=facts,
-                    context=context_items,
-                    reminders=reminders,
-                    trace=trace,
-                )
+                try:
+                    result = await run_agent(
+                        chat_id=chat_id,
+                        user_text=user_text,
+                        facts=facts,
+                        context=context_items,
+                        reminders=reminders,
+                        trace=trace,
+                    )
+                except Exception as agent_exc:
+                    # FIX-7: catch rate-limit / LLM failure and send user-facing message
+                    exc_str = str(agent_exc)
+                    if "429" in exc_str or "rate_limit" in exc_str.lower():
+                        friendly = _rate_limit_reply(agent_exc)
+                        logger.warning(
+                            "⚡ rate_limit.user_reply  chat=%s  err=%s",
+                            chat_id, exc_str[:200],
+                        )
+                        try:
+                            await send_text(chat_id, friendly)
+                        except Exception:
+                            pass
+                    raise   # re-raise so trace captures fatal_error
+
                 trace.tag(
                     agent_iterations=result.iterations,
                     reply_len=len(result.reply.text),
@@ -365,13 +403,12 @@ async def process_message(
                 reply_with_sig = append_signature(result.reply.text, chat_id)
                 trace.tag(final_len=len(reply_with_sig))
 
-            # ── 6. persist memory + reminders (BEFORE send so WAHA errors can't lose facts)
+            # ── 6. persist memory + reminders ──────────────────────────────
             with trace.step("memory_save"):
                 saved = created = updated = 0
                 save_errors: List[str] = []
 
                 if database.sqlite_store:
-                    # 6a. Save regular fact updates from orchestrator
                     for mu in result.memory_updates:
                         try:
                             status = await database.sqlite_store.upsert_fact(
@@ -398,7 +435,6 @@ async def process_message(
                                 sender_key, mu.key, exc,
                             )
 
-                    # 6b. Save reminders from AgentResult (dedup via pending list)
                     if result.reminders:
                         rems_saved = await _save_reminders(
                             sender_key=sender_key,
@@ -411,7 +447,7 @@ async def process_message(
                 trace.tag(
                     facts_saved=saved, facts_created=created, facts_updated=updated,
                     facts_attempted=len(result.memory_updates),
-                    **({"save_errors": "; ".join(save_errors)} if save_errors else {}),
+                    **( {"save_errors": "; ".join(save_errors)} if save_errors else {} ),
                 )
                 if result.memory_updates:
                     logger.info(
@@ -442,18 +478,13 @@ async def process_message(
             asyncio.create_task(
                 _store_out_bg(chat_id=chat_id, text=result.reply.text, ts=ts_out, out_id=out_id)
             )
-            # Skip reply_extract when bot just asked a clarifying question —
-            # there's no personal info in a question reply.
-            # NOTE: AgentResult schemas may not include reply.action (pydantic model changes).
-            # Using getattr keeps the worker resilient across schema versions.
-            reply_action = getattr(result.reply, 'action', None)
+            reply_action = getattr(result.reply, "action", None)
             if reply_action is None:
-                # Backward/forward compatibility: some schemas use intent/type instead of action.
-                reply_action = getattr(result.reply, 'intent', None) or getattr(result.reply, 'type', None)
-            reply_text = (getattr(result.reply, 'text', None) or '')
+                reply_action = getattr(result.reply, "intent", None) or getattr(result.reply, "type", None)
+            reply_text = (getattr(result.reply, "text", None) or "")
             _reply_is_question = (
-                (isinstance(reply_action, str) and reply_action == 'ask_user')
-                or (len(reply_text) < 120 and reply_text.rstrip().endswith('?'))
+                (isinstance(reply_action, str) and reply_action == "ask_user")
+                or (len(reply_text) < 120 and reply_text.rstrip().endswith("?"))
             )
             if not _reply_is_question:
                 asyncio.create_task(
@@ -497,7 +528,6 @@ async def _chat_worker(chat_id: str, q: asyncio.Queue) -> None:
                 )
             except Exception:
                 logger.exception("worker.msg_error  chat=%s", chat_id)
-                # Swallow — worker must stay alive for next message
             finally:
                 q.task_done()
     except asyncio.CancelledError:
@@ -521,7 +551,6 @@ async def lifespan(app: FastAPI):
     await init_waha()
     await init_llm()
 
-    # Start background reminder scheduler
     _REMINDER_TASK = asyncio.create_task(
         run_reminder_loop(check_interval_sec=60),
         name="reminder_scheduler",
@@ -531,13 +560,15 @@ async def lifespan(app: FastAPI):
     port = int(os.getenv("PORT", "6000"))
     logger.info(
         "🚀 startup.ready  http://0.0.0.0:%d  "
-        "allowlist=%d  allow_all=%s  live_search=%s  chroma=%s  model_pool=%s",
+        "allowlist=%d  allow_all=%s  live_search=%s  chroma=%s  "
+        "orchestrator=%s  extraction=%s",
         port,
         len(settings.allowed_chat_jids or []),
         settings.allow_all_chats,
         settings.live_search_enabled,
         settings.chroma_enabled,
-        settings.groq_model_pool,
+        settings.orchestrator_model,
+        settings.extraction_model,
     )
 
     yield
@@ -647,6 +678,13 @@ async def webhook(request: Request):
 
 @app.get("/healthz")
 async def health():
+    from .agent_engine import MODEL_CIRCUIT
+    import time as _time
+    now = _time.monotonic()
+    circuit_status = {
+        m: f"open" if now >= ts else f"tripped ({ts - now:.0f}s remaining)"
+        for m, ts in MODEL_CIRCUIT.items()
+    }
     return {
         "status":           "ok",
         "workers":          len(CHAT_WORKERS),
@@ -654,5 +692,8 @@ async def health():
         "live_search":      settings.live_search_enabled,
         "chroma":           settings.chroma_enabled,
         "model_pool":       settings.groq_model_pool,
+        "orchestrator":     settings.orchestrator_model,
+        "extraction":       settings.extraction_model,
+        "circuit_breakers": circuit_status,
         "reminder_task":    _REMINDER_TASK is not None and not (_REMINDER_TASK.done() if _REMINDER_TASK else True),
     }

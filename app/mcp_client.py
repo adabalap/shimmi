@@ -1,14 +1,14 @@
 """
-mcp_client.py — Shimmi v2.9.2
+mcp_client.py — Shimmi v3.0.2
 
-Thin async client for the local MCP server (mcp_server.py).
-Falls back gracefully if MCP server is not running.
+Changes vs v3.0.1:
+  NEW  mcp_currency(from_cur, to_cur, amount) — exchange rates via Frankfurter
+  NEW  mcp_timezone(city) — world clock lookup
+  ARCH live_data.py now calls this client instead of hitting external APIs directly
 
-Usage in agent_engine:
-    from .mcp_client import mcp_news, mcp_stocks, mcp_weather
-    result = await mcp_weather(city="Hyderabad", country="IN")
+Thin async client for the local MCP server (mcp_server.py on :7000).
+Falls back gracefully (returns None) if MCP server is not running.
 """
-
 import logging
 import os
 from typing import Optional
@@ -20,7 +20,6 @@ logger = logging.getLogger("app.mcp")
 _MCP_BASE = os.getenv("MCP_SERVER_URL", "http://localhost:7000")
 _TIMEOUT  = float(os.getenv("MCP_TIMEOUT", "8"))
 
-# Shared client (initialised lazily)
 _CLIENT: Optional[httpx.AsyncClient] = None
 
 
@@ -41,8 +40,10 @@ async def _get(path: str, **params) -> Optional[dict]:
         return None
 
 
+# ── Tool functions ────────────────────────────────────────────────────────────
+
 async def mcp_news(query: str = "top headlines", country: str = "in") -> Optional[dict]:
-    """Fetch news via MCP server. Returns dict with 'articles' list or None on failure."""
+    """Fetch news via MCP server. Returns dict with 'articles' list or None."""
     return await _get("/news", q=query, country=country)
 
 
@@ -52,8 +53,35 @@ async def mcp_stocks(symbols: str = "^NSEI,^BSESN,RELIANCE.NS,TCS.NS,INFY.NS") -
 
 
 async def mcp_weather(city: str, country: str = "IN", days: int = 3) -> Optional[dict]:
-    """Fetch weather for a city via MCP server. Returns weather dict or None on failure."""
+    """Fetch weather for a city via MCP server. Returns weather dict or None."""
     return await _get("/weather", city=city, country=country, days=days)
+
+
+async def mcp_currency(
+    from_cur: str,
+    to_cur:   str,
+    amount:   float = 1.0,
+) -> Optional[dict]:
+    """
+    Live currency conversion via MCP server.
+    Returns dict with {from, to, rate, amount, converted, as_of} or None.
+    Example: mcp_currency("USD", "INR", 100) → {"converted": 8350.0, "rate": 83.5, ...}
+    """
+    return await _get("/currency", **{"from": from_cur, "to": to_cur, "amount": amount})
+
+
+async def mcp_timezone(city: str) -> Optional[dict]:
+    """
+    World clock for a city via MCP server.
+    Returns dict with {city, timezone, local_time, utc_offset} or None.
+    Example: mcp_timezone("Tokyo") → {"local_time": "2026-03-10T15:45:00", ...}
+    """
+    return await _get("/timezone", city=city)
+
+
+async def mcp_health() -> Optional[dict]:
+    """Ping the MCP server health endpoint."""
+    return await _get("/health")
 
 
 def mcp_available() -> bool:
