@@ -9,3 +9,7 @@ app/__pycache__/
 .idea/
 .vscode/
 tests/test_results.json
+
+# Never commit env files
+.env
+.env.*
