@@ -55,6 +55,24 @@ _WORKER_IDLE_TIMEOUT_SEC: float = 3_600.0
 BOT_IDENTITY = "shimmi-bot"
 _REMINDER_TASK: Optional[asyncio.Task] = None
 
+# FIX-P0-3: inbound event dedup — prevents double-processing when WAHA retries
+# the same webhook event (common in WhatsApp delivery retries).
+_INBOUND_SEEN:     Dict[str, float] = {}   # event_id → monotonic timestamp
+_INBOUND_SEEN_TTL: float            = 30.0  # seconds to remember event_id
+
+
+def _inbound_seen_check(event_id: str) -> bool:
+    """Returns True (= duplicate, skip) if event_id was seen within TTL."""
+    now = time.monotonic()
+    # Prune old entries to prevent unbounded growth
+    stale = [k for k, ts in _INBOUND_SEEN.items() if now - ts > 60.0]
+    for k in stale:
+        _INBOUND_SEEN.pop(k, None)
+    if event_id in _INBOUND_SEEN:
+        return True
+    _INBOUND_SEEN[event_id] = now
+    return False
+
 
 # ---------------------------------------------------------------------------
 # Startup integrity check
@@ -662,6 +680,11 @@ async def webhook(request: Request):
 
     sender_key = canonical_user_key(sender_id) or sender_id or ""
     await _ambient_store(chat_id=chat_id, sender_key=sender_key, text=text or "", event_id=event_id)
+
+    # FIX-P0-3: reject duplicate event_ids (WAHA retries same event on delivery failure)
+    if event_id and _inbound_seen_check(event_id):
+        logger.debug("webhook.dedup  event=%s  chat=%s  (already seen)", event_id, chat_id)
+        return JSONResponse({"status": "ok", "message": "duplicate"})
 
     if from_me and not settings.allow_fromme:
         logger.debug("webhook.skip  reason=fromMe  event=%s", event_id)

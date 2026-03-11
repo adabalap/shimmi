@@ -724,47 +724,56 @@ _CURRENCY_KW = re.compile(r"\b(currency|exchange rate|convert|usd|eur|gbp|inr|fo
 _TIMEZONE_KW = re.compile(r"\b(time in|timezone|what time is it in|local time|current time in)\b", re.I)
 
 
-async def _live_search(query: str, chat_id: str) -> str:
+async def _live_search(query: str, chat_id: str, facts: Optional[Dict[str, str]] = None) -> str:
     """
     Route live-data requests to MCP first, then fall back to compound-beta-mini.
     compound-beta-mini uses the Groq web search capability with llama-3.3-70b backend.
     Tracked separately from the orchestration token budget.
+
+    FIX-P0-2: accepts `facts` so weather/stocks can use the user's known city/country
+    instead of passing the raw LLM query as a city name (which always 404s).
     """
     from .live_data import get_weather, get_indian_stocks, get_news
     from .mcp_client import mcp_currency, mcp_timezone
 
-    q = query.lower()
+    q      = query.lower()
+    _facts = facts or {}
 
     # ── MCP structured endpoints first ────────────────────────────────────
     try:
         if _WEATHER_KW.search(q):
-            return await get_weather(query) or ""
+            # FIX-P0-2: use city from facts — NOT the raw query string
+            city    = (_facts.get("city") or _facts.get("user_city") or "").strip()
+            country = (_facts.get("country") or "IN").strip()
+            if not city:
+                # Last resort: strip stop-words from query to get something usable
+                city = re.sub(
+                    r"\b(weather|forecast|temperature|tomorrow|today|rain|humidity|"
+                    r"wind|climate|in|for|the|what|is|it|s|current|week|weekly)\b",
+                    "", query, flags=re.I,
+                ).strip() or "Hyderabad"
+            result = await get_weather(city, country) or ""
+            if result:
+                return result
     except Exception:
         pass
 
     try:
         if _STOCKS_KW.search(q):
-            return await get_indian_stocks(query) or ""
+            return await get_indian_stocks(None) or ""
     except Exception:
         pass
 
     try:
         if _NEWS_KW.search(q):
-            return await get_news(query) or ""
+            country = (_facts.get("country") or "IN")[:2].upper()
+            return await get_news(query, country) or ""
     except Exception:
         pass
 
-    try:
-        if _CURRENCY_KW.search(q):
-            return await mcp_currency(query) or ""
-    except Exception:
-        pass
-
-    try:
-        if _TIMEZONE_KW.search(q):
-            return await mcp_timezone(query) or ""
-    except Exception:
-        pass
+    # currency + timezone: require structured params — skip MCP keyword-match,
+    # fall through to compound-beta-mini which handles freeform queries well
+    # (Phase 1 will replace this with LLM tool dispatch)
 
     # ── Fallback: compound-beta-mini web search ───────────────────────────
     if not settings.live_search_enabled:
@@ -1207,7 +1216,7 @@ async def run_agent(
                     iterations=iteration,
                 )
             query = orch.query or user_text
-            search_result = await _live_search(query, chat_id)
+            search_result = await _live_search(query, chat_id, facts=facts)
             logger.info("🔍 search.done  iter=%d  query=%r  result_len=%d",
                         iteration, query, len(search_result or ""))
             if trace:

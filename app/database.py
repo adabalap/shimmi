@@ -184,6 +184,18 @@ class SQLiteMemory:
             )
             conn.commit()
 
+        # ── FIX-P0-4: delete junk fact values persisted by early bot versions ──
+        _JUNK = ("unknown", "none", "null", "n/a", "-", "")
+        placeholders = ",".join("?" * len(_JUNK))
+        conn.execute(
+            f"DELETE FROM user_memory WHERE LOWER(TRIM(fact_value)) IN ({placeholders})",
+            _JUNK,
+        )
+        n_junk = conn.execute("SELECT changes()").fetchone()[0]
+        if n_junk:
+            conn.commit()
+            logger.info("🗄️  migrate — deleted %d junk fact rows (unknown/none/null)", n_junk)
+
         # ── reminders table migration ──────────────────────────────────────
         # v2.9.0 canonical schema uses cancelled/failed INTEGER booleans.
         # Any prior variant (no trigger_iso, status TEXT, user_name TEXT, etc.)
@@ -260,8 +272,11 @@ class SQLiteMemory:
                         "WHERE whatsapp_id=? ORDER BY updated_at DESC",
                         (whatsapp_id,),
                     )
+                    _JUNK = frozenset({"unknown", "none", "null", "n/a", "-", ""})
                     out: Dict[str, str] = {}
                     for raw_key, val in cur.fetchall():
+                        if (val or "").strip().lower() in _JUNK:  # FIX-P0-4
+                            continue
                         canon = normalize_key(raw_key)
                         if canon and canon not in out:
                             out[canon] = val
@@ -490,6 +505,10 @@ class ChromaAmbient:
             metadata={"hnsw:space": "cosine"},
             embedding_function=SentenceTransformerEmbedding(embed_model),
         )
+        # FIX-P0-1: SentenceTransformer's Rust tokenizer is NOT re-entrant.
+        # Concurrent asyncio.to_thread() calls → "RuntimeError: Already borrowed".
+        # This lock serialises all embedding operations (upsert + query + recent).
+        self._embed_lock = asyncio.Lock()
         logger.info(
             "📚 chroma.ready  dir=%s  collection=%s",
             str(persist_dir), collection_name,
@@ -500,14 +519,16 @@ class ChromaAmbient:
             return
         doc_id = f"{chat_id}:{message_id}:{direction}"
         meta   = {"chat_id": chat_id, "whatsapp_id": whatsapp_id, "direction": direction, "ts": ts}
-        await asyncio.to_thread(
-            lambda: self.collection.upsert(ids=[doc_id], documents=[text], metadatas=[meta])
-        )
+        async with self._embed_lock:  # FIX-P0-1: serialise embed calls
+            await asyncio.to_thread(
+                lambda: self.collection.upsert(ids=[doc_id], documents=[text], metadatas=[meta])
+            )
 
     async def search(self, *, chat_id, query, k):
-        res = await asyncio.to_thread(
-            lambda: self.collection.query(query_texts=[query], n_results=k, where={"chat_id": chat_id})
-        )
+        async with self._embed_lock:  # FIX-P0-1: serialise embed calls
+            res = await asyncio.to_thread(
+                lambda: self.collection.query(query_texts=[query], n_results=k, where={"chat_id": chat_id})
+            )
         return [
             ContextSnippet(id=_id, text=doc, metadata=meta or {}, distance=dist)
             for _id, doc, meta, dist in zip(
@@ -517,12 +538,13 @@ class ChromaAmbient:
         ]
 
     async def recent_window(self, *, chat_id, k):
-        res = await asyncio.to_thread(
-            lambda: self.collection.get(
-                where={"chat_id": chat_id}, limit=max(50, k * 5),
-                include=["documents", "metadatas"],
+        async with self._embed_lock:  # FIX-P0-1: serialise embed calls
+            res = await asyncio.to_thread(
+                lambda: self.collection.get(
+                    where={"chat_id": chat_id}, limit=max(50, k * 5),
+                    include=["documents", "metadatas"],
+                )
             )
-        )
         items = [
             ContextSnippet(id=_id, text=doc, metadata=meta or {})
             for _id, doc, meta in zip(
