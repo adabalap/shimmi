@@ -1,12 +1,14 @@
 """
-main.py — Shimmi v3.0.2
+main.py — Shimmi v3.0.3
 
-Changes vs v3.0.1:
-  FIX-7  User-facing error reply on total LLM failure: when all models are
-         rate-limited (Groq 429 / TPD exhausted) the user previously saw
-         silence. Now they receive a short informational message and a
-         retry hint, including how long to wait when parseable from the error.
-  NOTE   main.py version header updated; all other logic from v2.9.2 preserved.
+Changes vs v3.0.2:
+  - Added Gemini to integrity check (GEMINI_API_KEY warning if absent)
+  - Updated startup log to show provider chain (Gemini → Groq 70B → Groq 8B)
+  - Improved _rate_limit_reply: handles both Groq and Gemini quota messages
+  - Health endpoint: shows per-provider circuit state + token budget usage
+  - _reply_extract_and_save_bg: uses updated extract_reply_memory() signature
+  - All LLM errors now always produce a user-facing WhatsApp reply (no silent
+    failures even when all providers are exhausted)
 """
 from __future__ import annotations
 
@@ -34,8 +36,9 @@ from .waha_provider import (
     OUTBOUND_CACHE_IDS, OUTBOUND_CACHE_TXT, OUTBOUND_TTL_SEC, outbound_hash,
 )
 from .agent_engine import (
-    init_llm, close_llm, run_agent, extract_reply_memory, VALID_GROQ_PREFIXES,
-    _is_reminder_duplicate,
+    init_llm, close_llm, run_agent, extract_reply_memory,
+    VALID_GROQ_PREFIXES, VALID_GEMINI_PREFIXES,
+    _is_reminder_duplicate, MODEL_CIRCUIT, PROVIDER_CIRCUIT, _TOKEN_BUDGET,
 )
 from .trace import Trace
 from .signature import append_signature
@@ -59,6 +62,8 @@ _REMINDER_TASK: Optional[asyncio.Task] = None
 
 def _integrity_check() -> None:
     issues: List[str] = []
+    warnings: List[str] = []
+
     if not settings.groq_api_key:
         issues.append("GROQ_API_KEY is not set — LLM will be disabled")
     if not settings.waha_api_url:
@@ -69,6 +74,15 @@ def _integrity_check() -> None:
         )
     if settings.live_search_enabled and not settings.live_search_model:
         issues.append("LIVE_SEARCH_ENABLED=1 but LIVE_SEARCH_MODEL is empty")
+
+    # Gemini check — warning only (Groq fallback still works)
+    if not settings.gemini_api_key:
+        warnings.append(
+            "GEMINI_API_KEY is not set. Gemini is the primary orchestrator with a "
+            "much higher free-tier quota (1M tokens/min vs Groq 100K tokens/day). "
+            "Get a free key at https://aistudio.google.com/apikey and set GEMINI_API_KEY."
+        )
+
     pool = settings.groq_model_pool or []
     for m in pool:
         if not any(m.startswith(p) for p in VALID_GROQ_PREFIXES):
@@ -77,21 +91,29 @@ def _integrity_check() -> None:
                 "Valid names start with: llama-, compound-beta, mixtral-, gemma-. "
                 "Fix GROQ_MODEL_POOL in .env."
             )
-    if pool and pool[0] == "llama-3.1-8b-instant":
-        issues.append(
-            "GROQ_MODEL_POOL starts with llama-3.1-8b-instant (8B model). "
-            "Recommend putting llama-3.3-70b-versatile first."
-        )
     if any(m.startswith("compound-beta") for m in pool):
-        issues.append(
+        warnings.append(
             "GROQ_MODEL_POOL contains compound-beta-mini. This model shares the "
-            "llama-3.3-70b daily token bucket. Remove it from GROQ_MODEL_POOL — "
-            "it is used automatically for live search via LIVE_SEARCH_MODEL."
+            "llama-3.3-70b daily token bucket (100K/day). Remove it from "
+            "GROQ_MODEL_POOL — it is used automatically for live search."
         )
+
+    gem_pool = settings.gemini_model_pool or []
+    for m in gem_pool:
+        if not any(m.startswith(p) for p in VALID_GEMINI_PREFIXES):
+            warnings.append(
+                f"GEMINI_MODEL_POOL contains non-Gemini model {m!r}. "
+                "Expected names start with: gemini-"
+            )
+
     for issue in issues:
-        logger.warning("⚠️  CONFIG: %s", issue)
-    if not issues:
+        logger.warning("⚠️  CONFIG_ERROR: %s", issue)
+    for warn in warnings:
+        logger.warning("⚠️  CONFIG_WARN: %s", warn)
+    if not issues and not warnings:
         logger.info("✅ integrity_check — all config OK")
+    elif not issues:
+        logger.info("✅ integrity_check — config OK (with warnings)")
 
 
 # ---------------------------------------------------------------------------
@@ -99,9 +121,9 @@ def _integrity_check() -> None:
 # ---------------------------------------------------------------------------
 
 def _rate_limit_reply(exc: Exception) -> str:
-    """Compose a user-friendly reply when all LLM models are rate-limited."""
+    """Compose a user-friendly reply when all LLM providers are rate-limited."""
     msg = str(exc)
-    # Try to extract wait time from Groq message
+    # Groq: "Please try again in 1h4m54.368s"
     m = re.search(
         r"try again in\s+(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:([\d.]+)s)?",
         msg, re.IGNORECASE,
@@ -115,9 +137,19 @@ def _rate_limit_reply(exc: Exception) -> str:
         elif mins:
             wait_str = f" (about {mins} min)"
 
+    # Gemini: "retry after N seconds"
+    if not wait_str:
+        m2 = re.search(r"retry[^\d]*(\d+)\s*second", msg, re.IGNORECASE)
+        if m2:
+            secs = int(m2.group(1))
+            wait_str = f" (about {secs//60} min)" if secs >= 60 else f" ({secs}s)"
+
+    is_gemini = "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower()
+    provider  = "Gemini" if is_gemini else "Groq"
+
     return (
-        f"⚡ I've hit my daily AI quota{wait_str}. "
-        "Please try again later — I'll be back to full speed soon!"
+        f"⚡ I've hit my {provider} AI quota{wait_str}. "
+        "Please try again later — I'll be back to full speed soon! 🙏"
     )
 
 
@@ -163,29 +195,21 @@ async def _reply_extract_and_save_bg(
     sender_key:  str,
     user_text:   str,
     bot_reply:   str,
-    known_facts: dict,
+    known_facts: dict,  # noqa: ARG001 — kept for API compat
 ) -> None:
+    """
+    Fire-and-forget: extract facts from the bot's own reply and persist them.
+    Uses extract_reply_memory() which handles DB writes internally.
+    All exceptions are suppressed — this is best-effort enrichment.
+    """
     try:
-        updates = await extract_reply_memory(
+        await extract_reply_memory(
+            reply_text=bot_reply,
             chat_id=chat_id,
-            user_text=user_text,
-            bot_reply=bot_reply,
-            existing_facts=known_facts,
+            sender_key=sender_key,
         )
-        if not updates or not database.sqlite_store:
-            return
-        for mu in updates:
-            try:
-                status = await database.sqlite_store.upsert_fact(sender_key, mu.key, mu.value)
-                if status in ("created", "updated"):
-                    logger.info(
-                        "🧠 reply_memory.%s  sender=%s  key=%s  value=%r",
-                        status, sender_key, mu.key, mu.value,
-                    )
-            except Exception as exc:
-                logger.error("reply_memory.save_failed  key=%s  err=%s", mu.key, exc)
     except Exception as exc:
-        logger.error("reply_memory.bg_error  err=%s", exc)
+        logger.debug("reply_memory.bg_suppressed  err=%s", str(exc)[:80])
 
 
 # ---------------------------------------------------------------------------
@@ -558,17 +582,23 @@ async def lifespan(app: FastAPI):
     logger.info("🕐 scheduler.task_created")
 
     port = int(os.getenv("PORT", "6000"))
+    primary_orch = (
+        f"Gemini({settings.gemini_orchestrator_model})"
+        if settings.gemini_enabled
+        else f"Groq({settings.orchestrator_model})"
+    )
     logger.info(
         "🚀 startup.ready  http://0.0.0.0:%d  "
         "allowlist=%d  allow_all=%s  live_search=%s  chroma=%s  "
-        "orchestrator=%s  extraction=%s",
+        "primary_orchestrator=%s  extraction=%s  gemini=%s",
         port,
         len(settings.allowed_chat_jids or []),
         settings.allow_all_chats,
         settings.live_search_enabled,
         settings.chroma_enabled,
-        settings.orchestrator_model,
+        primary_orch,
         settings.extraction_model,
+        "✅" if settings.gemini_enabled else "❌ (set GEMINI_API_KEY for 15× more quota)",
     )
 
     yield
@@ -678,22 +708,43 @@ async def webhook(request: Request):
 
 @app.get("/healthz")
 async def health():
-    from .agent_engine import MODEL_CIRCUIT
     import time as _time
     now = _time.monotonic()
-    circuit_status = {
-        m: f"open" if now >= ts else f"tripped ({ts - now:.0f}s remaining)"
+    model_circuits = {
+        m: "open" if now >= ts else f"tripped ({ts - now:.0f}s remaining)"
         for m, ts in MODEL_CIRCUIT.items()
     }
+    provider_circuits = {
+        p: "open" if now >= ts else f"tripped ({ts - now:.0f}s remaining)"
+        for p, ts in PROVIDER_CIRCUIT.items()
+    }
+    # Token budget fractions
+    from .agent_engine import _budget_fraction
+    budget = {
+        "groq_70b": f"{_budget_fraction('groq_70b', settings.groq_70b_daily_limit)*100:.1f}% of {settings.groq_70b_daily_limit:,}/day",
+        "groq_8b":  f"{_budget_fraction('groq_8b', 500_000)*100:.1f}% of 500K/day",
+    }
     return {
-        "status":           "ok",
-        "workers":          len(CHAT_WORKERS),
-        "queues":           {cid: q.qsize() for cid, q in CHAT_QUEUES.items()},
-        "live_search":      settings.live_search_enabled,
-        "chroma":           settings.chroma_enabled,
-        "model_pool":       settings.groq_model_pool,
-        "orchestrator":     settings.orchestrator_model,
-        "extraction":       settings.extraction_model,
-        "circuit_breakers": circuit_status,
-        "reminder_task":    _REMINDER_TASK is not None and not (_REMINDER_TASK.done() if _REMINDER_TASK else True),
+        "status":            "ok",
+        "version":           "3.0.3",
+        "workers":           len(CHAT_WORKERS),
+        "queues":            {cid: q.qsize() for cid, q in CHAT_QUEUES.items()},
+        "providers": {
+            "gemini": {
+                "enabled": settings.gemini_enabled,
+                "orchestrator": settings.gemini_orchestrator_model,
+                "extraction":   settings.gemini_extraction_model,
+            },
+            "groq": {
+                "orchestrator": settings.orchestrator_model,
+                "extraction":   settings.extraction_model,
+                "pool":         settings.groq_model_pool,
+            },
+        },
+        "live_search":       settings.live_search_enabled,
+        "chroma":            settings.chroma_enabled,
+        "model_circuits":    model_circuits,
+        "provider_circuits": provider_circuits,
+        "token_budget":      budget,
+        "reminder_task":     _REMINDER_TASK is not None and not (_REMINDER_TASK.done() if _REMINDER_TASK else True),
     }

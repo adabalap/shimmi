@@ -1,50 +1,42 @@
-# ============================================================
-# Shimmi — WhatsApp AI Bot
-# requirements.txt  (Python 3.12+)
-# ============================================================
-
-# ── Web framework ────────────────────────────────────────────
-fastapi==0.115.6
-uvicorn[standard]==0.30.6          # [standard] adds WebSocket + faster event loop
-
-# ── Configuration ────────────────────────────────────────────
-python-dotenv==1.0.1
-
-# ── Data validation ──────────────────────────────────────────
-pydantic==2.9.2
-
-# ── LLM (Groq) ───────────────────────────────────────────────
-groq==0.13.1
-
-# ── HTTP client (WAHA API calls) ─────────────────────────────
-httpx==0.27.2
-
-# ── Vector database (semantic context) ───────────────────────
-chromadb==0.5.20
-
-# ── Embeddings (ChromaDB default embedding function) ─────────
-# NOTE: sentence-transformers pulls in PyTorch (~2GB on CPU).
-# If bandwidth / disk is a concern, first install CPU-only torch:
+# Shimmi v3.0.3 — Python requirements
+# Python >= 3.12 required.
+#
+# Install (inside venv recommended):
+#   pip install -r requirements.txt
+#
+# NOTE: sentence-transformers pulls in PyTorch (~2 GB).
+# For a CPU-only server, install torch first:
 #   pip install torch --index-url https://download.pytorch.org/whl/cpu
-sentence-transformers==2.7.0
-numpy==1.26.4                      # Required by sentence-transformers; pin to avoid numpy 2.x breakage
+#   then: pip install -r requirements.txt
 
-# ── Scheduler (proactive reminder delivery) ──────────────────
-# Used to fire timed reminders (60s poll loop).
-# Re-implement scheduler.py using AsyncIOScheduler.
-APScheduler==3.10.4
+# Web framework
+fastapi>=0.115.0,<1.0
+uvicorn[standard]>=0.30.0,<1.0
+python-multipart>=0.0.12
 
-# ── Stock / financial data (optional live-data enrichment) ───
-# Only needed if you implement a custom live_data.py with Yahoo Finance.
-# The default live-search path uses Groq compound-beta-mini (no yfinance needed).
-# Uncomment to enable direct Yahoo Finance queries:
-yfinance==0.2.54
+# LLM providers
+groq>=0.12.0                  # Groq async client (primary)
+# Google Gemini uses the OpenAI-compatible REST endpoint via httpx.
+# No extra SDK — just set GEMINI_API_KEY in .env.
 
-# ── News data (optional legacy live-data enrichment) ─────────
-# Only needed if you replace compound-beta-mini with a custom news API path.
-# Uncomment to enable direct GNews queries:
-gnews==0.3.7
+# HTTP
+httpx>=0.27.0,<1.0            # MCP client + Gemini REST calls
+anyio>=4.4.0
 
-# ── Utilities ────────────────────────────────────────────────
-anyio>=4.4.0                       # Async primitives (transitive from fastapi/httpx, pinned for compatibility)
-certifi>=2024.2.2                  # Up-to-date CA certificates for HTTPS
+# Database
+aiosqlite>=0.20.0
+chromadb>=0.5.0
+sentence-transformers>=3.0.0
+
+# Validation
+pydantic>=2.7.0,<3.0
+
+# Configuration
+python-dotenv>=1.0.0
+
+# Timezone
+tzdata>=2024.1
+
+# MCP sidecar (mcp_server.py — same or separate venv)
+yfinance>=0.2.40
+gnews>=0.3.7

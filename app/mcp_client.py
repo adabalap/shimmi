@@ -1,5 +1,5 @@
 """
-mcp_client.py — Shimmi v3.0.2
+mcp_client.py — Shimmi v3.0.3
 
 Changes vs v3.0.1:
   NEW  mcp_currency(from_cur, to_cur, amount) — exchange rates via Frankfurter
