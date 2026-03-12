@@ -40,7 +40,7 @@ _HTTP: Optional[httpx.AsyncClient] = None
 @app.on_event("startup")
 async def _startup():
     global _HTTP
-    _HTTP = httpx.AsyncClient(timeout=10.0, follow_redirects=True)
+    _HTTP = httpx.AsyncClient(timeout=30.0, follow_redirects=True)
     logger.info("🚀 MCP server ready on :7000")
 
 @app.on_event("shutdown")
@@ -292,6 +292,109 @@ async def get_weather(
             "as_of":        current.get("time"),
         },
         "forecast": forecast_days,
+    }
+
+
+# ─────────────────────────── /currency ──────────────────────────────────────
+
+@app.get("/currency")
+async def get_currency(
+    from_cur: str   = Query("USD", alias="from",   description="Source currency, e.g. USD"),
+    to_cur:   str   = Query("INR", alias="to",     description="Target currency, e.g. INR"),
+    amount:   float = Query(1.0,                   description="Amount to convert"),
+):
+    """
+    Live currency conversion via Frankfurter (free ECB data, no API key).
+    GET /currency?from=USD&to=INR&amount=100
+    """
+    from_cur = from_cur.upper()
+    to_cur   = to_cur.upper()
+    try:
+        resp = await _HTTP.get(
+            "https://api.frankfurter.app/latest",
+            params={"from": from_cur, "to": to_cur},
+        )
+        data = resp.json()
+        rate = data.get("rates", {}).get(to_cur)
+        if rate is None:
+            raise HTTPException(status_code=502, detail=f"Rate not found for {from_cur}→{to_cur}")
+        converted = round(rate * amount, 4)
+        return {
+            "from": from_cur,
+            "to": to_cur,
+            "rate": rate,
+            "amount": amount,
+            "converted": converted,
+            "as_of": data.get("date", datetime.now(UTC).date().isoformat()),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Currency fetch failed: {e}")
+
+
+# ─────────────────────────── /timezone ───────────────────────────────────────
+
+@app.get("/timezone")
+async def get_timezone(
+    city: str = Query(..., description="City name, e.g. Tokyo"),
+):
+    """
+    World clock for any city. Returns current local time + UTC offset.
+    Geocodes city via Open-Meteo (free, no API key).
+    """
+    from zoneinfo import ZoneInfo
+    geo_resp = await _HTTP.get(
+        "https://geocoding-api.open-meteo.com/v1/search",
+        params={"name": city, "count": 1, "language": "en", "format": "json"},
+    )
+    geo_data = geo_resp.json()
+    results = geo_data.get("results", [])
+    if not results:
+        raise HTTPException(status_code=404, detail=f"City not found: {city}")
+    loc = results[0]
+    tz_name   = loc.get("timezone", "UTC")
+    city_full = f"{loc.get('name', city)}, {loc.get('country', '')}"
+    try:
+        tz       = ZoneInfo(tz_name)
+        local_dt = datetime.now(tz)
+        offset   = local_dt.strftime("%z")
+        fmt_off  = f"{offset[:3]}:{offset[3:]}" if len(offset) == 5 else offset
+        return {
+            "city":       city_full,
+            "timezone":   tz_name,
+            "local_time": local_dt.isoformat(timespec="seconds"),
+            "utc_offset": fmt_off,
+            "formatted":  local_dt.strftime("%H:%M %Z, %A %d %b %Y"),
+        }
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=f"Timezone error: {e}")
+
+
+# ─────────────────────────── /datetime ───────────────────────────────────────
+
+@app.get("/datetime")
+async def get_datetime(
+    tz: str = Query("Asia/Kolkata", description="IANA timezone, e.g. Asia/Kolkata"),
+):
+    """
+    Current date and time for a given timezone. Useful for 'what time is it' queries.
+    Default timezone: Asia/Kolkata (IST, UTC+05:30).
+    """
+    from zoneinfo import ZoneInfo
+    try:
+        zone = ZoneInfo(tz)
+    except Exception:
+        zone = ZoneInfo("UTC")
+    now = datetime.now(zone)
+    return {
+        "timezone":    tz,
+        "iso":         now.isoformat(timespec="seconds"),
+        "date":        now.strftime("%Y-%m-%d"),
+        "time":        now.strftime("%H:%M:%S"),
+        "formatted":   now.strftime("%H:%M %Z, %A %d %b %Y"),
+        "day_of_week": now.strftime("%A"),
+        "timestamp_utc": datetime.now(UTC).isoformat(timespec="seconds"),
     }
 
 

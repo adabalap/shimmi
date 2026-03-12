@@ -46,20 +46,94 @@ class DeleteOutcome(str, Enum):
 # Key normalisation
 # ---------------------------------------------------------------------------
 
+# ── Canonical key map ──────────────────────────────────────────────────────
+# Every variant the LLM might hallucinate → single canonical key.
+# normalize_key() applies this AFTER stripping user_ prefix, so entries
+# here should NOT have the user_ prefix (it's already stripped).
 _KEY_ALIASES: Dict[str, str] = {
-    "user_name": "name", "username": "name", "first_name": "name", "full_name": "name",
-    "user_city": "city", "user_location": "city", "location": "city", "hometown": "city",
+    # ── name ──────────────────────────────────────────────────────────────
+    "username": "name", "first_name": "name", "full_name": "name",
+    "user_name": "name", "display_name": "name",
+
+    # ── location ──────────────────────────────────────────────────────────
+    "user_city": "city", "user_location": "city",
+    "location": "city", "hometown": "city", "current_city": "city",
     "user_country": "country",
+    "zip": "postal_code", "zipcode": "postal_code", "pin": "postal_code",
+    "pincode": "postal_code",
+
+    # ── color (canonical: favorite_color) ─────────────────────────────────
+    "colour": "favorite_color", "favorite_colour": "favorite_color",
+    "favourite_color": "favorite_color", "favourite_colour": "favorite_color",
+    "preferred_color": "favorite_color", "preferred_colour": "favorite_color",
+
+    # ── drink ─────────────────────────────────────────────────────────────
     "user_favorite_drink": "favorite_drink", "preferred_drink": "favorite_drink",
     "user_drink": "favorite_drink", "drink": "favorite_drink",
+    "favourite_drink": "favorite_drink", "fav_drink": "favorite_drink",
+
+    # ── food ──────────────────────────────────────────────────────────────
+    "favourite_food": "favorite_food", "fav_food": "favorite_food",
+    "preferred_food": "favorite_food",
+    "favourite_cuisine": "favorite_cuisine", "fav_cuisine": "favorite_cuisine",
+    "preferred_cuisine": "favorite_cuisine",
+
+    # ── interests / hobbies ───────────────────────────────────────────────
     "user_interests": "interests", "user_interest": "interests",
+    "interest": "interests", "passion": "interests", "passions": "interests",
+    "technical_interests": "interests",
     "user_hobby": "hobbies", "user_hobbies": "hobbies",
-    "user_occupation": "occupation", "user_job": "occupation", "job": "occupation",
-    "user_age": "age",
-    "user_language": "preferred_language", "language": "preferred_language",
+    "hobby": "hobbies",
+
+    # ── occupation / work ─────────────────────────────────────────────────
+    "user_occupation": "occupation", "user_job": "occupation",
+    "job": "occupation", "profession": "occupation", "role": "occupation",
+    "job_title": "occupation", "current_job_title": "occupation",
+    "work": "occupation",
+    "employer": "company", "current_company": "company",
+    "workplace": "company", "work_place": "company",
+
+    # ── education ─────────────────────────────────────────────────────────
+    "educational_background": "education",
+    "degree_background": "education",
+    "school": "education", "college": "education",
+
+    # ── fitness / health ──────────────────────────────────────────────────
+    "fitness_goal": "fitness_goals", "fitness_target": "fitness_goals",
+    "health_goal": "fitness_goals", "health_goals": "fitness_goals",
+    "marathon_goal": "fitness_goals",
+
+    # ── travel ────────────────────────────────────────────────────────────
+    "travel_plan": "travel_plans", "next_trip": "travel_plans",
+    "upcoming_trip": "travel_plans",
+
+    # ── pets ──────────────────────────────────────────────────────────────
+    "pet": "pets", "pet_name": "pets",
+
+    # ── vehicle ───────────────────────────────────────────────────────────
+    "vehicle": "car",
+
+    # ── books / reading ───────────────────────────────────────────────────
+    "book": "recent_book", "books": "recent_book",
+    "books_read": "recent_book", "current_book": "recent_book",
+    "reading": "recent_book", "last_book": "recent_book",
+
+    # ── lists ─────────────────────────────────────────────────────────────
     "grocery": "grocery_list", "groceries": "grocery_list",
     "shopping": "shopping_list",
-    "todo": "todo_list", "todos": "todo_list",
+    "todo": "todo_list", "todos": "todo_list", "task": "todo_list",
+
+    # ── language ──────────────────────────────────────────────────────────
+    "user_language": "preferred_language", "language": "preferred_language",
+    "lang": "preferred_language",
+
+    # ── age ───────────────────────────────────────────────────────────────
+    "user_age": "age",
+
+    # ── career / goals ────────────────────────────────────────────────────
+    "career_goal": "career_goals", "career_aspiration": "career_goals",
+    "career_aspirations": "career_goals",
+    "goal": "personal_goals", "life_goal": "personal_goals",
 }
 
 _SPECIAL_PREFIXES = ("_reminder", "_cancel_reminder")
@@ -287,6 +361,62 @@ class SQLiteMemory:
         if n_junk:
             conn.commit()
             logger.info("🗄️  migrate — deleted %d junk fact rows (unknown/none/null)", n_junk)
+
+        # ── FIX-P2: consolidate duplicate keys caused by LLM key sprawl ──────
+        # For each user, identify rows whose fact_key normalizes to the same
+        # canonical key.  Keep the most-recently-updated row, delete the rest.
+        rows = conn.execute(
+            "SELECT whatsapp_id, fact_key, fact_value, updated_at FROM user_memory"
+        ).fetchall()
+        # Group by (whatsapp_id, canonical_key); keep latest
+        from collections import defaultdict
+        best: dict = {}   # (whatsapp_id, canon) → (raw_key, value, updated_at)
+        for wid, raw_key, val, upd in rows:
+            canon = normalize_key(raw_key)
+            if not canon:
+                continue
+            k = (wid, canon)
+            if k not in best or (upd or "") > (best[k][2] or ""):
+                best[k] = (raw_key, val, upd)
+        # Delete rows that are not the keeper for their canonical key
+        deleted_dupes = 0
+        for wid, raw_key, val, upd in rows:
+            canon = normalize_key(raw_key)
+            if not canon:
+                continue
+            keeper_raw = best[(wid, canon)][0]
+            if raw_key != keeper_raw:
+                conn.execute(
+                    "DELETE FROM user_memory WHERE whatsapp_id=? AND fact_key=?",
+                    (wid, raw_key),
+                )
+                deleted_dupes += 1
+        # Rename keeper rows to their canonical key if different
+        renamed = 0
+        for (wid, canon), (raw_key, val, upd) in best.items():
+            if raw_key != canon:
+                # Check if canonical key row already exists (shouldn't after dedup but be safe)
+                existing = conn.execute(
+                    "SELECT 1 FROM user_memory WHERE whatsapp_id=? AND fact_key=?",
+                    (wid, canon),
+                ).fetchone()
+                if existing:
+                    conn.execute(
+                        "DELETE FROM user_memory WHERE whatsapp_id=? AND fact_key=?",
+                        (wid, raw_key),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE user_memory SET fact_key=? WHERE whatsapp_id=? AND fact_key=?",
+                        (canon, wid, raw_key),
+                    )
+                renamed += 1
+        if deleted_dupes or renamed:
+            conn.commit()
+            logger.info(
+                "🗄️  migrate — key_dedup: removed %d duplicate rows, canonicalized %d keys",
+                deleted_dupes, renamed,
+            )
 
         # ── reminders table migration ──────────────────────────────────────
         # v2.9.0 canonical schema uses cancelled/failed INTEGER booleans.
@@ -575,22 +705,24 @@ class SQLiteMemory:
         raw_keys: List[str],
         *,
         confirmed: bool = False,
-    ) -> tuple[int, List[str]]:
+    ) -> Tuple[int, Dict[str, DeleteOutcome]]:
         """
         P1-FEAT-2 + P1-GUARD: Delete multiple facts in a single transaction.
 
-        Each key is individually checked against the allowlist and confirmation
-        requirement.  Keys that fail guardrails are skipped and reported.
+        Each key is individually checked against the allowlist + confirmation
+        requirement before any DB write occurs.
 
         Args:
-            whatsapp_id: Authenticated sender key.
+            whatsapp_id: Authenticated sender key (from WAHA webhook, never from LLM).
             raw_keys:    List of raw fact keys to delete.
-            confirmed:   Pass True for keys in _CONFIRM_BEFORE_DELETE.
+            confirmed:   Pass True for _CONFIRM_BEFORE_DELETE keys (list keys).
 
         Returns:
-            (deleted_count: int, blocked_reasons: List[str])
+            (deleted_count: int,  outcomes: Dict[normalized_key, DeleteOutcome])
+            outcomes contains an entry for every input key — callers can inspect
+            individual outcomes to surface precise messages to the user.
         """
-        blocked_reasons: List[str] = []
+        outcomes: Dict[str, DeleteOutcome] = {}
         allowed_keys: List[str] = []
 
         for rk in raw_keys:
@@ -601,14 +733,19 @@ class SQLiteMemory:
             if ok:
                 allowed_keys.append(key)
             else:
-                blocked_reasons.append(f"{key}: {reason}")
+                outcome = (
+                    DeleteOutcome.NEEDS_CONFIRM
+                    if (key in _CONFIRM_BEFORE_DELETE and not confirmed)
+                    else DeleteOutcome.BLOCKED
+                )
+                outcomes[key] = outcome
                 logger.warning(
-                    "🚫 delete_facts_batch.blocked  sender=%s  key=%s  reason=%s",
-                    whatsapp_id, key, reason,
+                    "🚫 delete_facts_batch.blocked  sender=%s  key=%s  outcome=%s",
+                    whatsapp_id, key, outcome,
                 )
 
         if not allowed_keys:
-            return 0, blocked_reasons
+            return 0, outcomes
 
         async with self._lock:
             def _do() -> int:
@@ -628,7 +765,9 @@ class SQLiteMemory:
                     return n
 
         n = await asyncio.to_thread(_do)
-        return n, blocked_reasons
+        for key in allowed_keys:
+            outcomes[key] = DeleteOutcome.DELETED
+        return n, outcomes
 
     async def cancel_reminder(self, reminder_id: int) -> bool:
         """Mark a reminder as cancelled. Returns True if found."""
@@ -829,15 +968,12 @@ async def delete_fact(
     raw_key: str,
     *,
     confirmed: bool = False,
-) -> tuple[bool, str]:
+) -> "DeleteOutcome":
     """
     P1-FEAT-2 + P1-GUARD: Module-level shorthand for guarded fact deletion.
 
-    Forwards to sqlite_store.delete_fact().
-
-    Returns:
-        (success: bool, reason: str) — callers must check success and surface
-        reason to the user when False (e.g. confirmation required).
+    Forwards to sqlite_store.delete_fact(). Returns a DeleteOutcome enum so
+    callers can branch on the result without string-matching.
     """
     if sqlite_store is None:
         raise RuntimeError("sqlite_store not initialised — call init_stores() first")

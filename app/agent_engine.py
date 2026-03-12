@@ -1249,10 +1249,20 @@ def _build_orchestrator_messages(
     context_str   = _build_context_str(context)
     time_str      = _current_time_str()
     today_str     = _today_str()
+    tz_offset     = _utc_offset_str()
+    time_of_day   = _time_of_day()
 
     system_content = ORCHESTRATOR_PROMPT
 
+    # Inject temporal context as a JSON block so the model can use it
+    # for reminders (trigger_iso), date-relative queries, and time queries.
+    temporal = (
+        f"current_time={time_str!r}  today={today_str!r}  "
+        f"tz_offset={tz_offset!r}  time_of_day={time_of_day!r}"
+    )
+
     user_content_parts = [
+        f"TIME: {temporal}",
         f"FACTS: {facts_str}",
         f"REMINDERS: {reminders_str}",
         f"CONTEXT:\n{context_str}",
@@ -1363,12 +1373,33 @@ async def run_agent(
 
         if orch.action == "answer":
             reply_text = orch.text or "Sorry, I couldn't generate a reply."
-            memory_updates = pre_updates + orch.memory_updates
-            # Verify before saving
-            approved = await _verify_updates(
-                memory_updates, chat_id,
+            # Orchestrator-decided updates are already verified by the orchestrator
+            # itself (it knows the full context and explicitly chose to save them).
+            # Only run the verifier on pre_updates (extracted from user message alone)
+            # where LLM inference may be less reliable.
+            # Orchestrator updates are accepted directly (they pass through normalize_key).
+            orch_approved = [
+                ApprovedUpdate(
+                    key=mu.key,
+                    value=mu.value,
+                    confidence=1.0,
+                    delete=getattr(mu, "delete", False),
+                    confirm=getattr(mu, "confirm", False),
+                )
+                for mu in orch.memory_updates
+            ]
+            # Pre-extracted updates still go through verifier
+            pre_verified = await _verify_updates(
+                pre_updates, chat_id,
                 existing_facts=facts, user_text=user_text, trace=trace,
-            )
+            ) if pre_updates else []
+            approved = pre_verified + orch_approved
+            if trace:
+                trace.tag(
+                    memory_extracted=len(pre_updates) + len(orch.memory_updates),
+                    memory_verified=len(approved),
+                    memory_total=len(approved),
+                )
             # Format
             formatted = await _format_whatsapp(reply_text, chat_id, trace=trace)
             if len(formatted) > len(reply_text) * 2 or not formatted.strip():
