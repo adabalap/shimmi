@@ -1,11 +1,15 @@
 """
-database.py — Shimmi v2.9.2
+database.py — Shimmi Phase 1
 
-Changes vs v2.7.0:
-  ① reminders table + ReminderStore methods
-     - add_reminder(), get_due_reminders(), mark_reminder_sent()
-     - get_user_reminders(), cancel_reminder()
-  ② Dataclass Reminder for typed reminder records
+Changes vs Phase 0 (v2.9.2):
+
+  P1-FEAT-2: Memory deletion
+    • SQLiteMemory.delete_fact(whatsapp_id, key) — hard-deletes a fact row.
+    • upsert_fact() now accepts value="" as a deletion signal, returning "deleted".
+    • Callers in main.py and agent_engine.py check for the "deleted" status and
+      log accordingly; no other plumbing change needed in main.py.
+
+  Everything else is unchanged from Phase 0 (database_p0.py).
 """
 from __future__ import annotations
 
@@ -13,7 +17,7 @@ import asyncio
 import logging
 import re
 import sqlite3
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional
 
@@ -26,7 +30,7 @@ logger = logging.getLogger("app.database")
 UTC    = timezone.utc
 
 # ---------------------------------------------------------------------------
-# Key normalisation
+# Key normalisation (unchanged)
 # ---------------------------------------------------------------------------
 
 _KEY_ALIASES: Dict[str, str] = {
@@ -62,7 +66,7 @@ def normalize_key(raw: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Reminder dataclass
+# Reminder dataclass (unchanged)
 # ---------------------------------------------------------------------------
 
 @dataclass
@@ -71,12 +75,12 @@ class Reminder:
     whatsapp_id:   str
     chat_id:       str
     reminder_text: str
-    trigger_iso:   str          # ISO 8601 with tz offset, e.g. "2026-03-09T06:00+05:30"
+    trigger_iso:   str
     created_at:    str
     sent_at:       Optional[str] = None
     cancelled:     bool          = False
     failed:        bool          = False
-    user_name:     str           = ""  # populated from facts at send time
+    user_name:     str           = ""
 
     @property
     def status(self) -> str:
@@ -106,7 +110,6 @@ class SQLiteMemory:
             conn.execute("PRAGMA foreign_keys=ON")
             conn.execute("PRAGMA busy_timeout=5000")
 
-            # ── user facts KV ──────────────────────────────────────────────
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS user_memory (
                     whatsapp_id  TEXT NOT NULL,
@@ -119,7 +122,6 @@ class SQLiteMemory:
             """)
             self._migrate(conn)
 
-            # ── message log ───────────────────────────────────────────────
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS message_log (
                     id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,10 +139,6 @@ class SQLiteMemory:
                 "ON message_log(chat_id, ts DESC)"
             )
 
-            # ── reminders ─────────────────────────────────────────────────
-            # NOTE: _migrate() may have already rebuilt this table from an older
-            # schema. CREATE TABLE IF NOT EXISTS is a no-op in that case — the
-            # migrated table with the correct schema is already in place.
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS reminders (
                     id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -164,7 +162,6 @@ class SQLiteMemory:
 
     @staticmethod
     def _migrate(conn: sqlite3.Connection) -> None:
-        # ── user_memory migrations ─────────────────────────────────────────
         um_cols = {
             row[1]
             for row in conn.execute("PRAGMA table_info(user_memory)").fetchall()
@@ -176,7 +173,6 @@ class SQLiteMemory:
                 "UPDATE user_memory SET created_at = updated_at WHERE created_at IS NULL"
             )
             conn.commit()
-            logger.info("🗄️  migrate — created_at back-filled ✓")
         if "updated_at" not in um_cols:
             now = datetime.now(UTC).isoformat()
             conn.execute(
@@ -184,7 +180,6 @@ class SQLiteMemory:
             )
             conn.commit()
 
-        # ── FIX-P0-4: delete junk fact values persisted by early bot versions ──
         _JUNK = ("unknown", "none", "null", "n/a", "-", "")
         placeholders = ",".join("?" * len(_JUNK))
         conn.execute(
@@ -196,11 +191,6 @@ class SQLiteMemory:
             conn.commit()
             logger.info("🗄️  migrate — deleted %d junk fact rows (unknown/none/null)", n_junk)
 
-        # ── reminders table migration ──────────────────────────────────────
-        # v2.9.0 canonical schema uses cancelled/failed INTEGER booleans.
-        # Any prior variant (no trigger_iso, status TEXT, user_name TEXT, etc.)
-        # must be rebuilt. We check for the EXACT v2.9.0 columns; anything
-        # missing triggers a rename+rebuild so queries never hit missing columns.
         tables = {
             row[0]
             for row in conn.execute(
@@ -212,8 +202,6 @@ class SQLiteMemory:
                 row[1]
                 for row in conn.execute("PRAGMA table_info(reminders)").fetchall()
             }
-            # v2.9.0 requires cancelled + failed boolean columns.
-            # Any older schema (status TEXT, missing trigger_iso, etc.) is rebuilt.
             required = {"cancelled", "failed", "trigger_iso",
                         "chat_id", "whatsapp_id", "reminder_text", "created_at"}
             if not required.issubset(rem_cols):
@@ -221,11 +209,8 @@ class SQLiteMemory:
                     "🗄️  migrate — reminders schema outdated (missing: %s), rebuilding",
                     ", ".join(sorted(required - rem_cols)),
                 )
-                # Drop any partial index that references missing columns
                 conn.execute("DROP INDEX IF EXISTS idx_reminders_trigger")
-                # Rename old table so we can recreate with new schema
                 conn.execute("ALTER TABLE reminders RENAME TO reminders_old")
-                # Create the new schema (v2.9.0: cancelled/failed booleans)
                 conn.execute("""
                     CREATE TABLE reminders (
                         id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -239,9 +224,6 @@ class SQLiteMemory:
                         failed         INTEGER NOT NULL DEFAULT 0
                     )
                 """)
-                # Copy rows that have the columns we need (best-effort).
-                # If old table has trigger_iso we copy it; otherwise use a
-                # sentinel past-date so the scheduler marks it stale+drops it.
                 if "chat_id" in rem_cols and "reminder_text" in rem_cols:
                     now_iso     = datetime.now(UTC).isoformat()
                     wa_col      = "whatsapp_id" if "whatsapp_id" in rem_cols else "''"
@@ -256,7 +238,6 @@ class SQLiteMemory:
                            FROM reminders_old
                            WHERE reminder_text IS NOT NULL"""
                     )
-                    logger.info("🗄️  migrate — reminders rows copied (marked failed/stale)")
                 conn.execute("DROP TABLE reminders_old")
                 conn.commit()
                 logger.info("🗄️  migrate — reminders table rebuilt ✓")
@@ -275,7 +256,7 @@ class SQLiteMemory:
                     _JUNK = frozenset({"unknown", "none", "null", "n/a", "-", ""})
                     out: Dict[str, str] = {}
                     for raw_key, val in cur.fetchall():
-                        if (val or "").strip().lower() in _JUNK:  # FIX-P0-4
+                        if (val or "").strip().lower() in _JUNK:
                             continue
                         canon = normalize_key(raw_key)
                         if canon and canon not in out:
@@ -284,10 +265,23 @@ class SQLiteMemory:
             return await asyncio.to_thread(_do)
 
     async def upsert_fact(self, whatsapp_id: str, raw_key: str, value: str) -> str:
+        """
+        Insert or update a fact.
+
+        P1-FEAT-2: If value is empty string, delete the fact and return "deleted".
+        Otherwise behaves identically to Phase 0 (returns "created" | "updated" | "unchanged").
+        """
         key   = normalize_key(raw_key)
         value = (value or "").strip()
-        if not key or not value:
+
+        if not key:
             return "unchanged"
+
+        # P1-FEAT-2: empty value = deletion intent
+        if not value:
+            deleted = await self.delete_fact(whatsapp_id, key)
+            return "deleted" if deleted else "unchanged"
+
         async with self._lock:
             def _do():
                 now = datetime.now(UTC).isoformat()
@@ -318,6 +312,29 @@ class SQLiteMemory:
                     return "updated"
             return await asyncio.to_thread(_do)
 
+    async def delete_fact(self, whatsapp_id: str, raw_key: str) -> bool:
+        """
+        P1-FEAT-2: Hard-delete a single fact by key.
+
+        Returns True if a row was deleted, False if the key didn't exist.
+        """
+        key = normalize_key(raw_key)
+        if not key:
+            return False
+        async with self._lock:
+            def _do() -> bool:
+                with sqlite3.connect(self.path) as conn:
+                    cur = conn.execute(
+                        "DELETE FROM user_memory WHERE whatsapp_id=? AND fact_key=?",
+                        (whatsapp_id, key),
+                    )
+                    conn.commit()
+                    return cur.rowcount > 0
+            result = await asyncio.to_thread(_do)
+        if result:
+            logger.info("🗑️  memory.deleted  sender=%s  key=%s", whatsapp_id, key)
+        return result
+
     async def log_message(
         self, *, chat_id, whatsapp_id, direction, text, ts, event_id=None,
     ) -> None:
@@ -338,7 +355,7 @@ class SQLiteMemory:
                         pass
             await asyncio.to_thread(_do)
 
-    # ── reminders API ──────────────────────────────────────────────────────
+    # ── reminders API (unchanged from Phase 0) ─────────────────────────────
 
     async def add_reminder(
         self,
@@ -347,7 +364,6 @@ class SQLiteMemory:
         text:        str,
         trigger_iso: str,
     ) -> int:
-        """Insert a new reminder. Returns its auto-increment id."""
         async with self._lock:
             def _do() -> int:
                 now = datetime.now(UTC).isoformat()
@@ -365,16 +381,15 @@ class SQLiteMemory:
     async def get_user_reminders(
         self, whatsapp_id: str, include_sent: bool = False,
     ) -> List[Reminder]:
-        """Return reminders for a user (pending by default, or all)."""
         async with self._lock:
             def _do() -> List[Reminder]:
                 with sqlite3.connect(self.path) as conn:
                     conn.row_factory = sqlite3.Row
-                    base = (
+                    rows = conn.execute(
                         "SELECT * FROM reminders WHERE whatsapp_id=? "
-                        "ORDER BY trigger_iso ASC"
-                    )
-                    rows = conn.execute(base, (whatsapp_id,)).fetchall()
+                        "ORDER BY trigger_iso ASC",
+                        (whatsapp_id,),
+                    ).fetchall()
                     out = []
                     for row in rows:
                         r = Reminder(
@@ -390,7 +405,6 @@ class SQLiteMemory:
             return await asyncio.to_thread(_do)
 
     async def cancel_reminder(self, reminder_id: int) -> bool:
-        """Mark a reminder as cancelled. Returns True if found."""
         async with self._lock:
             def _do() -> bool:
                 with sqlite3.connect(self.path) as conn:
@@ -403,13 +417,6 @@ class SQLiteMemory:
             return await asyncio.to_thread(_do)
 
     async def get_due_reminders(self) -> List[Reminder]:
-        """Return all unfired, non-cancelled reminders whose trigger time <= now (UTC).
-
-        IMPORTANT: Uses timezone-aware Python comparison, NOT SQL string comparison.
-        SQL string comparison of ISO timestamps with different offsets is incorrect:
-          '2026-03-09T13:00:00+05:30' > '2026-03-09T11:49:00+00:00'  ← string says NOT due
-        but 13:00 IST = 07:30 UTC which IS before 11:49 UTC.
-        """
         async with self._lock:
             def _do() -> List[Reminder]:
                 now_utc = datetime.now(UTC)
@@ -423,13 +430,10 @@ class SQLiteMemory:
                     result = []
                     for row in rows:
                         try:
-                            # Parse ISO with timezone offset (e.g. +05:30)
                             trigger_dt = datetime.fromisoformat(row["trigger_iso"])
                             if trigger_dt.tzinfo is None:
                                 trigger_dt = trigger_dt.replace(tzinfo=UTC)
-                            # Convert to UTC for correct comparison
-                            trigger_utc = trigger_dt.astimezone(UTC)
-                            if trigger_utc <= now_utc:
+                            if trigger_dt.astimezone(UTC) <= now_utc:
                                 result.append(Reminder(
                                     id=row["id"], whatsapp_id=row["whatsapp_id"],
                                     chat_id=row["chat_id"], reminder_text=row["reminder_text"],
@@ -437,7 +441,6 @@ class SQLiteMemory:
                                     sent_at=row["sent_at"],
                                 ))
                         except (ValueError, TypeError):
-                            # Bad trigger_iso — still return it so scheduler can mark failed
                             result.append(Reminder(
                                 id=row["id"], whatsapp_id=row["whatsapp_id"],
                                 chat_id=row["chat_id"], reminder_text=row["reminder_text"],
@@ -470,7 +473,7 @@ class SQLiteMemory:
 
 
 # ---------------------------------------------------------------------------
-# ChromaDB
+# ChromaDB (unchanged from Phase 0)
 # ---------------------------------------------------------------------------
 
 class SentenceTransformerEmbedding:
@@ -505,9 +508,6 @@ class ChromaAmbient:
             metadata={"hnsw:space": "cosine"},
             embedding_function=SentenceTransformerEmbedding(embed_model),
         )
-        # FIX-P0-1: SentenceTransformer's Rust tokenizer is NOT re-entrant.
-        # Concurrent asyncio.to_thread() calls → "RuntimeError: Already borrowed".
-        # This lock serialises all embedding operations (upsert + query + recent).
         self._embed_lock = asyncio.Lock()
         logger.info(
             "📚 chroma.ready  dir=%s  collection=%s",
@@ -519,26 +519,28 @@ class ChromaAmbient:
             return
         doc_id = f"{chat_id}:{message_id}:{direction}"
         meta   = {"chat_id": chat_id, "whatsapp_id": whatsapp_id, "direction": direction, "ts": ts}
-        async with self._embed_lock:  # FIX-P0-1: serialise embed calls
+        async with self._embed_lock:
             await asyncio.to_thread(
                 lambda: self.collection.upsert(ids=[doc_id], documents=[text], metadatas=[meta])
             )
 
     async def search(self, *, chat_id, query, k):
-        async with self._embed_lock:  # FIX-P0-1: serialise embed calls
+        async with self._embed_lock:
             res = await asyncio.to_thread(
-                lambda: self.collection.query(query_texts=[query], n_results=k, where={"chat_id": chat_id})
+                lambda: self.collection.query(
+                    query_texts=[query], n_results=k, where={"chat_id": chat_id}
+                )
             )
         return [
             ContextSnippet(id=_id, text=doc, metadata=meta or {}, distance=dist)
             for _id, doc, meta, dist in zip(
-                res.get("ids",[[]])[0], res.get("documents",[[]])[0],
-                res.get("metadatas",[[]])[0], res.get("distances",[[None]*k])[0],
+                res.get("ids", [[]])[0], res.get("documents", [[]])[0],
+                res.get("metadatas", [[]])[0], res.get("distances", [[None]*k])[0],
             )
         ]
 
     async def recent_window(self, *, chat_id, k):
-        async with self._embed_lock:  # FIX-P0-1: serialise embed calls
+        async with self._embed_lock:
             res = await asyncio.to_thread(
                 lambda: self.collection.get(
                     where={"chat_id": chat_id}, limit=max(50, k * 5),
@@ -561,6 +563,18 @@ class ChromaAmbient:
 
 sqlite_store: Optional[SQLiteMemory] = None
 chroma_store: Optional[ChromaAmbient] = None
+
+# P1-FEAT-2 convenience alias used by agent_engine.py
+async def upsert_fact(whatsapp_id: str, key: str, value: str) -> str:
+    if sqlite_store is None:
+        raise RuntimeError("sqlite_store not initialised")
+    return await sqlite_store.upsert_fact(whatsapp_id, key, value)
+
+
+async def delete_fact(whatsapp_id: str, key: str) -> bool:
+    if sqlite_store is None:
+        raise RuntimeError("sqlite_store not initialised")
+    return await sqlite_store.delete_fact(whatsapp_id, key)
 
 
 def init_stores() -> None:

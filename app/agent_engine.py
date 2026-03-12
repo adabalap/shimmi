@@ -1,55 +1,37 @@
 """
-agent_engine.py — Shimmi v3.0.3
+agent_engine.py — Shimmi Phase 1
 
-Changes vs v3.0.2:
+Changes vs Phase 0 (v3.0.3):
 
-  PROVIDER-1  Google Gemini added as primary orchestrator.
-              Gemini 2.0 Flash free tier: ~1,500 req/day, 1M tokens/min.
-              That is 15× more generous than Groq 70B (100K tokens/day).
-              Provider chain: Gemini → Groq 70B → Groq 8B.
-              Uses OpenAI-compatible endpoint so no extra SDK needed.
+  P1-FEAT-1: Structured tool dispatch
+    • _live_search() removed.  Replaced by tools.ToolDispatcher.dispatch().
+    • Orchestrator prompt now contains tool schemas (injected via
+      tool_schemas_json()) and is instructed to output a `tool_call` JSON
+      object alongside action=search.
+    • OrchestratorResult gains a `tool_call` field (raw dict).
+    • run_agent() calls parse_tool_call() then dispatcher.dispatch() —
+      no more keyword-regex routing.
 
-  PROVIDER-2  Per-provider circuit breakers (separate from model circuit).
-              Gemini circuit opens on quota/429, falls back to Groq 70B.
-              Groq 70B circuit opens on 429, falls back to Groq 8B.
+  P1-FEAT-2: Memory deletion
+    • MemoryUpdate.value min_length relaxed to 0 (empty = delete intent).
+    • delete=True flag added to MemoryUpdate; orchestrator/extractor can emit
+      {"key":"car","value":"","delete":true}.
+    • OrchestratorResult._clean_memory accepts delete entries.
+    • Verifier prompt updated to accept deletion intent.
+    • run_agent() routes delete updates to database.delete_fact().
+    • Prompts updated: ORCHESTRATOR_PROMPT, MEMORY_EXTRACTOR_PROMPT,
+      VERIFIER_PROMPT gain deletion examples.
 
-  PROVIDER-3  Token budget tracker: estimates daily usage per provider,
-              logs warnings at 75%, blocks (routes to fallback) at 92%.
-              Prevents silent exhaustion — first warning message is sent
-              to the user when budget is nearly full.
-
-  FIX-S1      Facts shortcut v2: completely rewritten with broader matching.
-              Previous RECALL_PATTERNS regex missed "coffee order", "hiking
-              trail", "podcast" etc., so ALL simple memory queries burned
-              ~1700 tokens on the 70B model.  New approach: short-message
-              heuristic + broad keyword table covering 30+ fact patterns.
-
-  FIX-S2      Junk fact filtering hardened: facts with value in
-              {unknown,none,null,n/a,''} are stripped BEFORE building the
-              orchestrator prompt.  Previously the filter ran too late in
-              some paths, leaking ~200-400 tokens per call.
-
-  FIX-S3      Fire-and-forget task exception handling: _extract_memory and
-              extract_reply_memory wrapped in top-level try/except catching
-              ALL exceptions (including TimeoutError, CancelledError).
-              "Task exception was never retrieved" errors eliminated.
-
-  FIX-S4      asyncio.get_event_loop() → asyncio.get_running_loop() (broken
-              on Python 3.12+).
-
-  FIX-S5      Retry-after parsing: 429 error messages from Groq and Gemini
-              are parsed for the wait time; circuit cooldown is set to the
-              actual required wait, not a random jitter.
-
-  FIX-S6      Live search 413 (Request Entity Too Large) handling: query is
-              automatically shortened and retried.
-
-  FIX-S7      User-facing error message is populated in AgentResult instead
-              of silently failing.  main.py uses this to always send a reply.
+  P1-FEAT-3: Gemini RPM rate limiter (ISSUE-6)
+    • _GeminiRPMLimiter class — rolling 60-second window counter.
+    • Capped at settings.gemini_rpm_limit (default 12).
+    • _pick_provider_and_model() consults limiter before selecting Gemini.
+    • When limiter is full, Gemini is skipped and Groq 70B is used instead.
 """
 from __future__ import annotations
 
 import asyncio
+import collections
 import json
 import logging
 import random
@@ -57,21 +39,27 @@ import re
 import time
 from contextlib import nullcontext
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Deque, Dict, List, Optional, Tuple
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from pydantic import BaseModel, Field, field_validator
 from groq import AsyncGroq
-from openai import AsyncOpenAI   # used for Gemini OpenAI-compat endpoint
+from openai import AsyncOpenAI
 
 from .config import settings
 from .retry import async_retry
 from .prompts import (
-    ORCHESTRATOR_PROMPT, MEMORY_EXTRACTOR_PROMPT, REPLY_EXTRACTOR_PROMPT,
-    VERIFIER_PROMPT, REPAIR_PROMPT, FORMATTER_PROMPT, LIVE_SEARCH_PROMPT,
+    ORCHESTRATOR_PROMPT_P1,
+    MEMORY_EXTRACTOR_PROMPT_P1,
+    REPLY_EXTRACTOR_PROMPT,
+    VERIFIER_PROMPT_P1,
+    REPAIR_PROMPT,
+    FORMATTER_PROMPT,
+    LIVE_SEARCH_PROMPT,
 )
 from .utils import sanitize_for_whatsapp
 from .database import normalize_key, Reminder
+from .tools import tool_schemas_json, parse_tool_call, dispatcher as tool_dispatcher
 
 logger = logging.getLogger("app.agent")
 UTC    = timezone.utc
@@ -86,13 +74,26 @@ _MIN_FORMAT_LEN      = 120
 # ─────────────────────────────────────────────────────────────────────────────
 
 class MemoryUpdate(BaseModel):
-    key:   str = Field(..., min_length=1)
-    value: str = Field(..., min_length=1)
+    key:    str  = Field(..., min_length=1)
+    value:  str  = Field(default="")          # P1-FEAT-2: empty = delete
+    delete: bool = Field(default=False)       # P1-FEAT-2: explicit delete flag
 
     @field_validator("key", "value", mode="before")
     @classmethod
     def _coerce_str(cls, v):
         return "" if v is None else str(v).strip()
+
+    @field_validator("delete", mode="before")
+    @classmethod
+    def _coerce_bool(cls, v):
+        if isinstance(v, bool):
+            return v
+        return str(v).lower() in ("true", "1", "yes")
+
+    @property
+    def is_delete(self) -> bool:
+        """True if this update should delete the key rather than upsert it."""
+        return self.delete or not self.value
 
 
 class ReminderEntry(BaseModel):
@@ -115,7 +116,7 @@ class AgentResult(BaseModel):
     memory_updates: List[MemoryUpdate]  = Field(default_factory=list)
     reminders:      List[ReminderEntry] = Field(default_factory=list)
     iterations:     int = 1
-    provider_used:  str = ""   # "gemini" | "groq_70b" | "groq_8b"
+    provider_used:  str = ""
 
 
 class OrchestratorResult(BaseModel):
@@ -124,6 +125,7 @@ class OrchestratorResult(BaseModel):
     text:           str              = ""
     query:          str              = ""
     question:       str              = ""
+    tool_call:      Optional[Any]    = None   # P1-FEAT-1: raw dict from LLM
     memory_updates: List[MemoryUpdate]  = Field(default_factory=list)
     reminders:      List[ReminderEntry] = Field(default_factory=list)
 
@@ -136,10 +138,13 @@ class OrchestratorResult(BaseModel):
         for item in v:
             if not isinstance(item, dict):
                 continue
-            k   = str(item.get("key",   "") or "").strip()
-            val = str(item.get("value", "") or "").strip()
-            if k and val:
-                out.append({"key": k, "value": val})
+            k      = str(item.get("key",   "") or "").strip()
+            val    = str(item.get("value", "") or "").strip()
+            delete = item.get("delete", False)
+            if k:
+                # P1-FEAT-2: accept delete entries (value may be "")
+                if val or delete or not val:
+                    out.append({"key": k, "value": val, "delete": delete})
         return out
 
     @field_validator("reminders", mode="before")
@@ -161,6 +166,7 @@ class OrchestratorResult(BaseModel):
 class ApprovedUpdate(BaseModel):
     key:        str
     value:      str
+    delete:     bool  = False            # P1-FEAT-2
     confidence: float = Field(ge=0.0, le=1.0)
 
 
@@ -182,8 +188,9 @@ class ExtractResult(BaseModel):
                 continue
             k   = str(item.get("key",   "") or "").strip()
             val = str(item.get("value", "") or "").strip()
-            if k and val:
-                out.append({"key": k, "value": val})
+            delete = item.get("delete", False)
+            if k:
+                out.append({"key": k, "value": val, "delete": delete})
         return out
 
 
@@ -192,7 +199,7 @@ class FormatterResult(BaseModel):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Timezone helpers
+# Timezone helpers (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _get_local_tz():
@@ -257,31 +264,84 @@ def _fix_reminder_tz(trigger_iso: str) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Multi-provider LLM clients + circuit breakers + token budget
+# P1-FEAT-3: Gemini RPM rate limiter
 # ─────────────────────────────────────────────────────────────────────────────
 
-GROQ_CLIENT: Optional[AsyncGroq] = None
-GEMINI_CLIENT: Optional[AsyncOpenAI] = None   # OpenAI-compat wrapper for Gemini
+class _GeminiRPMLimiter:
+    """
+    Rolling-window RPM limiter for Gemini.
 
-# Per-model circuit breakers: model → monotonic timestamp when circuit reopens
-MODEL_CIRCUIT: Dict[str, float] = {}
+    Tracks request timestamps in a deque.  Before each Gemini call,
+    _pick_provider_and_model() calls .allow() — returns False if the
+    count of requests in the past 60 seconds >= limit.
+    """
 
-# Per-provider-level circuit: "gemini" | "groq_70b" | "groq_8b" → reopen time
+    def __init__(self, limit: int = 12, window_sec: float = 60.0):
+        self._limit      = limit
+        self._window_sec = window_sec
+        self._timestamps: Deque[float] = collections.deque()
+
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    @limit.setter
+    def limit(self, v: int) -> None:
+        self._limit = max(1, v)
+
+    def allow(self) -> bool:
+        """Return True and record the request if under the RPM cap, else False."""
+        now = time.monotonic()
+        # Prune stale entries
+        while self._timestamps and now - self._timestamps[0] > self._window_sec:
+            self._timestamps.popleft()
+        if len(self._timestamps) >= self._limit:
+            return False
+        self._timestamps.append(now)
+        return True
+
+    def current_rpm(self) -> int:
+        """Return the number of Gemini requests in the last 60 s."""
+        now = time.monotonic()
+        while self._timestamps and now - self._timestamps[0] > self._window_sec:
+            self._timestamps.popleft()
+        return len(self._timestamps)
+
+
+# Module-level limiter — limit read from settings at first call (settings may
+# not be fully populated at import time).
+_gemini_rpm_limiter = _GeminiRPMLimiter(limit=12)
+
+
+def _update_gemini_rpm_limit() -> None:
+    """Sync limiter limit from settings (called lazily)."""
+    try:
+        lim = int(settings.gemini_rpm_limit or 12)
+        _gemini_rpm_limiter.limit = lim
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Multi-provider LLM clients + circuit breakers + token budget (mostly unchanged)
+# ─────────────────────────────────────────────────────────────────────────────
+
+GROQ_CLIENT:   Optional[AsyncGroq]    = None
+GEMINI_CLIENT: Optional[AsyncOpenAI]  = None
+
+MODEL_CIRCUIT:    Dict[str, float] = {}
 PROVIDER_CIRCUIT: Dict[str, float] = {}
 
-# Sticky model per chat
 STICKY_MODEL: Dict[str, str] = {}
 _STICKY_MAX = 2_000
 
-# Token budget tracking: provider → (tokens_used_today, reset_ts)
 _TOKEN_BUDGET: Dict[str, Tuple[int, float]] = {}
-_BUDGET_RESET_INTERVAL = 86_400.0  # 24 hours
+_BUDGET_RESET_INTERVAL = 86_400.0
 
 _inflight = asyncio.Semaphore(int(settings.groq_max_inflight or 5))
 
 
 def _budget_add(provider: str, tokens: int) -> int:
-    """Track token usage for a provider. Returns current total for the day."""
     now = time.time()
     used, reset_ts = _TOKEN_BUDGET.get(provider, (0, now + _BUDGET_RESET_INTERVAL))
     if now >= reset_ts:
@@ -293,7 +353,6 @@ def _budget_add(provider: str, tokens: int) -> int:
 
 
 def _budget_fraction(provider: str, daily_limit: int) -> float:
-    """Return fraction of daily budget used (0.0–1.0+)."""
     if daily_limit <= 0:
         return 0.0
     used, reset_ts = _TOKEN_BUDGET.get(provider, (0, 0))
@@ -320,35 +379,19 @@ def _trip_provider(provider: str, cooldown: float) -> None:
 
 
 def _parse_retry_after(exc: Exception) -> float:
-    """
-    FIX-S5: Parse the actual wait time from Groq/Gemini 429 errors.
-
-    Groq format: "Please try again in 1h4m54.368s"
-    Gemini format: may include retry_delay in seconds
-    Returns seconds (minimum 60.0, maximum 7200.0).
-    """
     s = str(exc)
-
-    # Hours + minutes + seconds: e.g. "1h4m54.368s" or "36m12.096s"
     m = re.search(r"(?:(\d+)h\s*)?(?:(\d+)m\s*)?(\d+(?:\.\d+)?)s", s)
     if m:
         h = float(m.group(1) or 0)
         mn = float(m.group(2) or 0)
         sec = float(m.group(3) or 0)
         total = h * 3600 + mn * 60 + sec
-        return max(60.0, min(total + 10.0, 7200.0))  # +10s buffer
-
-    # Gemini: "quota exceeded … retry after N seconds"
+        return max(60.0, min(total + 10.0, 7200.0))
     m2 = re.search(r"retry[^\d]*(\d+)\s*second", s, re.IGNORECASE)
     if m2:
         return max(60.0, float(m2.group(1)) + 10.0)
+    return 300.0
 
-    return 300.0  # conservative default: 5 min
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Provider / model selection
-# ─────────────────────────────────────────────────────────────────────────────
 
 def _is_gemini_model(model: str) -> bool:
     return model.startswith("gemini")
@@ -356,18 +399,13 @@ def _is_gemini_model(model: str) -> bool:
 
 def _pick_provider_and_model(chat_id: str, role: str) -> Tuple[str, str]:
     """
-    Route to the best available provider+model for the given role.
+    Route to the best available provider+model.
 
-    Priority chain for orchestration:
-      1. Gemini 2.0 Flash       (primary — 1.5M tokens/day free)
-      2. Groq llama-3.3-70b     (fallback — 100K/day free)
-      3. Groq llama-3.1-8b      (last resort for orchestration)
-
-    Priority chain for extraction/format/verify:
-      1. Groq llama-3.1-8b      (primary — 500K/day free, very fast)
-      2. Gemini 2.0 Flash Lite  (fallback)
-      3. Groq llama-3.3-70b     (last resort)
+    P1-FEAT-3: Gemini is skipped when the rolling RPM limiter is full
+    (i.e. ≥ gemini_rpm_limit requests in the past 60 seconds).
     """
+    _update_gemini_rpm_limit()
+
     is_orchestrate = (role == "orchestrate")
 
     if is_orchestrate:
@@ -384,16 +422,20 @@ def _pick_provider_and_model(chat_id: str, role: str) -> Tuple[str, str]:
         ]
 
     for provider, model in candidates:
-        # Skip Gemini if no key configured
         if provider == "gemini" and not settings.gemini_enabled:
             continue
-        # Check model-level circuit
         if not _model_open(model):
             continue
-        # Check provider-level circuit
         if not _provider_open(provider):
             continue
-        # Check token budget (only Groq 70B has a meaningful hard limit)
+        # P1-FEAT-3: Gemini RPM guard
+        if provider == "gemini":
+            if not _gemini_rpm_limiter.allow():
+                logger.warning(
+                    "🚦 gemini.rpm_limit  current=%d/min  skipping_gemini",
+                    _gemini_rpm_limiter.current_rpm(),
+                )
+                continue
         if provider == "groq_70b":
             frac = _budget_fraction("groq_70b", settings.groq_70b_daily_limit)
             if frac >= settings.token_budget_block_pct:
@@ -407,7 +449,6 @@ def _pick_provider_and_model(chat_id: str, role: str) -> Tuple[str, str]:
                      role, provider, model)
         return provider, model
 
-    # All options exhausted — return first candidate, will likely fail with 429
     fallback = candidates[0]
     logger.error(
         "🚨 provider.all_exhausted  role=%s  returning_anyway  provider=%s  model=%s",
@@ -417,7 +458,7 @@ def _pick_provider_and_model(chat_id: str, role: str) -> Tuple[str, str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Low-level LLM call
+# Low-level LLM call (unchanged from Phase 0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def _call_llm(
@@ -430,10 +471,6 @@ async def _call_llm(
     chat_id: str,
     label: str,
 ) -> str:
-    """
-    Single attempt to call the LLM.  Handles circuit-tripping and budget tracking.
-    Raises the original exception on failure.
-    """
     t0 = time.monotonic()
 
     async def _attempt():
@@ -476,7 +513,6 @@ async def _call_llm(
                 label, provider, model, elapsed,
             )
 
-        # Track token usage
         usage = getattr(resp, "usage", None)
         if usage:
             total_tokens = getattr(usage, "total_tokens", 0) or 0
@@ -493,7 +529,6 @@ async def _call_llm(
         return resp.choices[0].message.content or ""
 
     except Exception as exc:
-        elapsed = time.monotonic() - t0
         exc_str = str(exc)
         is_rl   = "429" in exc_str or "rate_limit" in exc_str.lower() or "RESOURCE_EXHAUSTED" in exc_str
 
@@ -506,9 +541,9 @@ async def _call_llm(
                 provider, model, label, cooldown, exc_str[:200],
             )
         else:
+            elapsed = time.monotonic() - t0
             logger.error("❌ llm_call.error  label=%s  provider=%s  model=%s  %.1fs  err=%s",
                          label, provider, model, elapsed, exc_str[:200])
-
         raise
 
 
@@ -521,10 +556,6 @@ async def _groq_raw(
     role: str,
     timeout: Optional[float] = None,
 ) -> str:
-    """
-    Route to the best available provider for the given role, with automatic
-    fallback if the primary is circuit-tripped.
-    """
     provider, model = _pick_provider_and_model(chat_id, role)
     effective_timeout = timeout or (
         settings.gemini_timeout if provider == "gemini" else settings.groq_timeout
@@ -537,15 +568,12 @@ async def _groq_raw(
             chat_id=chat_id, label=label,
         )
     except Exception as first_exc:
-        # Try fallback provider if primary failed
         first_exc_str = str(first_exc)
         is_rl = "429" in first_exc_str or "rate_limit" in first_exc_str.lower()
 
-        # Only attempt fallback on rate-limit or timeout errors
         if not (is_rl or isinstance(first_exc, (asyncio.TimeoutError, TimeoutError))):
             raise
 
-        # Get fallback
         fallback_candidates = (
             [("gemini",   settings.gemini_orchestrator_model),
              ("groq_70b", settings.orchestrator_model),
@@ -557,12 +585,15 @@ async def _groq_raw(
         )
         for fb_provider, fb_model in fallback_candidates:
             if fb_provider == provider and fb_model == model:
-                continue  # skip the one that just failed
+                continue
             if fb_provider == "gemini" and not settings.gemini_enabled:
                 continue
             if not _model_open(fb_model):
                 continue
             if not _provider_open(fb_provider):
+                continue
+            # P1-FEAT-3: also check RPM on fallback path
+            if fb_provider == "gemini" and not _gemini_rpm_limiter.allow():
                 continue
             logger.info("🔄 provider.fallback  role=%s  from=%s/%s  to=%s/%s",
                         role, provider, model, fb_provider, fb_model)
@@ -577,11 +608,11 @@ async def _groq_raw(
                 chat_id=chat_id, label=f"{label}_fb",
             )
 
-        raise  # all fallbacks exhausted
+        raise
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Junk-fact filter
+# Junk-fact filter (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 _JUNK_VALUES = frozenset({
@@ -591,10 +622,6 @@ _JUNK_VALUES = frozenset({
 
 
 def _clean_facts(facts: Dict[str, str]) -> Dict[str, str]:
-    """
-    FIX-S2: Strip junk placeholder values before building prompts.
-    Saves ~200-400 tokens per orchestrator call.
-    """
     return {
         k: v for k, v in facts.items()
         if v and str(v).strip().lower() not in _JUNK_VALUES
@@ -602,12 +629,9 @@ def _clean_facts(facts: Dict[str, str]) -> Dict[str, str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Facts shortcut v2 (FIX-S1)
+# Facts shortcut v2 (unchanged from Phase 0)
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Maps DB fact keys → trigger words that appear in the user's question.
-# Deliberately broad — better to shortcut and answer than to burn 70B tokens
-# to echo the database.
 _FACT_SIGNALS: Dict[str, List[str]] = {
     "name":              ["my name", "what's my name", "what is my name", "who am i"],
     "age":               ["my age", "how old am i", "how old"],
@@ -625,8 +649,6 @@ _FACT_SIGNALS: Dict[str, List[str]] = {
     "allergies":         ["my allergies", "my allergy", "allergic to", "what i'm allergic"],
     "dietary_restriction": ["dietary restriction", "what i can't eat", "foods to avoid"],
     "pets":              ["my pets", "my pet", "my dog", "my cat", "pets' names", "my animals"],
-    "pet_max_age":       ["max's age", "how old is max", "max age"],
-    "pet_luna_age":      ["luna's age", "how old is luna", "luna age"],
     "shopping_list":     ["shopping list", "what's on my shopping", "grocery", "groceries"],
     "grocery_list":      ["grocery list", "groceries", "what to buy"],
     "todo_list":         ["todo list", "to do list", "my tasks", "to-do list"],
@@ -636,45 +658,25 @@ _FACT_SIGNALS: Dict[str, List[str]] = {
 
 
 def _try_facts_shortcut(user_text: str, facts: Dict[str, str]) -> Optional[str]:
-    """
-    FIX-S1: Answer simple memory-recall questions directly from the facts
-    dict WITHOUT calling any LLM.  Zero tokens, instant response.
-
-    Strategy:
-      1. Only attempt if the message is short (≤90 chars) — long messages
-         likely contain multiple intents or require reasoning.
-      2. Scan the broad _FACT_SIGNALS table for any signal that appears in
-         the lowercased user text.
-      3. If a matching fact exists in the DB and is not junk, return a
-         ready-made reply string.  Otherwise return None so the LLM handles.
-    """
     if len(user_text) > 90:
         return None
-
     low = user_text.lower()
-
-    # Must look like a question or recall request
     recall_triggers = (
         "what", "which", "who", "where", "tell me", "show me", "remind me",
         "do you know", "do i have", "list", "my ", "am i",
     )
     if not any(t in low for t in recall_triggers):
         return None
-
     clean = _clean_facts(facts)
     if not clean:
         return None
-
     matched_key: Optional[str] = None
     for db_key, signals in _FACT_SIGNALS.items():
         if any(sig in low for sig in signals):
             matched_key = db_key
             break
-
     if not matched_key:
         return None
-
-    # Try exact key and underscore/space variants
     val = (
         clean.get(matched_key)
         or clean.get(matched_key.replace("_", " "))
@@ -682,7 +684,6 @@ def _try_facts_shortcut(user_text: str, facts: Dict[str, str]) -> Optional[str]:
     )
     if not val:
         return None
-
     persona = settings.bot_persona_name or "Shimmi"
     label_map = {
         "name":              "name",
@@ -701,8 +702,6 @@ def _try_facts_shortcut(user_text: str, facts: Dict[str, str]) -> Optional[str]:
         "allergies":         "allergies",
         "dietary_restriction": "dietary restrictions",
         "pets":              "pets",
-        "pet_max_age":       "Max's age",
-        "pet_luna_age":      "Luna's age",
         "shopping_list":     "shopping list",
         "grocery_list":      "grocery list",
         "todo_list":         "to-do list",
@@ -714,121 +713,10 @@ def _try_facts_shortcut(user_text: str, facts: Dict[str, str]) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Live search routing
-# ─────────────────────────────────────────────────────────────────────────────
-
-_WEATHER_KW  = re.compile(r"\b(weather|temperature|forecast|rain|humid|wind|climate)\b", re.I)
-_STOCKS_KW   = re.compile(r"\b(stock|share|nse|bse|sensex|nifty|equity|ticker|paytm|zomato|reliance)\b", re.I)
-_NEWS_KW     = re.compile(r"\b(news|headline|article|latest|update|today.s news|breaking)\b", re.I)
-_CURRENCY_KW = re.compile(r"\b(currency|exchange rate|convert|usd|eur|gbp|inr|forex)\b", re.I)
-_TIMEZONE_KW = re.compile(r"\b(time in|timezone|what time is it in|local time|current time in)\b", re.I)
-
-
-async def _live_search(query: str, chat_id: str, facts: Optional[Dict[str, str]] = None) -> str:
-    """
-    Route live-data requests to MCP first, then fall back to compound-beta-mini.
-    compound-beta-mini uses the Groq web search capability with llama-3.3-70b backend.
-    Tracked separately from the orchestration token budget.
-
-    FIX-P0-2: accepts `facts` so weather/stocks can use the user's known city/country
-    instead of passing the raw LLM query as a city name (which always 404s).
-    """
-    from .live_data import get_weather, get_indian_stocks, get_news
-    from .mcp_client import mcp_currency, mcp_timezone
-
-    q      = query.lower()
-    _facts = facts or {}
-
-    # ── MCP structured endpoints first ────────────────────────────────────
-    try:
-        if _WEATHER_KW.search(q):
-            # FIX-P0-2: use city from facts — NOT the raw query string
-            city    = (_facts.get("city") or _facts.get("user_city") or "").strip()
-            country = (_facts.get("country") or "IN").strip()
-            if not city:
-                # Last resort: strip stop-words from query to get something usable
-                city = re.sub(
-                    r"\b(weather|forecast|temperature|tomorrow|today|rain|humidity|"
-                    r"wind|climate|in|for|the|what|is|it|s|current|week|weekly)\b",
-                    "", query, flags=re.I,
-                ).strip() or "Hyderabad"
-            result = await get_weather(city, country) or ""
-            if result:
-                return result
-    except Exception:
-        pass
-
-    try:
-        if _STOCKS_KW.search(q):
-            return await get_indian_stocks(None) or ""
-    except Exception:
-        pass
-
-    try:
-        if _NEWS_KW.search(q):
-            country = (_facts.get("country") or "IN")[:2].upper()
-            return await get_news(query, country) or ""
-    except Exception:
-        pass
-
-    # currency + timezone: require structured params — skip MCP keyword-match,
-    # fall through to compound-beta-mini which handles freeform queries well
-    # (Phase 1 will replace this with LLM tool dispatch)
-
-    # ── Fallback: compound-beta-mini web search ───────────────────────────
-    if not settings.live_search_enabled:
-        return "Live search is disabled."
-
-    search_model = settings.live_search_model or "compound-beta-mini"
-    if not _model_open(search_model):
-        return "Live search model is temporarily unavailable."
-
-    messages = [
-        {"role": "system", "content": LIVE_SEARCH_PROMPT},
-        {"role": "user",   "content": query},
-    ]
-
-    # compound-beta-mini can return 413 if the query is too long — retry shorter
-    for attempt, q_text in enumerate([query, query[:200], query[:80]], 1):
-        messages[-1]["content"] = q_text
-        try:
-            if GROQ_CLIENT is None:
-                return "LLM not initialised."
-            resp = await asyncio.wait_for(
-                GROQ_CLIENT.chat.completions.create(
-                    model=search_model,
-                    messages=messages,
-                    max_tokens=800,
-                    temperature=0.1,
-                ),
-                timeout=50.0,
-            )
-            text = (resp.choices[0].message.content or "").strip()
-            elapsed = "?"
-            if len(text) < 60 and attempt < 3:
-                continue
-            logger.info("🔍 search.done  query=%r  result_len=%d", q_text, len(text))
-            return text[:_MAX_SEARCH_RESULT] if len(text) > _MAX_SEARCH_RESULT else text
-        except Exception as e:
-            s = str(e)
-            if "413" in s and attempt < 3:
-                logger.warning("⚠️  live_search.413  query=%r — retrying shorter", q_text)
-                continue
-            if "429" in s or "rate_limit" in s.lower():
-                _trip_model(search_model, _parse_retry_after(e))
-                return "Live search quota exhausted. Please try again later."
-            logger.error("❌ live_search.error  %s", s[:200])
-            return f"Search failed: {s[:80]}"
-
-    return "Search returned no result."
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# JSON parse helpers
+# JSON parse helpers (unchanged)
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _strip_md_fences(raw: str) -> str:
-    """Strip ```json ... ``` fences from LLM output."""
     s = raw.strip()
     s = re.sub(r"^```(?:json)?\s*", "", s, flags=re.IGNORECASE)
     s = re.sub(r"\s*```$", "", s)
@@ -840,7 +728,6 @@ def _parse_json(raw: str) -> Any:
     try:
         return json.loads(cleaned)
     except json.JSONDecodeError:
-        # Try extracting a {...} block
         m = re.search(r"\{.*\}", cleaned, re.DOTALL)
         if m:
             return json.loads(m.group())
@@ -853,7 +740,6 @@ async def _parse_with_repair(
     label: str,
     schema_hint: str,
 ) -> Any:
-    """Parse JSON; if malformed, ask the extraction model to repair it."""
     try:
         return _parse_json(raw)
     except Exception:
@@ -893,21 +779,17 @@ async def _extract_memory(
     existing_facts: Dict[str, str],
     trace: Any = None,
 ) -> List[MemoryUpdate]:
-    """Extract memory updates from user message before orchestration."""
     step = trace.step("memory_extract") if trace else nullcontext()
     with step:
         if not user_text or len(user_text) < 4:
             return []
-
-        # Skip if message is clearly not personal
         low = user_text.lower()
-        personal_hints = ("i ", "i'm", "i am", "my ", "me ", "mine", "myself")
+        personal_hints = ("i ", "i'm", "i am", "my ", "me ", "mine", "myself", "forget", "remove", "delete")
         if not any(h in low for h in personal_hints):
             return []
-
         facts_str = ", ".join(f"{k}={v!r}" for k, v in _clean_facts(existing_facts).items())
         messages = [
-            {"role": "system", "content": MEMORY_EXTRACTOR_PROMPT},
+            {"role": "system", "content": MEMORY_EXTRACTOR_PROMPT_P1},
             {"role": "user", "content": (
                 f"Existing facts: {facts_str or 'none'}\n\n"
                 f"User message: {user_text}"
@@ -939,7 +821,6 @@ async def _verify_updates(
     user_text: str,
     trace: Any = None,
 ) -> List[ApprovedUpdate]:
-    """Verify memory updates using the extraction model."""
     step = trace.step("memory_verify") if trace else nullcontext()
     with step:
         if not updates:
@@ -948,12 +829,12 @@ async def _verify_updates(
                           memory_verified=0, memory_total=0)
             return []
 
-        updates_str = json.dumps([u.model_dump() for u in updates])
+        updates_str  = json.dumps([u.model_dump() for u in updates])
         existing_str = ", ".join(
             f"{k}={v!r}" for k, v in _clean_facts(existing_facts).items()
         )
         messages = [
-            {"role": "system", "content": VERIFIER_PROMPT},
+            {"role": "system", "content": VERIFIER_PROMPT_P1},
             {"role": "user", "content": (
                 f"User said: {user_text}\n"
                 f"Existing facts: {existing_str or 'none'}\n"
@@ -995,7 +876,6 @@ async def _format_whatsapp(
     *,
     trace: Any = None,
 ) -> str:
-    """Format the reply for WhatsApp markup using the extraction model."""
     step = trace.step("format") if trace else nullcontext()
     with step:
         if len(text) < _MIN_FORMAT_LEN:
@@ -1027,12 +907,11 @@ async def _orchestrate(
     label: str,
     trace: Any = None,
 ) -> OrchestratorResult:
-    """Run one orchestrator turn using the best available provider."""
     step = trace.step(label) if trace else nullcontext()
     with step:
         raw = await _groq_raw(
             messages,
-            max_tokens=600,
+            max_tokens=700,                # +100 for tool_call field
             chat_id=chat_id,
             label=label,
             role="orchestrate",
@@ -1074,12 +953,11 @@ def _build_reminders_str(reminders: List[Reminder]) -> str:
             if trigger.tzinfo is None:
                 trigger = trigger.replace(tzinfo=UTC)
             diff = trigger.astimezone(UTC) - now.astimezone(UTC)
-            if diff.total_seconds() < 0:
-                when = "overdue"
-            elif diff.total_seconds() < 3600:
-                when = f"in {int(diff.total_seconds()//60)}m"
-            else:
-                when = f"in {int(diff.total_seconds()//3600)}h"
+            when = "overdue" if diff.total_seconds() < 0 else (
+                f"in {int(diff.total_seconds()//60)}m"
+                if diff.total_seconds() < 3600
+                else f"in {int(diff.total_seconds()//3600)}h"
+            )
         except Exception:
             when = "at " + r.trigger_iso
         parts.append(f"• {r.reminder_text} ({when})")
@@ -1105,14 +983,13 @@ def _build_orchestrator_messages(
     reminders: List[Reminder],
     search_result: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
-    """Build the message list for the orchestrator (first or second turn)."""
+    """Build orchestrator message list.
+
+    P1-FEAT-1: Uses ORCHESTRATOR_PROMPT_P1 which includes tool schemas.
+    """
     facts_str     = _build_facts_str(facts)
     reminders_str = _build_reminders_str(reminders)
     context_str   = _build_context_str(context)
-    time_str      = _current_time_str()
-    today_str     = _today_str()
-
-    system_content = ORCHESTRATOR_PROMPT
 
     user_content_parts = [
         f"FACTS: {facts_str}",
@@ -1124,7 +1001,7 @@ def _build_orchestrator_messages(
     user_content_parts.append(f"USER: {user_text}")
 
     return [
-        {"role": "system", "content": system_content},
+        {"role": "system", "content": ORCHESTRATOR_PROMPT_P1},
         {"role": "user",   "content": "\n\n".join(user_content_parts)},
     ]
 
@@ -1143,13 +1020,17 @@ async def run_agent(
     trace: Any = None,
 ) -> AgentResult:
     """
-    Full agentic pipeline. Steps:
-      1. Facts shortcut — answer simple memory queries instantly (0 tokens)
-      2. Pre-extract memory updates from user message (8B / Gemini Lite)
-      3. Orchestrate (Gemini Flash primary → Groq 70B fallback)
-         - If action=search: call _live_search(), then re-orchestrate
-      4. Verify memory updates (8B / Gemini Lite)
-      5. Format reply for WhatsApp (8B / Gemini Lite)
+    Full agentic pipeline (Phase 1).
+
+    Steps:
+      1. Facts shortcut — zero-token fast path for simple recall
+      2. Pre-extract memory from user message (8B / Gemini Lite)
+      3. Orchestrate (Gemini Flash → Groq 70B):
+           - action=search: parse tool_call → ToolDispatcher.dispatch() → re-orchestrate
+           - action=answer: proceed to verify + format
+      4. Verify memory updates (8B)
+      5. Format reply for WhatsApp (8B)
+      6. Route deletes vs upserts in memory_updates
     """
     # ── 1. Zero-token facts shortcut ──────────────────────────────────────
     shortcut = _try_facts_shortcut(user_text, facts)
@@ -1167,7 +1048,7 @@ async def run_agent(
             user_text, chat_id, existing_facts=facts, trace=trace,
         )
     except Exception:
-        pass   # non-fatal
+        pass
 
     # ── 3. Orchestrate ────────────────────────────────────────────────────
     messages = _build_orchestrator_messages(user_text, facts, context, reminders)
@@ -1186,20 +1067,23 @@ async def run_agent(
         if orch.action == "answer":
             reply_text = orch.text or "Sorry, I couldn't generate a reply."
             memory_updates = pre_updates + orch.memory_updates
+
             # Verify before saving
             approved = await _verify_updates(
                 memory_updates, chat_id,
                 existing_facts=facts, user_text=user_text, trace=trace,
             )
+
             # Format
             formatted = await _format_whatsapp(reply_text, chat_id, trace=trace)
             if len(formatted) > len(reply_text) * 2 or not formatted.strip():
-                formatted = reply_text  # sanity guard
+                formatted = reply_text
 
             return AgentResult(
                 reply=ReplyPayload(type="text", text=formatted),
                 memory_updates=[
-                    MemoryUpdate(key=a.key, value=a.value) for a in approved
+                    MemoryUpdate(key=a.key, value=a.value, delete=a.delete)
+                    for a in approved
                 ],
                 reminders=orch.reminders,
                 iterations=iteration,
@@ -1207,7 +1091,6 @@ async def run_agent(
 
         elif orch.action == "search":
             if not settings.live_search_enabled:
-                # Convert to answer with a note
                 return AgentResult(
                     reply=ReplyPayload(
                         type="text",
@@ -1215,17 +1098,31 @@ async def run_agent(
                     ),
                     iterations=iteration,
                 )
+
+            # P1-FEAT-1: parse LLM tool_call → typed ToolCall → dispatch
             query = orch.query or user_text
-            search_result = await _live_search(query, chat_id, facts=facts)
-            logger.info("🔍 search.done  iter=%d  query=%r  result_len=%d",
-                        iteration, query, len(search_result or ""))
+            tc = parse_tool_call(
+                orch.tool_call,
+                fallback_query=query,
+                facts=facts,
+            )
+            logger.info(
+                "🔧 tool.selected  tool=%s  chat=%s",
+                getattr(tc, "tool", "?"), chat_id,
+            )
+            search_result = await tool_dispatcher.dispatch(
+                tc,
+                groq_client=GROQ_CLIENT,
+                live_search_model=settings.live_search_model or "compound-beta-mini",
+                live_search_enabled=settings.live_search_enabled,
+            )
+            logger.info("🔍 search.done  iter=%d  tool=%s  result_len=%d",
+                        iteration, getattr(tc, "tool", "?"), len(search_result or ""))
             if trace:
-                trace.tag(
-                    **{f"live_search_{iteration}": {
-                        "search_query": query,
-                        "result_len": len(search_result or ""),
-                    }}
-                )
+                trace.tag(**{f"live_search_{iteration}": {
+                    "tool":       getattr(tc, "tool", "?"),
+                    "result_len": len(search_result or ""),
+                }})
 
         elif orch.action == "ask":
             question = orch.question or orch.text or "Could you clarify that?"
@@ -1241,7 +1138,6 @@ async def run_agent(
                 iterations=iteration,
             )
 
-    # Max iterations reached — return last search result or generic fallback
     fallback = f"Here's what I found:\n\n{search_result}" if search_result else \
                "I reached my reasoning limit. Please try rephrasing."
     return AgentResult(
@@ -1251,7 +1147,7 @@ async def run_agent(
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Fire-and-forget reply memory extraction (FIX-S3)
+# Fire-and-forget reply memory extraction (unchanged from Phase 0)
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def extract_reply_memory(
@@ -1260,17 +1156,9 @@ async def extract_reply_memory(
     chat_id: str,
     sender_key: str,
 ) -> None:
-    """
-    FIX-S3: Extract facts that appear in Shimmi's own reply text (e.g. when
-    the bot confirms a fact it looked up).  Run as fire-and-forget.
-
-    Wrapped in top-level try/except so 'Task exception was never retrieved'
-    errors never appear in logs.
-    """
     try:
         if not reply_text or len(reply_text) < 20:
             return
-
         messages = [
             {"role": "system", "content": REPLY_EXTRACTOR_PROMPT},
             {"role": "user",   "content": reply_text},
@@ -1292,32 +1180,22 @@ async def extract_reply_memory(
                 len(result.memory_updates),
                 [u.key for u in result.memory_updates],
             )
-            # Import here to avoid circular dependency
             from .database import upsert_fact
             for u in result.memory_updates:
                 try:
                     await upsert_fact(sender_key, normalize_key(u.key), u.value)
-                    logger.info(
-                        "🧠 reply_memory.updated  sender=%s  key=%s  value=%r",
-                        sender_key, u.key, u.value,
-                    )
                 except Exception as db_err:
                     logger.warning("⚠️  reply_memory.db_fail  key=%s  err=%s",
                                    u.key, str(db_err)[:80])
     except Exception as e:
-        # Completely suppress — this is a best-effort enrichment task
         logger.debug("ℹ️  reply_extract.suppressed  err=%s", str(e)[:80])
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Initialization
+# Initialisation
 # ─────────────────────────────────────────────────────────────────────────────
 
 async def init_llm() -> None:
-    """
-    Initialise Groq and (optionally) Gemini clients.
-    Called once at application startup.
-    """
     global GROQ_CLIENT, GEMINI_CLIENT
 
     if not settings.groq_api_key:
@@ -1331,36 +1209,19 @@ async def init_llm() -> None:
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         )
         logger.info(
-            "🧠 llm.init — Groq + Gemini ready  "
-            "groq_pool=%s  gemini_pool=%s  "
+            "🧠 llm.init — Groq + Gemini ready  gemini_rpm_limit=%d  "
             "orchestrator=Gemini(%s) → Groq(%s)  extraction=Groq(%s)",
-            settings.groq_model_pool,
-            settings.gemini_model_pool,
+            _gemini_rpm_limiter.limit,
             settings.gemini_orchestrator_model,
             settings.orchestrator_model,
             settings.extraction_model,
         )
     else:
         logger.info(
-            "🧠 llm.init — Groq only (no GEMINI_API_KEY)  "
-            "model_pool=%s  orchestrator=%s  extraction=%s",
-            settings.groq_model_pool,
+            "🧠 llm.init — Groq only  orchestrator=%s  extraction=%s",
             settings.orchestrator_model,
             settings.extraction_model,
         )
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Compatibility / helper exports used by main.py
-# ─────────────────────────────────────────────────────────────────────────────
-
-VALID_GROQ_PREFIXES = (
-    "llama-", "mixtral-", "gemma-",
-    "compound-beta", "compound-beta-mini",
-    "whisper-", "distil-",
-)
-
-VALID_GEMINI_PREFIXES = ("gemini-",)
 
 
 async def close_llm() -> None:
@@ -1373,6 +1234,19 @@ async def close_llm() -> None:
                 pass
     GROQ_CLIENT   = None
     GEMINI_CLIENT = None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Compatibility exports used by main.py
+# ─────────────────────────────────────────────────────────────────────────────
+
+VALID_GROQ_PREFIXES = (
+    "llama-", "mixtral-", "gemma-",
+    "compound-beta", "compound-beta-mini",
+    "whisper-", "distil-",
+)
+
+VALID_GEMINI_PREFIXES = ("gemini-",)
 
 
 def _is_reminder_duplicate(
