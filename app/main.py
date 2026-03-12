@@ -31,6 +31,7 @@ from .utils import (
     compile_prefix_re, chat_is_allowed, canonical_user_key,
 )
 import app.database as database
+from .database import DeleteOutcome
 from .waha_provider import (
     init_waha, close_waha, send_text, typing_keepalive,
     OUTBOUND_CACHE_IDS, OUTBOUND_CACHE_TXT, OUTBOUND_TTL_SEC, outbound_hash,
@@ -446,6 +447,26 @@ async def process_message(
                 reply_with_sig = append_signature(result.reply.text, chat_id)
                 trace.tag(final_len=len(reply_with_sig))
 
+            # ── 5b. reply-extract (ambient memory) ──────────────────────────
+            # Awaited here — before memory_save — so facts found in the bot's
+            # own reply text land in the DB in the same turn they were said.
+            # Only runs when the reply is a statement (not a question/ask_user).
+            _re_action = getattr(result.reply, "action", None) or                          getattr(result.reply, "intent", None) or                          getattr(result.reply, "type", None)
+            _re_text = getattr(result.reply, "text", None) or ""
+            _reply_is_question = (
+                (isinstance(_re_action, str) and _re_action == "ask_user")
+                or (len(_re_text) < 120 and _re_text.rstrip().endswith("?"))
+            )
+            if not _reply_is_question and _re_text:
+                with trace.step("reply_extract"):
+                    await _reply_extract_and_save_bg(
+                        chat_id=chat_id,
+                        sender_key=sender_key,
+                        user_text=user_text,
+                        bot_reply=_re_text,
+                        known_facts=facts,
+                    )
+
             # ── 6. persist memory + reminders ──────────────────────────────
             with trace.step("memory_save"):
                 saved = created = updated = 0
@@ -461,42 +482,49 @@ async def process_message(
                             if getattr(mu, "delete", False):
                                 # P1-FEAT-2 + P1-GUARD: guarded deletion
                                 confirmed = getattr(mu, "confirm", False)
-                                success, reason = await database.sqlite_store.delete_fact(
+                                outcome = await database.sqlite_store.delete_fact(
                                     sender_key, mu.key, confirmed=confirmed,
                                 )
-                                if success:
+                                # ── Branch on structured DeleteOutcome enum ──────
+                                if outcome == DeleteOutcome.DELETED:
                                     logger.info(
                                         "🗑️  memory.deleted  sender=%s  key=%s  confirmed=%s",
                                         sender_key, mu.key, confirmed,
                                     )
                                     saved += 1
-                                elif reason.startswith("deleting") and "confirmation" in reason:
-                                    # High-stakes key — queue a confirmation request
+
+                                elif outcome == DeleteOutcome.NEEDS_CONFIRM:
+                                    # High-stakes list key (shopping_list / grocery_list /
+                                    # todo_list) — queue confirmation and rewrite reply.
                                     current_val = facts.get(mu.key, "")
                                     from .agent_engine import _register_pending_delete
                                     _register_pending_delete(sender_key, mu.key, current_val)
-                                    # Replace the reply text with a confirmation prompt.
-                                    # We rewrite result.reply so the confirmation question
-                                    # reaches the user instead of the original reply.
                                     key_label = mu.key.replace("_", " ")
                                     confirm_text = (
                                         f"⚠️ Are you sure you want to clear your "
                                         f"*{key_label}*? Reply *yes* to confirm or "
                                         f"*no* to keep it."
                                     )
-                                    # Mutate via object.__setattr__ since ReplyPayload is a pydantic model
+                                    # ReplyPayload is frozen Pydantic — use object.__setattr__
                                     object.__setattr__(result.reply, "text", confirm_text)
                                     logger.info(
-                                        "⏳ memory.delete_pending  sender=%s  key=%s  "
-                                        "reason=%s",
-                                        sender_key, mu.key, reason,
+                                        "⏳ memory.delete_needs_confirm  sender=%s  key=%s",
+                                        sender_key, mu.key,
                                     )
-                                else:
+
+                                elif outcome == DeleteOutcome.NOT_FOUND:
+                                    # Key not in DB — no-op, not an error.
+                                    logger.debug(
+                                        "🗑️  memory.delete_noop  sender=%s  key=%s  (not in DB)",
+                                        sender_key, mu.key,
+                                    )
+
+                                elif outcome in (DeleteOutcome.BLOCKED, DeleteOutcome.EMPTY_KEY):
                                     logger.warning(
-                                        "🚫 memory.delete_blocked  sender=%s  key=%s  reason=%s",
-                                        sender_key, mu.key, reason,
+                                        "🚫 memory.delete_blocked  sender=%s  key=%s  outcome=%s",
+                                        sender_key, mu.key, outcome,
                                     )
-                                    save_errors.append(f"{mu.key}: blocked — {reason}")
+                                    save_errors.append(f"{mu.key}: {outcome}")
                             else:
                                 status = await database.sqlite_store.upsert_fact(
                                     sender_key, mu.key, mu.value,
@@ -559,30 +587,13 @@ async def process_message(
                     len(reply_with_sig),
                 )
 
-            # ── 8. store outgoing + post-reply memory (fire-and-forget) ────
+            # ── 8. store outgoing message (fire-and-forget) ────────────────
             ts_out = datetime.now(UTC).isoformat()
             out_id = msg_id or f"out-{event_id}" or f"out-{int(time.time()*1000)}"
             asyncio.create_task(
                 _store_out_bg(chat_id=chat_id, text=result.reply.text, ts=ts_out, out_id=out_id)
             )
-            reply_action = getattr(result.reply, "action", None)
-            if reply_action is None:
-                reply_action = getattr(result.reply, "intent", None) or getattr(result.reply, "type", None)
-            reply_text = (getattr(result.reply, "text", None) or "")
-            _reply_is_question = (
-                (isinstance(reply_action, str) and reply_action == "ask_user")
-                or (len(reply_text) < 120 and reply_text.rstrip().endswith("?"))
-            )
-            if not _reply_is_question:
-                asyncio.create_task(
-                    _reply_extract_and_save_bg(
-                        chat_id=chat_id,
-                        sender_key=sender_key,
-                        user_text=user_text,
-                        bot_reply=result.reply.text,
-                        known_facts=facts,
-                    )
-                )
+            # Note: reply_extract now runs in step 5b (awaited before memory_save).
 
         finally:
             stop_evt.set()
