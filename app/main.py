@@ -406,6 +406,7 @@ async def process_message(
                 try:
                     result = await run_agent(
                         chat_id=chat_id,
+                        sender_key=sender_key,   # P1-GUARD: authenticated, never from LLM
                         user_text=user_text,
                         facts=facts,
                         context=context_items,
@@ -451,24 +452,68 @@ async def process_message(
                 save_errors: List[str] = []
 
                 if database.sqlite_store:
+                    # P1-GUARD: sender_key is derived from the WAHA webhook payload,
+                    # never from LLM output. Explicitly verify it is not empty.
+                    assert sender_key, "sender_key must be set before writing to DB"
+
                     for mu in result.memory_updates:
                         try:
-                            status = await database.sqlite_store.upsert_fact(
-                                sender_key, mu.key, mu.value,
-                            )
-                            if status == "created":
-                                created += 1
-                                logger.info(
-                                    "🧠 memory.new      sender=%s  key=%s  value=%r",
+                            if getattr(mu, "delete", False):
+                                # P1-FEAT-2 + P1-GUARD: guarded deletion
+                                confirmed = getattr(mu, "confirm", False)
+                                success, reason = await database.sqlite_store.delete_fact(
+                                    sender_key, mu.key, confirmed=confirmed,
+                                )
+                                if success:
+                                    logger.info(
+                                        "🗑️  memory.deleted  sender=%s  key=%s  confirmed=%s",
+                                        sender_key, mu.key, confirmed,
+                                    )
+                                    saved += 1
+                                elif reason.startswith("deleting") and "confirmation" in reason:
+                                    # High-stakes key — queue a confirmation request
+                                    current_val = facts.get(mu.key, "")
+                                    from .agent_engine import _register_pending_delete
+                                    _register_pending_delete(sender_key, mu.key, current_val)
+                                    # Replace the reply text with a confirmation prompt.
+                                    # We rewrite result.reply so the confirmation question
+                                    # reaches the user instead of the original reply.
+                                    key_label = mu.key.replace("_", " ")
+                                    confirm_text = (
+                                        f"⚠️ Are you sure you want to clear your "
+                                        f"*{key_label}*? Reply *yes* to confirm or "
+                                        f"*no* to keep it."
+                                    )
+                                    # Mutate via object.__setattr__ since ReplyPayload is a pydantic model
+                                    object.__setattr__(result.reply, "text", confirm_text)
+                                    logger.info(
+                                        "⏳ memory.delete_pending  sender=%s  key=%s  "
+                                        "reason=%s",
+                                        sender_key, mu.key, reason,
+                                    )
+                                else:
+                                    logger.warning(
+                                        "🚫 memory.delete_blocked  sender=%s  key=%s  reason=%s",
+                                        sender_key, mu.key, reason,
+                                    )
+                                    save_errors.append(f"{mu.key}: blocked — {reason}")
+                            else:
+                                status = await database.sqlite_store.upsert_fact(
                                     sender_key, mu.key, mu.value,
                                 )
-                            elif status == "updated":
-                                updated += 1
-                                logger.info(
-                                    "🧠 memory.updated  sender=%s  key=%s  value=%r",
-                                    sender_key, mu.key, mu.value,
-                                )
-                            saved += 1
+                                if status == "created":
+                                    created += 1
+                                    logger.info(
+                                        "🧠 memory.new      sender=%s  key=%s  value=%r",
+                                        sender_key, mu.key, mu.value,
+                                    )
+                                elif status == "updated":
+                                    updated += 1
+                                    logger.info(
+                                        "🧠 memory.updated  sender=%s  key=%s  value=%r",
+                                        sender_key, mu.key, mu.value,
+                                    )
+                                saved += 1
                         except Exception as exc:
                             err_msg = f"{type(exc).__name__}: {exc}"
                             save_errors.append(f"{mu.key}: {err_msg}")

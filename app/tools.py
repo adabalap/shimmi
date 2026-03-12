@@ -1,27 +1,32 @@
 """
 tools.py — Shimmi Phase 1
 
-P1-FEAT-1: Structured LLM tool dispatch.
+Replaces the brittle keyword-regex tool routing in agent_engine.py._live_search()
+with a proper LLM-decided, Pydantic-validated tool dispatch system.
 
-Replaces the brittle keyword-regex routing in _live_search() with structured,
-LLM-decided tool invocation.  The orchestrator now outputs a `tool_call` JSON
-object alongside `action=search`, and ToolDispatcher routes it to the correct
-live-data function with properly-typed parameters — no more passing a raw query
-string as a city name.
+Why this matters (from the analysis report, ISSUE-5):
+  - _live_search() passed raw LLM query strings as city/symbol/currency args
+  - ALL MCP structured calls were silently failing and falling through to
+    compound-beta-mini every single time
+  - Phase 1 fix: LLM embeds a tool_call JSON block in its orchestrator output;
+    ToolDispatcher validates + routes it with correct arguments.
 
-Module layout:
-  • Tool schema models (Pydantic)  — one per tool
-  • ToolCall discriminated union
-  • tool_schemas_json()            — serialises schemas for prompt injection
-  • ToolDispatcher.dispatch()      — async, calls the right live-data fn
-  • parse_tool_call()              — parses LLM JSON into a ToolCall model
+Architecture:
+  OrchestratorResult.tool_call (new field)
+      ↓
+  ToolDispatcher.dispatch(tool_call, facts)
+      ├── WeatherTool   → live_data.get_weather(city, country)
+      ├── NewsTool      → live_data.get_news(query, country)
+      ├── StocksTool    → live_data.get_indian_stocks(symbols)
+      ├── CurrencyTool  → mcp_client.mcp_currency(from, to, amount)
+      ├── TimezoneTool  → mcp_client.mcp_timezone(city)
+      └── WebSearchTool → GROQ compound-beta-mini (fallback for open-ended queries)
 """
 from __future__ import annotations
 
-import json
 import logging
 import re
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Annotated, Any, Dict, List, Literal, Optional, Union
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -29,227 +34,98 @@ logger = logging.getLogger("app.tools")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Tool schema models
+# Tool schemas — one Pydantic model per tool
 # ─────────────────────────────────────────────────────────────────────────────
 
 class WeatherTool(BaseModel):
-    """Fetch current weather and short forecast for a city."""
-    tool:    Literal["weather"]
-    city:    str   = Field(..., description="City name, e.g. 'Hyderabad'")
-    country: str   = Field("IN", description="ISO-3166-1 alpha-2 country code")
-    days:    int   = Field(3, ge=1, le=7, description="Forecast days (1–7)")
+    tool: Literal["weather"]
+    city: str = Field(..., min_length=1, description="City name to fetch weather for")
+    country: str = Field("IN", description="ISO-2 country code, default IN")
+    days: int = Field(3, ge=1, le=7, description="Forecast days")
 
-    @field_validator("city", mode="before")
+    @field_validator("city", "country", mode="before")
     @classmethod
-    def _clean_city(cls, v):
-        return (v or "").strip()
+    def _strip(cls, v: Any) -> str:
+        return str(v or "").strip()
 
-    @field_validator("country", mode="before")
+    @field_validator("country", mode="after")
     @classmethod
-    def _clean_country(cls, v):
-        return (str(v or "IN").strip().upper() or "IN")[:2]
+    def _upper(cls, v: str) -> str:
+        return v.upper()[:2] if v else "IN"
 
 
 class NewsTool(BaseModel):
-    """Fetch latest news headlines matching a query."""
-    tool:    Literal["news"]
-    query:   str  = Field(..., description="Search topic, e.g. 'India cricket'")
-    country: str  = Field("IN", description="ISO-3166-1 alpha-2 country code")
+    tool: Literal["news"]
+    query: str = Field(..., min_length=1, description="Search query for news")
+    country: str = Field("IN", description="ISO-2 country code for news locale")
 
-    @field_validator("query", mode="before")
+    @field_validator("query", "country", mode="before")
     @classmethod
-    def _clean_query(cls, v):
-        return (v or "").strip()
+    def _strip(cls, v: Any) -> str:
+        return str(v or "").strip()
 
-    @field_validator("country", mode="before")
+    @field_validator("country", mode="after")
     @classmethod
-    def _clean_country(cls, v):
-        return (str(v or "IN").strip().upper() or "IN")[:2]
+    def _upper(cls, v: str) -> str:
+        return (v.upper()[:2] if v else "IN")
 
 
 class StocksTool(BaseModel):
-    """Fetch Indian stock / index prices from NSE/BSE."""
-    tool:    Literal["stocks"]
+    tool: Literal["stocks"]
     symbols: List[str] = Field(
         default_factory=list,
-        description="Ticker symbols, e.g. ['RELIANCE', 'NIFTY50']. "
-                    "Empty list fetches broad market summary.",
+        description="List of NSE/BSE ticker symbols. Empty = top Nifty indices."
     )
 
     @field_validator("symbols", mode="before")
     @classmethod
-    def _clean_symbols(cls, v):
-        if not isinstance(v, list):
-            return []
-        return [str(s).strip().upper() for s in v if s]
+    def _coerce(cls, v: Any) -> List[str]:
+        if isinstance(v, str):
+            # Accept comma-separated string from LLM
+            return [s.strip().upper() for s in v.split(",") if s.strip()]
+        if isinstance(v, list):
+            return [str(s).strip().upper() for s in v if str(s).strip()]
+        return []
 
 
 class CurrencyTool(BaseModel):
-    """Convert an amount between two currencies."""
-    tool:          Literal["currency"]
-    from_currency: str   = Field(..., description="Source currency code, e.g. 'USD'")
-    to_currency:   str   = Field(..., description="Target currency code, e.g. 'INR'")
-    amount:        float = Field(1.0, ge=0, description="Amount to convert")
+    tool: Literal["currency"]
+    from_currency: str = Field(..., min_length=1, description="Source ISO currency code, e.g. USD")
+    to_currency: str = Field(..., min_length=1, description="Target ISO currency code, e.g. INR")
+    amount: float = Field(1.0, ge=0.0, description="Amount to convert")
 
     @field_validator("from_currency", "to_currency", mode="before")
     @classmethod
-    def _clean_cur(cls, v):
-        return (str(v or "").strip().upper() or "USD")[:3]
+    def _upper(cls, v: Any) -> str:
+        return str(v or "").strip().upper()
+
+
+class TimezoneTool(BaseModel):
+    tool: Literal["timezone"]
+    city: str = Field(..., min_length=1, description="City to get current local time for")
+
+    @field_validator("city", mode="before")
+    @classmethod
+    def _strip(cls, v: Any) -> str:
+        return str(v or "").strip()
 
 
 class WebSearchTool(BaseModel):
-    """General-purpose web search via compound-beta-mini.
-
-    Use only when no structured tool (weather/stocks/news/currency) applies.
-    """
-    tool:  Literal["web_search"]
-    query: str = Field(..., description="Freeform search query")
+    """Fallback: open-ended query routed to compound-beta-mini web search."""
+    tool: Literal["web_search"]
+    query: str = Field(..., min_length=1)
 
     @field_validator("query", mode="before")
     @classmethod
-    def _clean_query(cls, v):
-        return (v or "").strip()
+    def _strip(cls, v: Any) -> str:
+        return str(v or "").strip()
 
 
-# Discriminated union — Pydantic uses the `tool` field to pick the model.
-ToolCall = Union[WeatherTool, NewsTool, StocksTool, CurrencyTool, WebSearchTool]
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Prompt helper — embed tool schemas in the orchestrator system prompt
-# ─────────────────────────────────────────────────────────────────────────────
-
-_TOOL_DESCRIPTIONS: List[Dict[str, Any]] = [
-    {
-        "name":        "weather",
-        "description": "Current weather + short forecast for a city.",
-        "parameters":  {
-            "city":    "string — city name (use facts.city when available)",
-            "country": "string — ISO alpha-2, default 'IN'",
-            "days":    "integer 1–7, default 3",
-        },
-    },
-    {
-        "name":        "news",
-        "description": "Latest news headlines on a topic.",
-        "parameters":  {
-            "query":   "string — topic / keywords",
-            "country": "string — ISO alpha-2, default 'IN'",
-        },
-    },
-    {
-        "name":        "stocks",
-        "description": "Indian stock / index prices (NSE/BSE).",
-        "parameters":  {
-            "symbols": "list[string] — ticker list, empty = broad summary",
-        },
-    },
-    {
-        "name":        "currency",
-        "description": "Currency conversion between two codes.",
-        "parameters":  {
-            "from_currency": "string — 3-letter code, e.g. 'USD'",
-            "to_currency":   "string — 3-letter code, e.g. 'INR'",
-            "amount":        "number, default 1.0",
-        },
-    },
-    {
-        "name":        "web_search",
-        "description": "General web search. Use ONLY when no structured tool applies.",
-        "parameters":  {
-            "query": "string — freeform search query",
-        },
-    },
+# Union type — used as the type annotation for OrchestratorResult.tool_call
+ToolCall = Annotated[
+    Union[WeatherTool, NewsTool, StocksTool, CurrencyTool, TimezoneTool, WebSearchTool],
+    Field(discriminator="tool"),
 ]
-
-
-def tool_schemas_json() -> str:
-    """Return a compact JSON string of tool descriptions for prompt injection."""
-    return json.dumps(_TOOL_DESCRIPTIONS, ensure_ascii=False, separators=(",", ":"))
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Parse LLM output → ToolCall
-# ─────────────────────────────────────────────────────────────────────────────
-
-def parse_tool_call(
-    raw: Any,
-    *,
-    fallback_query: str = "",
-    facts: Optional[Dict[str, str]] = None,
-) -> ToolCall:
-    """
-    Parse the LLM's `tool_call` field into a typed ToolCall model.
-
-    The LLM output may be:
-      • a dict already (parsed from JSON): {"tool": "weather", "city": "Hyderabad"}
-      • a JSON string
-      • None / missing (use fallback heuristics)
-
-    Falls back to WebSearchTool(query=fallback_query) on any parse failure.
-    """
-    _facts = facts or {}
-
-    # 1. Normalise to dict
-    if raw is None:
-        return _fallback_tool(fallback_query, _facts)
-
-    if isinstance(raw, str):
-        raw = raw.strip()
-        # Strip ```json fences
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.IGNORECASE)
-        raw = re.sub(r"\s*```$", "", raw)
-        try:
-            raw = json.loads(raw)
-        except Exception:
-            logger.warning("⚠️  tool_call.json_parse_failed  raw=%r", raw[:120])
-            return _fallback_tool(fallback_query, _facts)
-
-    if not isinstance(raw, dict):
-        return _fallback_tool(fallback_query, _facts)
-
-    tool_name = (raw.get("tool") or "").strip().lower()
-    if not tool_name:
-        return _fallback_tool(fallback_query, _facts)
-
-    # 2. Fill in city from facts when LLM omits it for weather
-    if tool_name == "weather" and not raw.get("city"):
-        city = (
-            _facts.get("city")
-            or _facts.get("user_city")
-            or ""
-        ).strip()
-        if city:
-            raw = {**raw, "city": city}
-        else:
-            # Cannot route to weather tool without a city — fall back
-            logger.info(
-                "⚠️  tool_call.weather_no_city  falling_back  query=%r", fallback_query
-            )
-            return WebSearchTool(tool="web_search", query=fallback_query or "weather today")
-
-    # 3. Dispatch to the right Pydantic model
-    _TOOL_MAP = {
-        "weather":    WeatherTool,
-        "news":       NewsTool,
-        "stocks":     StocksTool,
-        "currency":   CurrencyTool,
-        "web_search": WebSearchTool,
-    }
-    model_cls = _TOOL_MAP.get(tool_name)
-    if model_cls is None:
-        logger.warning("⚠️  tool_call.unknown_tool  tool=%r", tool_name)
-        return _fallback_tool(fallback_query, _facts)
-
-    try:
-        return model_cls.model_validate(raw)
-    except Exception as exc:
-        logger.warning("⚠️  tool_call.validation_failed  tool=%r  err=%s", tool_name, exc)
-        return _fallback_tool(fallback_query, _facts)
-
-
-def _fallback_tool(query: str, facts: Dict[str, str]) -> WebSearchTool:
-    return WebSearchTool(tool="web_search", query=query or "")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -258,141 +134,189 @@ def _fallback_tool(query: str, facts: Dict[str, str]) -> WebSearchTool:
 
 class ToolDispatcher:
     """
-    Routes a ToolCall to the appropriate live-data function.
+    Routes a validated ToolCall to the correct live-data backend.
 
-    All methods are async and return a plain string suitable for injecting into
-    the orchestrator as SEARCH_RESULT.  Empty string means no data retrieved.
+    Usage::
+
+        dispatcher = ToolDispatcher()
+        result = await dispatcher.dispatch(tool_call, facts=user_facts)
+
+    The dispatcher is stateless — instantiate once and reuse.
     """
 
     async def dispatch(
         self,
         tool_call: ToolCall,
-        *,
-        groq_client: Any = None,           # passed through for web_search
-        live_search_model: str = "compound-beta-mini",
-        live_search_enabled: bool = True,
+        facts: Optional[Dict[str, str]] = None,
     ) -> str:
         """
-        Dispatch a ToolCall and return the result string.
+        Dispatch a ToolCall to its backend.
 
-        Raises nothing — all exceptions are caught and logged; empty string
-        is returned so the orchestrator can fall back gracefully.
+        Args:
+            tool_call: Validated Pydantic ToolCall instance.
+            facts:     User fact dict (used to fill defaults like city/country).
+
+        Returns:
+            String result to inject as SEARCH_RESULT into the orchestrator prompt.
+            Empty string if the tool returned no data.
         """
+        _facts = facts or {}
+        tool_name = tool_call.tool
+
         try:
-            if isinstance(tool_call, WeatherTool):
-                return await self._weather(tool_call)
-            elif isinstance(tool_call, NewsTool):
-                return await self._news(tool_call)
-            elif isinstance(tool_call, StocksTool):
-                return await self._stocks(tool_call)
-            elif isinstance(tool_call, CurrencyTool):
-                return await self._currency(tool_call)
-            elif isinstance(tool_call, WebSearchTool):
-                return await self._web_search(
-                    tool_call,
-                    groq_client=groq_client,
-                    model=live_search_model,
-                    enabled=live_search_enabled,
-                )
+            if tool_name == "weather":
+                return await self._weather(tool_call, _facts)        # type: ignore[arg-type]
+            elif tool_name == "news":
+                return await self._news(tool_call, _facts)           # type: ignore[arg-type]
+            elif tool_name == "stocks":
+                return await self._stocks(tool_call)                  # type: ignore[arg-type]
+            elif tool_name == "currency":
+                return await self._currency(tool_call)                # type: ignore[arg-type]
+            elif tool_name == "timezone":
+                return await self._timezone(tool_call)                # type: ignore[arg-type]
+            elif tool_name == "web_search":
+                return await self._web_search(tool_call)              # type: ignore[arg-type]
+            else:
+                logger.warning("tools.dispatch — unknown tool=%r", tool_name)
+                return ""
         except Exception as exc:
             logger.error(
-                "❌ tool.dispatch_error  tool=%s  err=%s",
-                getattr(tool_call, "tool", "?"),
-                str(exc)[:200],
+                "tools.dispatch.error  tool=%s  err=%s",
+                tool_name, str(exc)[:200],
             )
-        return ""
+            return ""
 
-    # ── individual tool handlers ──────────────────────────────────────────
+    # ── Individual tool handlers ──────────────────────────────────────────
 
-    async def _weather(self, tc: WeatherTool) -> str:
-        from .live_data import get_weather
-        logger.info("🌤️  tool.weather  city=%r  country=%r  days=%d",
-                    tc.city, tc.country, tc.days)
-        result = await get_weather(tc.city, tc.country) or ""
-        if not result:
-            logger.warning("⚠️  tool.weather  no_result  city=%r", tc.city)
-        return result
+    async def _weather(self, tc: WeatherTool, facts: Dict[str, str]) -> str:
+        from .live_data import get_weather  # local import — avoids circular deps
 
-    async def _news(self, tc: NewsTool) -> str:
+        # Fallback chain for city: tool_call → facts["city"] → facts["user_city"] → "Hyderabad"
+        city = tc.city or facts.get("city") or facts.get("user_city") or ""
+        if not city:
+            city = "Hyderabad"
+            logger.warning("tools.weather — no city in tool_call or facts; defaulting to Hyderabad")
+
+        country = tc.country or facts.get("country") or "IN"
+        logger.info("tools.weather  city=%r  country=%r  days=%d", city, country, tc.days)
+        result = await get_weather(city, country)
+        return result or ""
+
+    async def _news(self, tc: NewsTool, facts: Dict[str, str]) -> str:
         from .live_data import get_news
-        logger.info("📰 tool.news  query=%r  country=%r", tc.query, tc.country)
-        return await get_news(tc.query, tc.country) or ""
+
+        country = tc.country or facts.get("country") or "IN"
+        logger.info("tools.news  query=%r  country=%r", tc.query, country)
+        result = await get_news(tc.query, country[:2].upper())
+        return result or ""
 
     async def _stocks(self, tc: StocksTool) -> str:
         from .live_data import get_indian_stocks
-        symbols = tc.symbols or None
-        logger.info("📈 tool.stocks  symbols=%r", symbols)
-        return await get_indian_stocks(symbols) or ""
+
+        symbols = tc.symbols or []
+        logger.info("tools.stocks  symbols=%r", symbols)
+        result = await get_indian_stocks(symbols)
+        return result or ""
 
     async def _currency(self, tc: CurrencyTool) -> str:
         from .mcp_client import mcp_currency
-        logger.info("💱 tool.currency  %r→%r  amount=%s",
-                    tc.from_currency, tc.to_currency, tc.amount)
-        result = await mcp_currency(tc.from_currency, tc.to_currency, tc.amount) or ""
-        if not result:
-            # MCP currency endpoint may not be live — fall back to web search
-            logger.info("⚠️  tool.currency  mcp_empty  falling_back_to_websearch")
-            return ""
-        return result
 
-    async def _web_search(
-        self,
-        tc: WebSearchTool,
-        *,
-        groq_client: Any,
-        model: str,
-        enabled: bool,
-    ) -> str:
-        """
-        compound-beta-mini web search (unchanged from Phase 0 _live_search fallback).
-        """
-        import asyncio
-        from .prompts import LIVE_SEARCH_PROMPT
+        logger.info(
+            "tools.currency  from=%s  to=%s  amount=%.2f",
+            tc.from_currency, tc.to_currency, tc.amount,
+        )
+        result = await mcp_currency(tc.from_currency, tc.to_currency, tc.amount)
+        return result or ""
 
-        if not enabled:
-            return "Live search is disabled."
-        if groq_client is None:
-            return "LLM not initialised."
+    async def _timezone(self, tc: TimezoneTool) -> str:
+        from .mcp_client import mcp_timezone
 
-        query = tc.query
-        if not query:
-            return ""
+        logger.info("tools.timezone  city=%r", tc.city)
+        result = await mcp_timezone(tc.city)
+        return result or ""
 
-        logger.info("🔍 tool.web_search  query=%r", query[:80])
-        messages = [
-            {"role": "system", "content": LIVE_SEARCH_PROMPT},
-            {"role": "user",   "content": query},
-        ]
-
-        for attempt, q_text in enumerate([query, query[:200], query[:80]], 1):
-            messages[-1]["content"] = q_text
-            try:
-                resp = await asyncio.wait_for(
-                    groq_client.chat.completions.create(
-                        model=model,
-                        messages=messages,
-                        max_tokens=800,
-                        temperature=0.1,
-                    ),
-                    timeout=50.0,
-                )
-                text = (resp.choices[0].message.content or "").strip()
-                if len(text) < 60 and attempt < 3:
-                    continue
-                logger.info("🔍 tool.web_search.done  result_len=%d", len(text))
-                return text[:1200] if len(text) > 1200 else text
-            except Exception as exc:
-                s = str(exc)
-                if "413" in s and attempt < 3:
-                    logger.warning("⚠️  tool.web_search.413  retrying_shorter")
-                    continue
-                if "429" in s or "rate_limit" in s.lower():
-                    return "Live search quota exhausted. Please try again later."
-                logger.error("❌ tool.web_search.error  %s", s[:200])
-                return f"Search failed: {s[:80]}"
-
-        return "Search returned no result."
+    async def _web_search(self, tc: WebSearchTool) -> str:
+        # Web search is handled upstream in agent_engine._live_search_fallback()
+        # We return a sentinel that signals the caller to use compound-beta-mini.
+        # This keeps the Groq client out of tools.py (no circular dep).
+        logger.info("tools.web_search  query=%r  → delegating to compound-beta-mini", tc.query)
+        return _WEB_SEARCH_SENTINEL + tc.query
 
 
-# Module-level singleton — import and use this everywhere.
-dispatcher = ToolDispatcher()
+# Sentinel prefix — agent_engine inspects this to route to compound-beta-mini
+_WEB_SEARCH_SENTINEL = "__web_search__:"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Tool call parser — parses raw LLM dict into a validated ToolCall
+# ─────────────────────────────────────────────────────────────────────────────
+
+def parse_tool_call(raw: Any) -> Optional[ToolCall]:
+    """
+    Parse a raw dict (from the LLM JSON output) into a validated ToolCall.
+
+    Returns None if the input is missing, malformed, or describes an unknown tool.
+    Validation errors are logged at WARNING level (not raised) so the caller
+    can gracefully fall back to compound-beta-mini.
+
+    Args:
+        raw: The value of orchestrator JSON key ``tool_call``. May be None,
+             a dict, or garbage — this function handles all cases.
+    """
+    if not raw or not isinstance(raw, dict):
+        return None
+
+    tool_name = str(raw.get("tool", "")).strip().lower()
+    if not tool_name:
+        return None
+
+    # Normalise common LLM typos / synonyms
+    _ALIASES = {
+        "get_weather":  "weather",
+        "fetch_weather": "weather",
+        "get_news":     "news",
+        "fetch_news":   "news",
+        "get_stocks":   "stocks",
+        "stock":        "stocks",
+        "stock_prices": "stocks",
+        "exchange":     "currency",
+        "forex":        "currency",
+        "get_currency": "currency",
+        "time":         "timezone",
+        "get_timezone": "timezone",
+        "search":       "web_search",
+        "web":          "web_search",
+        "google":       "web_search",
+    }
+    tool_name = _ALIASES.get(tool_name, tool_name)
+
+    _TOOL_MAP = {
+        "weather":    WeatherTool,
+        "news":       NewsTool,
+        "stocks":     StocksTool,
+        "currency":   CurrencyTool,
+        "timezone":   TimezoneTool,
+        "web_search": WebSearchTool,
+    }
+
+    cls = _TOOL_MAP.get(tool_name)
+    if cls is None:
+        logger.warning("tools.parse — unknown tool=%r in LLM output", tool_name)
+        return None
+
+    try:
+        payload = {**raw, "tool": tool_name}
+        return cls.model_validate(payload)
+    except Exception as exc:
+        logger.warning(
+            "tools.parse — validation failed  tool=%r  err=%s",
+            tool_name, str(exc)[:200],
+        )
+        return None
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Singleton dispatcher — import and use directly
+# ─────────────────────────────────────────────────────────────────────────────
+
+tool_dispatcher = ToolDispatcher()
