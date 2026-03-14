@@ -191,8 +191,10 @@ def _format_stocks_mcp(data: dict) -> Optional[str]:
         return None
     today = datetime.now(UTC).strftime("%a %d %b %Y")
     lines = [f"📈 *Indian Markets — {today}*", "_(~15 min delay · Yahoo Finance via MCP)_", ""]
+    skipped = []
     for s in stocks:
         if s.get("error"):
+            skipped.append(s.get("symbol", "?"))
             continue
         price   = s.get("price")
         chg_pct = s.get("change_pct", 0) or 0
@@ -200,10 +202,20 @@ def _format_stocks_mcp(data: dict) -> Optional[str]:
         arrow   = "🟢" if chg_pct >= 0 else "🔴"
         name    = s.get("name", s.get("symbol", ""))
         if price is None:
+            skipped.append(s.get("symbol", "?"))
             continue
         lines.append(f"{arrow} *{name}* — {cur}{price:,.2f}  ({chg_pct:+.2f}%)")
     if len(lines) <= 3:
-        return None
+        # All symbols had errors or null prices — return an informative message
+        sym_list = ", ".join(skipped) if skipped else "requested symbols"
+        return (
+            f"📊 *Stock Data Unavailable*\n"
+            f"Could not fetch price for {sym_list}.\n"
+            f"_(Yahoo Finance may not recognise this ticker or market is closed. "
+            f"Try adding .NS for NSE or .BO for BSE, e.g. PAYTM.NS)_"
+        )
+    if skipped:
+        lines.append(f"\n_⚠️ No data for: {', '.join(skipped)}_")
     return "\n".join(lines)
 
 
@@ -218,7 +230,8 @@ async def get_indian_stocks(symbols: Optional[list] = None) -> Optional[str]:
         if data and data.get("stocks"):
             result = _format_stocks_mcp(data)
             if result:
-                logger.info("📈 live_data.stocks.mcp  count=%d", len(data["stocks"]))
+                logger.info("📈 live_data.stocks.mcp  count=%d  symbols=%r",
+                            len(data["stocks"]), sym_str)
                 return result
     except Exception as e:
         logger.debug("live_data.stocks.mcp_skip  err=%s", e)
@@ -252,7 +265,14 @@ async def get_indian_stocks(symbols: Optional[list] = None) -> Optional[str]:
 
     stocks = await asyncio.to_thread(_fetch_sync)
     if not stocks:
-        return None
+        sym_list = ", ".join(str(s) for s in symbols) if symbols else "requested symbols"
+        logger.info("📈 live_data.stocks.no_data  symbols=%r", sym_list)
+        return (
+            f"📊 *Stock Data Unavailable*\n"
+            f"Could not fetch price for {sym_list}.\n"
+            "_(Market may be closed, or the ticker may not be recognised by Yahoo Finance. "
+            "Try NSE format: PAYTM.NS, RELIANCE.NS, etc.)_"
+        )
     today = datetime.now(UTC).strftime("%a %d %b %Y")
     lines = [f"📈 *Indian Markets — {today}*", "_(~15 min delay · Yahoo Finance)_", ""]
     for s in stocks:

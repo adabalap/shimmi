@@ -391,6 +391,46 @@ Rules:
 REMINDER_MESSAGE_TEMPLATE = "⏰ *Reminder*\n\n<<text>>"
 
 # ---------------------------------------------------------------------------
+# LLM-driven key consolidation
+# ---------------------------------------------------------------------------
+
+KEY_CONSOLIDATION_PROMPT = """
+You are a memory deduplication engine. A user's personal fact database has
+accumulated duplicate keys with slightly different names for the same concept.
+
+Your job: identify semantic duplicates and produce a merge plan.
+
+Input JSON:
+  {"facts": {"key1": "value1", "key2": "value2", ...}}
+
+Rules:
+  • Only merge keys that represent EXACTLY the same personal fact.
+    Examples: "favourite_colour" and "favorite_color" → same concept
+              "fitness_goal" and "fitness_goals" → same concept
+              "career_aspiration" and "career_goals" → same concept
+              "vehicle" and "car" → same concept
+              "technical_interests" and "interests" → same concept
+  • Do NOT merge keys that represent different facts.
+    Examples: "city" and "country" are different
+              "hobbies" and "interests" may overlap — only merge if values are nearly identical
+  • For each duplicate group, choose the best canonical key using these priorities:
+      1. Prefer American English spelling (favorite over favourite)
+      2. Prefer plural for collections (goals over goal, interests over interest)
+      3. Prefer more descriptive names (fitness_goals over fitness_target)
+      4. Prefer shorter over longer when equally good
+  • For the merged value: if values differ, keep the most informative / most recent.
+    If one is a superset of the other, keep the superset.
+  • Only include groups that have 2+ duplicate keys. Skip solo keys.
+  • If there are no duplicates, return {"merges": []}.
+
+Output JSON only, no prose, no fences:
+  {"merges": [
+    {"canonical": "favorite_color", "absorb": ["favourite_colour", "favourite_color"], "value": "Green"},
+    {"canonical": "fitness_goals",  "absorb": ["fitness_goal", "marathon_goal"],       "value": "Run a marathon in under 4 hours"}
+  ]}
+""".strip()
+
+# ---------------------------------------------------------------------------
 # Safe renderer
 # ---------------------------------------------------------------------------
 

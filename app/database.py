@@ -705,7 +705,7 @@ class SQLiteMemory:
         raw_keys: List[str],
         *,
         confirmed: bool = False,
-    ) -> Tuple[int, Dict[str, DeleteOutcome]]:
+    ) -> Tuple[int, List[str]]:
         """
         P1-FEAT-2 + P1-GUARD: Delete multiple facts in a single transaction.
 
@@ -718,18 +718,18 @@ class SQLiteMemory:
             confirmed:   Pass True for _CONFIRM_BEFORE_DELETE keys (list keys).
 
         Returns:
-            (deleted_count: int,  outcomes: Dict[normalized_key, DeleteOutcome])
-            outcomes contains an entry for every input key — callers can inspect
-            individual outcomes to surface precise messages to the user.
+            (deleted_count: int,  blocked: List[str])
+            blocked contains only the keys that were NOT deleted (BLOCKED or
+            NEEDS_CONFIRM). Successfully deleted keys are NOT in this list.
         """
-        outcomes: Dict[str, DeleteOutcome] = {}
+        blocked: List[str] = []
         allowed_keys: List[str] = []
 
         for rk in raw_keys:
             key = normalize_key(rk)
             if not key:
                 continue
-            ok, reason = is_key_deletable(key, confirmed=confirmed)
+            ok, _reason = is_key_deletable(key, confirmed=confirmed)
             if ok:
                 allowed_keys.append(key)
             else:
@@ -738,14 +738,14 @@ class SQLiteMemory:
                     if (key in _CONFIRM_BEFORE_DELETE and not confirmed)
                     else DeleteOutcome.BLOCKED
                 )
-                outcomes[key] = outcome
+                blocked.append(key)
                 logger.warning(
                     "🚫 delete_facts_batch.blocked  sender=%s  key=%s  outcome=%s",
                     whatsapp_id, key, outcome,
                 )
 
         if not allowed_keys:
-            return 0, outcomes
+            return 0, blocked
 
         async with self._lock:
             def _do() -> int:
@@ -764,10 +764,9 @@ class SQLiteMemory:
                     )
                     return n
 
-        n = await asyncio.to_thread(_do)
-        for key in allowed_keys:
-            outcomes[key] = DeleteOutcome.DELETED
-        return n, outcomes
+            n = await asyncio.to_thread(_do)
+
+        return n, blocked
 
     async def cancel_reminder(self, reminder_id: int) -> bool:
         """Mark a reminder as cancelled. Returns True if found."""

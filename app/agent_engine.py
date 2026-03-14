@@ -69,6 +69,7 @@ from .retry import async_retry
 from .prompts import (
     ORCHESTRATOR_PROMPT, MEMORY_EXTRACTOR_PROMPT, REPLY_EXTRACTOR_PROMPT,
     VERIFIER_PROMPT, REPAIR_PROMPT, FORMATTER_PROMPT, LIVE_SEARCH_PROMPT,
+    KEY_CONSOLIDATION_PROMPT,
 )
 from .utils import sanitize_for_whatsapp
 from .database import normalize_key, Reminder
@@ -80,6 +81,11 @@ _SLOW_CALL_WARN_SEC  = 5.0
 _MAX_ITERATIONS      = 3
 _MAX_SEARCH_RESULT   = 1_200
 _MIN_FORMAT_LEN      = 120
+
+# Consolidation runs at most once per hour per user — prevents burning 8B quota
+# on every single message when the user's facts are already clean.
+_CONSOLIDATION_COOLDOWN_SEC: float = 3_600.0   # 1 hour
+_CONSOLIDATION_LAST_RUN: Dict[str, float] = {}  # whatsapp_id → monotonic timestamp
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Pydantic models
@@ -358,8 +364,14 @@ def _trip_model(model: str, cooldown: float) -> None:
 
 
 def _trip_provider(provider: str, cooldown: float) -> None:
+    already_tripped = not _provider_open(provider)
     PROVIDER_CIRCUIT[provider] = time.monotonic() + cooldown
-    logger.warning("🔴 provider.circuit_tripped  provider=%s  cooldown=%.0fs", provider, cooldown)
+    if not already_tripped:
+        # First time tripping this provider — log at WARNING so it's visible
+        logger.warning(
+            "🔴 provider.circuit_tripped  provider=%s  cooldown=%.0fs", provider, cooldown
+        )
+    # (subsequent re-trips are silently absorbed — _call_llm logs circuit.tripped already)
 
 
 def _parse_retry_after(exc: Exception) -> float:
@@ -426,15 +438,25 @@ def _pick_provider_and_model(chat_id: str, role: str) -> Tuple[str, str]:
             ("groq_70b", settings.orchestrator_model),
         ]
 
+    gemini_skipped = False
     for provider, model in candidates:
         # Skip Gemini if no key configured
         if provider == "gemini" and not settings.gemini_enabled:
             continue
         # Check model-level circuit
         if not _model_open(model):
+            if provider == "gemini":
+                gemini_skipped = True
             continue
         # Check provider-level circuit
         if not _provider_open(provider):
+            if provider == "gemini" and not gemini_skipped:
+                gemini_skipped = True
+                reopen_in = max(0, PROVIDER_CIRCUIT.get("gemini", 0) - time.monotonic())
+                logger.info(
+                    "⏭️  gemini.rate_limited  routing=groq  reopen_in=%.0fs",
+                    reopen_in,
+                )
             continue
         # Check token budget (only Groq 70B has a meaningful hard limit)
         if provider == "groq_70b":
@@ -542,11 +564,14 @@ async def _call_llm(
 
         if is_rl:
             cooldown = _parse_retry_after(exc)
+            # Strip verbose URLs from the error string (e.g. Gemini quota messages)
+            err_short = re.sub(r"https?://\S+", "", exc_str).strip()[:160]
             _trip_model(model, cooldown)
             _trip_provider(provider, cooldown)
-            logger.warning(
-                "🔴 circuit.tripped  provider=%s  model=%s  label=%s  cooldown=%.0fs  err=%s",
-                provider, model, label, cooldown, exc_str[:200],
+            # Demote to INFO — the fallback handles this cleanly, it's not an error
+            logger.info(
+                "⚡ rate_limit  provider=%s  model=%s  label=%s  cooldown=%.0fs  fallback=auto  err=%s",
+                provider, model, label, cooldown, err_short,
             )
         else:
             logger.error("❌ llm_call.error  label=%s  provider=%s  model=%s  %.1fs  err=%s",
@@ -1224,15 +1249,109 @@ def _build_reminders_str(reminders: List[Reminder]) -> str:
     return "\n".join(parts)
 
 
-def _build_context_str(context: List[Any]) -> str:
-    lines = []
-    for item in context:
-        if hasattr(item, "role") and hasattr(item, "content"):
-            lines.append(f"{item.role}: {item.content}")
-        elif isinstance(item, dict):
-            lines.append(f"{item.get('role','?')}: {item.get('content','')}")
+def _relative_ts_label(ts_iso: Optional[str], now: Optional[datetime] = None) -> str:
+    """
+    Convert an ISO-8601 timestamp string to a human-readable relative label
+    so the orchestrator can reason about temporal distance.
+
+    Examples:
+      "today 14:32"        — same calendar day in user's timezone
+      "yesterday 09:15"    — previous calendar day
+      "2 days ago 18:04"   — older messages
+      "Mon 08:50"          — if > 6 days ago, show weekday name
+
+    Falls back to the raw ts string if parsing fails.
+    """
+    if not ts_iso:
+        return ""
+    try:
+        # Parse ISO with optional timezone offset (e.g. "+05:30" or "Z")
+        ts_dt = datetime.fromisoformat(ts_iso.replace("Z", "+00:00"))
+        if now is None:
+            try:
+                tz = ZoneInfo(settings.app_timezone)
+            except (ZoneInfoNotFoundError, AttributeError):
+                tz = UTC
+            now = datetime.now(tz)
+        # Normalise both to user's local timezone for calendar-day comparison
+        try:
+            tz = ZoneInfo(settings.app_timezone)
+        except (ZoneInfoNotFoundError, AttributeError):
+            tz = UTC
+        local_ts  = ts_dt.astimezone(tz)
+        local_now = now.astimezone(tz)
+
+        delta_days = (local_now.date() - local_ts.date()).days
+        time_str   = local_ts.strftime("%H:%M")
+
+        if delta_days == 0:
+            return f"today {time_str}"
+        elif delta_days == 1:
+            return f"yesterday {time_str}"
+        elif delta_days < 7:
+            return f"{delta_days} days ago {time_str}"
         else:
-            lines.append(str(item))
+            return local_ts.strftime("%a %d %b %H:%M")   # e.g. "Mon 03 Mar 08:50"
+    except (ValueError, TypeError):
+        return ts_iso[:16] if ts_iso else ""
+
+
+def _build_context_str(context: List[Any]) -> str:
+    """
+    Render context items as a timestamped conversation feed.
+
+    Each item is expected to be a dict with keys:
+      text      — the message text
+      metadata  — dict containing:
+          direction  "in" | "out"
+          ts         ISO-8601 timestamp (e.g. "2026-03-11T09:15:30+05:30")
+
+    Output is sorted chronologically (oldest first) so the LLM reads a
+    natural conversation arc, with a relative timestamp prefix on each line:
+
+      [yesterday 09:15] user: I went for a run this morning
+      [yesterday 09:15] shimmi: Great! How far did you go?
+      [today 14:32] user: Can you remind me about the marathon?
+
+    The orchestrator can then correctly answer "did we talk about X yesterday?"
+    """
+    now = datetime.now(UTC)
+
+    # ── Normalise each item into (ts_iso, direction, text) ───────────────────
+    entries: List[Tuple[str, str, str]] = []
+    for item in context:
+        if isinstance(item, dict):
+            meta      = item.get("metadata") or {}
+            text      = (item.get("text") or "").strip()
+            direction = meta.get("direction", "in")
+            ts_iso    = meta.get("ts") or ""
+        elif hasattr(item, "metadata"):
+            meta      = item.metadata or {}
+            text      = (getattr(item, "text", None) or "").strip()
+            direction = meta.get("direction", "in")
+            ts_iso    = meta.get("ts") or ""
+        elif hasattr(item, "role") and hasattr(item, "content"):
+            text      = getattr(item, "content", "").strip()
+            direction = "in" if getattr(item, "role", "user") == "user" else "out"
+            ts_iso    = ""
+        else:
+            entries.append(("", "in", str(item)))
+            continue
+
+        if text:
+            entries.append((ts_iso, direction, text))
+
+    # ── Sort chronologically by ts (empty ts floats to top as oldest) ─────────
+    entries.sort(key=lambda e: e[0] or "")
+
+    # ── Render with relative timestamp prefix ─────────────────────────────────
+    lines = []
+    for ts_iso, direction, text in entries:
+        label  = _relative_ts_label(ts_iso, now=now)
+        role   = "user" if direction == "in" else "shimmi"
+        prefix = f"[{label}] " if label else ""
+        lines.append(f"{prefix}{role}: {text}")
+
     return "\n".join(lines)
 
 
@@ -1441,15 +1560,32 @@ async def run_agent(
                         "result_len": len(search_result or ""),
                     }}
                 )
+            # ── Early exit: tool returned an "unavailable" notice ────────────
+            # When tool returns a non-empty message that signals unavailability
+            # (stock data unavailable, market closed, etc.), relay it to the user
+            # immediately rather than looping. Prevents the 3-iteration spin seen
+            # when yfinance has no price data for a ticker.
+            _sr_lower = (search_result or "").lower()
+            if search_result and (
+                "unavailable" in _sr_lower
+                or "could not fetch" in _sr_lower
+                or "not recognised" in _sr_lower
+                or "market may be closed" in _sr_lower
+            ):
+                logger.info("🔍 search.unavailable  iter=%d  — replying directly", iteration)
+                return AgentResult(
+                    reply=ReplyPayload(type="text", text=search_result),
+                    iterations=iteration,
+                )
 
-        elif orch.action == "ask":
+        elif orch.action in ("ask", "ask_user", "clarify"):
             question = orch.question or orch.text or "Could you clarify that?"
             return AgentResult(
                 reply=ReplyPayload(type="text", text=question),
                 iterations=iteration,
             )
         else:
-            logger.warning("⚠️  orchestrate.unknown_action  action=%s", orch.action)
+            logger.info("ℹ️  orchestrate.unknown_action  action=%s  (treating as answer)", orch.action)
             text = orch.text or orch.reasoning or "I'm not sure how to help with that."
             return AgentResult(
                 reply=ReplyPayload(type="text", text=text),
@@ -1568,9 +1704,154 @@ async def init_llm() -> None:
         )
 
 
+
 # ─────────────────────────────────────────────────────────────────────────────
-# Compatibility / helper exports used by main.py
+# LLM-driven fact key consolidation  (replaces brittle _KEY_ALIASES expansion)
 # ─────────────────────────────────────────────────────────────────────────────
+
+async def consolidate_user_facts(whatsapp_id: str) -> None:
+    """
+    LLM-driven deduplication of a user's fact keys.
+
+    Instead of an ever-growing hand-written alias map, we give the LLM the
+    user's full key→value dict and ask it to identify semantic duplicates
+    (favourite_colour / favorite_color, fitness_goal / fitness_goals, etc.)
+    and return a merge plan.  We then apply the plan directly to SQLite.
+
+    Design decisions:
+    • Uses the 8B extraction model (cheapest / fastest — no orchestrator quota)
+    • Fire-and-forget: caller wraps in asyncio.create_task(); all exceptions
+      are caught internally so nothing can break the main request path
+    • Called from main.py after facts_load when the user has ≥2 facts
+    • Idempotent: merging already-canonical keys produces an empty merge list
+    • Rate-limited: runs at most once per hour per user (cooldown gate below)
+    • The _KEY_ALIASES dict in database.py stays as a fast synchronous path
+      for known aliases; this function handles unknown / novel variants
+
+    Merge plan applied:
+      1. For each merge group: upsert canonical_key = best_value
+      2. Delete all absorbed (alias) keys that differ from canonical
+    """
+    # ── Cooldown gate: skip if run recently ──────────────────────────────────
+    now_mono = time.monotonic()
+    last_run = _CONSOLIDATION_LAST_RUN.get(whatsapp_id, 0.0)
+    if now_mono - last_run < _CONSOLIDATION_COOLDOWN_SEC:
+        logger.debug(
+            "consolidate.skipped  sender=%s  next_in=%.0fs",
+            whatsapp_id, _CONSOLIDATION_COOLDOWN_SEC - (now_mono - last_run),
+        )
+        return
+    _CONSOLIDATION_LAST_RUN[whatsapp_id] = now_mono
+
+    from .database import sqlite_store, normalize_key
+
+    if sqlite_store is None:
+        return
+
+    try:
+        facts = await sqlite_store.get_all_facts(whatsapp_id)
+    except Exception as exc:
+        logger.debug("consolidate.get_facts_fail  sender=%s  err=%s", whatsapp_id, exc)
+        return
+
+    if len(facts) < 2:
+        return  # nothing to deduplicate
+
+    payload = json.dumps({"facts": facts}, ensure_ascii=False)
+
+    try:
+        raw = await _groq_raw(
+            [
+                {"role": "system", "content": KEY_CONSOLIDATION_PROMPT},
+                {"role": "user",   "content": payload},
+            ],
+            max_tokens=512,
+            chat_id=whatsapp_id,
+            label="key_consolidation",
+            role="extract",         # uses cheap 8B model
+            timeout=20.0,
+        )
+    except Exception as exc:
+        logger.debug("consolidate.llm_fail  sender=%s  err=%s", whatsapp_id, str(exc)[:120])
+        return
+
+    # ── parse response ────────────────────────────────────────────────────────
+    try:
+        clean = raw.strip()
+        if clean.startswith("```"):
+            clean = re.sub(r"```[^\n]*\n?", "", clean).strip()
+        data  = json.loads(clean)
+        merges: list = data.get("merges") or []
+    except (json.JSONDecodeError, AttributeError, TypeError) as exc:
+        logger.debug("consolidate.parse_fail  sender=%s  err=%s  raw=%r",
+                     whatsapp_id, exc, raw[:200])
+        return
+
+    if not merges:
+        logger.debug("consolidate.no_duplicates  sender=%s  facts=%d", whatsapp_id, len(facts))
+        return
+
+    # ── apply merge plan ──────────────────────────────────────────────────────
+    applied = 0
+    for merge in merges:
+        try:
+            canonical = normalize_key(str(merge.get("canonical", "")))
+            absorb    = [normalize_key(str(k)) for k in (merge.get("absorb") or [])]
+            value     = str(merge.get("value") or "").strip()
+
+            if not canonical or not value:
+                continue
+
+            # Write canonical key with the best value
+            await sqlite_store.upsert_fact(whatsapp_id, canonical, value)
+
+            # Delete alias keys (skip if they already equal canonical — normalize_key
+            # may have already mapped them, in which case the row doesn't exist)
+            for alias in absorb:
+                if alias and alias != canonical:
+                    # Direct delete bypassing the allowlist guard — this is an
+                    # internal maintenance operation, not a user-initiated deletion.
+                    await _consolidation_delete(whatsapp_id, alias)
+
+            logger.info(
+                "🔑 consolidate.merged  sender=%s  canonical=%s  absorbed=%s  value=%r",
+                whatsapp_id, canonical, absorb, value[:60],
+            )
+            applied += 1
+        except Exception as exc:
+            logger.debug("consolidate.merge_fail  sender=%s  err=%s", whatsapp_id, str(exc)[:80])
+
+    if applied:
+        logger.info(
+            "✅ consolidate.done  sender=%s  merges_applied=%d  original_keys=%d",
+            whatsapp_id, applied, len(facts),
+        )
+
+
+async def _consolidation_delete(whatsapp_id: str, key: str) -> None:
+    """
+    Internal-only delete that bypasses the _DELETABLE_KEYS allowlist guard.
+    Used exclusively by consolidate_user_facts() to remove alias rows after
+    their value has been merged into the canonical key.
+    """
+    from .database import sqlite_store
+    import asyncio as _asyncio
+    import sqlite3 as _sqlite3
+
+    if sqlite_store is None:
+        return
+
+    async with sqlite_store._lock:
+        def _do():
+            with _sqlite3.connect(sqlite_store.path) as conn:
+                conn.execute(
+                    "DELETE FROM user_memory WHERE whatsapp_id=? AND fact_key=?",
+                    (whatsapp_id, key),
+                )
+                conn.commit()
+        await _asyncio.to_thread(_do)
+
+
 
 VALID_GROQ_PREFIXES = (
     "llama-", "mixtral-", "gemma-",

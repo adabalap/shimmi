@@ -31,13 +31,13 @@ from .utils import (
     compile_prefix_re, chat_is_allowed, canonical_user_key,
 )
 import app.database as database
-from .database import DeleteOutcome
+from .database import DeleteOutcome, normalize_key
 from .waha_provider import (
     init_waha, close_waha, send_text, typing_keepalive,
     OUTBOUND_CACHE_IDS, OUTBOUND_CACHE_TXT, OUTBOUND_TTL_SEC, outbound_hash,
 )
 from .agent_engine import (
-    init_llm, close_llm, run_agent, extract_reply_memory,
+    init_llm, close_llm, run_agent, extract_reply_memory, consolidate_user_facts,
     VALID_GROQ_PREFIXES, VALID_GEMINI_PREFIXES,
     _is_reminder_duplicate, MODEL_CIRCUIT, PROVIDER_CIRCUIT, _TOKEN_BUDGET,
 )
@@ -288,6 +288,51 @@ async def _store_out_bg(*, chat_id, text, ts, out_id) -> None:
         logger.exception("store_out_bg.error  chat=%s", chat_id)
 
 
+async def _ambient_extract_bg(*, chat_id: str, sender_key: str, text: str) -> None:
+    """
+    Background LLM memory extraction for messages that bypassed the main
+    process_message() pipeline (no-prefix group messages).
+
+    Runs _extract_memory + verify + upsert entirely in the background.
+    All exceptions are suppressed — purely best-effort enrichment.
+    This is what makes non-prefix group chat messages contribute to
+    long-term memory, not just context.
+    """
+    try:
+        from .agent_engine import _extract_memory, _verify_updates
+        if not database.sqlite_store:
+            return
+        # Load existing facts so extraction knows what's new
+        existing = await database.sqlite_store.get_all_facts(sender_key)
+        updates = await _extract_memory(text, chat_id, existing_facts=existing)
+        if not updates:
+            return
+        approved = await _verify_updates(
+            updates, chat_id, existing_facts=existing, user_text=text,
+        )
+        if not approved:
+            return
+        created = updated = 0
+        for u in approved:
+            if getattr(u, "delete", False):
+                continue   # never auto-delete from ambient observation
+            status = await database.sqlite_store.upsert_fact(
+                sender_key, normalize_key(u.key), u.value
+            )
+            if status == "created":
+                created += 1
+            elif status == "updated":
+                updated += 1
+        if created or updated:
+            logger.info(
+                "🧠 ambient_memory.saved  sender=%s  created=%d  updated=%d",
+                sender_key, created, updated,
+            )
+    except Exception as exc:
+        logger.debug("ambient_extract_bg.suppressed  sender=%s  err=%s",
+                     sender_key, str(exc)[:80])
+
+
 async def _ambient_store(*, chat_id, sender_key, text, event_id) -> None:
     if not chat_is_allowed(chat_id):
         return
@@ -295,16 +340,39 @@ async def _ambient_store(*, chat_id, sender_key, text, event_id) -> None:
     if not cleaned:
         return
     ts_in = datetime.now(UTC).isoformat()
+    stored_sqlite = stored_chroma = False
     if database.sqlite_store:
         await database.sqlite_store.log_message(
             chat_id=chat_id, whatsapp_id=sender_key,
             direction="in", text=cleaned, ts=ts_in, event_id=event_id or None,
         )
+        stored_sqlite = True
     if database.chroma_store:
         await database.chroma_store.add_message(
             chat_id=chat_id, whatsapp_id=sender_key,
             direction="in", text=cleaned, ts=ts_in,
             message_id=event_id or ("in-" + str(int(time.time() * 1000))),
+        )
+        stored_chroma = True
+
+    logger.info(
+        "📥 ambient.stored  sender=%s  len=%d  sqlite=%s  chroma=%s  preview=%r",
+        sender_key, len(cleaned), stored_sqlite, stored_chroma, cleaned[:60],
+    )
+
+    # ── Long-term memory extraction (fire-and-forget) ────────────────────────
+    # Even when the message has no bot prefix and won't trigger a full LLM
+    # response, we still extract personal facts into long-term memory.
+    # Trigger for: first-person signals OR substantive messages (>15 chars)
+    # that may contain facts like "Going to Goa next week", "My dog is sick" etc.
+    _low = cleaned.lower()
+    _personal = ("i ", "i'm", "i am", "my ", "me ", "mine", "myself", "i've", "i'd", "i'll",
+                 "we ", "we're", "we are", "our ", "going to", "planning to", "will be")
+    _has_signal = any(h in _low for h in _personal) or len(cleaned) > 15
+    if sender_key and _has_signal:
+        asyncio.create_task(
+            _ambient_extract_bg(chat_id=chat_id, sender_key=sender_key, text=cleaned),
+            name=f"ambient_extract:{sender_key}",
         )
 
 
@@ -366,6 +434,13 @@ async def process_message(
                         "📋 facts.loaded  sender=%s  count=%d  %s",
                         sender_key, len(facts),
                         "  ".join(f"{k}={v!r}" for k, v in facts.items()),
+                    )
+                    # LLM-driven dedup: fire-and-forget — merges semantic
+                    # duplicates (favourite_colour / favorite_color etc.)
+                    # without a hand-written alias map.
+                    asyncio.create_task(
+                        consolidate_user_facts(sender_key),
+                        name=f"consolidate:{sender_key}",
                     )
                 else:
                     logger.info("📋 facts.new_user  sender=%s", sender_key)
