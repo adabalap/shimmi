@@ -321,6 +321,17 @@ def parse_tool_call(raw: Any) -> Optional[ToolCall]:
 
     try:
         payload = {**raw, "tool": tool_name}
+
+        # FIX-D: LLM sometimes emits {"tool":"web_search"} with no "query" field,
+        # causing a Pydantic "Field required" validation error and falling back to
+        # the no_tool_call path (which then also has no query, so compound-beta
+        # gets an empty string). Pull the query from sibling fields if missing.
+        if tool_name == "web_search" and not payload.get("query"):
+            payload["query"] = (
+                str(raw.get("query") or raw.get("q") or raw.get("search_query") or "").strip()
+                or None  # leave None so Pydantic still rejects genuinely empty calls
+            )
+
         return cls.model_validate(payload)
     except Exception as exc:
         logger.warning(

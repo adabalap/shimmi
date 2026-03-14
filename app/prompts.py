@@ -419,49 +419,53 @@ Your job: identify semantic duplicates and produce a merge plan.
 Input JSON:
   {"facts": {"key1": "value1", "key2": "value2", ...}}
 
-Rules:
-  • Only merge keys that represent EXACTLY the same personal fact.
-    Examples: "favourite_colour" and "favorite_color" → same concept
-              "fitness_goal" and "fitness_goals" → same concept
-              "career_aspiration" and "career_goals" → same concept
-              "vehicle" and "car" → same concept
-              "technical_interests" and "interests" → same concept
-  • Do NOT merge keys that represent different facts.
-    Examples: "city" and "country" are different
-              "hobbies" and "interests" may overlap — only merge if values are nearly identical
+━━━ STRUCTURAL BLOCKLIST — NEVER merge these ━━━
+These keys are structurally distinct and must NEVER be merged into each other
+or into any other key, even if their values overlap:
 
-  STRUCTURAL BLOCKLIST — NEVER merge these keys into anything else, and never
-  merge anything else into them. They are structurally distinct fact types:
-    trip_destination, trip_duration, trip_to_portland, next_trip_destination,
-    next_trip_family, next_trip_type, next_trip_start_date,
-    running_mileage, language_goal,
-    next_meeting_team, next_meeting_topic, next_meeting_time,
-    reminder_notes, recent_activity,
-    city, country, postal_code, name, age,
-    shopping_list, grocery_list, todo_list,
-    car, bike, vehicle, pets
+  goals            — life goals (marathon, career change, learning language).
+                     NOT the same as fitness_goals or career_goals.
+  fitness_goals    — fitness/exercise targets ONLY. NEVER merge with goals.
+  career_goals     — career aspirations ONLY. NEVER merge with goals.
+  personal_goals   — personal aspirations. NEVER merge with goals.
+  car              — automobile. ALWAYS keep separate from bike.
+  bike             — bicycle or motorbike. ALWAYS keep separate from car.
+  trip_destination, trip_duration, next_trip_destination,
+  next_trip_family, next_trip_type, next_trip_start_date,
+  running_mileage, language_goal,
+  next_meeting_team, next_meeting_topic, next_meeting_time,
+  reminder_notes, recent_activity,
+  city, country, postal_code, name, age,
+  shopping_list, grocery_list, todo_list, pets
 
-  SAFE TO MERGE examples (only spelling/plural variants of the SAME concept):
-    "favourite_colour" / "favorite_color" / "favourite_color" → favorite_color
-    "fitness_goal" / "fitness_goals" / "marathon_goal"        → fitness_goals
-    "career_aspiration" / "career_goals"                      → career_goals
-    "technical_interests" / "interests"                       → interests
-    "vehicle" / "car"  — only when BOTH exist and hold the same vehicle info
+━━━ WRONG (do NOT do these) ━━━
+  ✗  goals + fitness_goals → fitness_goals   (different concepts)
+  ✗  goals + career_goals  → goals           (different concepts)
+  ✗  car   + bike          → car             (different vehicles)
+  ✗  trip_duration + goals → goals           (completely unrelated)
 
-  For each duplicate group, choose the best canonical key using these priorities:
-      1. Prefer American English spelling (favorite over favourite)
-      2. Prefer plural for collections (goals over goal, interests over interest)
-      3. Prefer more descriptive names (fitness_goals over fitness_target)
-      4. Prefer shorter over longer when equally good
-  For the merged value: if values differ, keep the most informative / most recent.
-    If one is a superset of the other, keep the superset.
-  Only include groups that have 2+ duplicate keys. Skip solo keys.
-  If there are no duplicates, return {"merges": []}.
+━━━ SAFE TO MERGE (spelling/plural variants of the SAME concept only) ━━━
+  ✓  favourite_colour / favorite_color / favourite_color  → favorite_color
+  ✓  fitness_goal (singular) / fitness_goals (plural)     → fitness_goals
+  ✓  career_aspiration / career_goals                     → career_goals
+  ✓  technical_interests / interests                      → interests
+  ✓  favourite_food / favorite_food                       → favorite_food
+  ✓  trip_plans / travel_plans (identical values only)    → travel_plans
+
+Canonical key selection priority:
+  1. American English spelling (favorite over favourite)
+  2. Plural for collections (goals over goal, interests over interest)
+  3. More descriptive name (fitness_goals over fitness_target)
+  4. Shorter when equally good
+
+For the merged value: keep the most informative / most recent. Superset wins.
+Only include groups with 2+ duplicate keys. Skip solo keys.
+If no duplicates found, return {"merges": []}.
 
 Output JSON only, no prose, no fences:
   {"merges": [
     {"canonical": "favorite_color", "absorb": ["favourite_colour", "favourite_color"], "value": "Green"},
-    {"canonical": "fitness_goals",  "absorb": ["fitness_goal", "marathon_goal"],       "value": "Run a marathon in under 4 hours"}
+    {"canonical": "fitness_goals",  "absorb": ["fitness_goal"],  "value": "Run a marathon in under 4 hours"}
   ]}
 """.strip()
 

@@ -731,23 +731,27 @@ async def lifespan(app: FastAPI):
     logger.info("🕐 scheduler.task_created")
 
     port = int(os.getenv("PORT", "6000"))
-    primary_orch = (
-        f"Gemini({settings.gemini_orchestrator_model})"
-        if settings.gemini_enabled
-        else f"Groq({settings.orchestrator_model})"
+    # FIX-A: Orchestrator priority is now Groq 70b → Gemini → Groq 8b.
+    # Gemini free tier exhausts immediately; Groq 70b is the real primary.
+    primary_orch = f"Groq({settings.orchestrator_model})"
+    fallback_orch = (
+        f" → Gemini({settings.gemini_orchestrator_model})"
+        if settings.gemini_enabled else ""
     )
     logger.info(
         "🚀 startup.ready  http://0.0.0.0:%d  "
         "allowlist=%d  allow_all=%s  live_search=%s  chroma=%s  "
-        "primary_orchestrator=%s  extraction=%s  gemini=%s",
+        "orchestrator=%s%s → Groq(%s)  extraction=%s  gemini=%s",
         port,
         len(settings.allowed_chat_jids or []),
         settings.allow_all_chats,
         settings.live_search_enabled,
         settings.chroma_enabled,
         primary_orch,
+        fallback_orch,
         settings.extraction_model,
-        "✅" if settings.gemini_enabled else "❌ (set GEMINI_API_KEY for 15× more quota)",
+        settings.extraction_model,
+        "✅" if settings.gemini_enabled else "❌ (set GEMINI_API_KEY for extra quota)",
     )
 
     yield

@@ -602,62 +602,85 @@ async def _groq_raw(
     timeout: Optional[float] = None,
 ) -> str:
     """
-    Route to the best available provider for the given role, with automatic
-    fallback if the primary is circuit-tripped.
+    Route to the best available provider for the given role.
+
+    FIX-B-CRASH: Iterates through ALL candidates in priority order, catching
+    per-attempt rate-limit/timeout errors and continuing to the next candidate.
+    Previously a single one-shot fallback call could itself throw 429 (when both
+    groq_70b AND gemini are rate-limited simultaneously), propagating as a fatal
+    crash. Now groq_8b is always reached as last resort regardless of failures.
     """
-    provider, model = _pick_provider_and_model(chat_id, role)
-    effective_timeout = timeout or (
-        settings.gemini_timeout if provider == "gemini" else settings.groq_timeout
+    all_candidates = (
+        [("groq_70b", settings.orchestrator_model),
+         ("gemini",   settings.gemini_orchestrator_model),
+         ("groq_8b",  settings.extraction_model)]
+        if role == "orchestrate"
+        else [("groq_8b",  settings.extraction_model),
+              ("gemini",   settings.gemini_extraction_model),
+              ("groq_70b", settings.orchestrator_model)]
     )
-    try:
-        return await _call_llm(
-            messages,
-            provider=provider, model=model,
-            max_tokens=max_tokens, timeout=effective_timeout,
-            chat_id=chat_id, label=label,
-        )
-    except Exception as first_exc:
-        # Try fallback provider if primary failed
-        first_exc_str = str(first_exc)
-        is_rl = "429" in first_exc_str or "rate_limit" in first_exc_str.lower()
 
-        # Only attempt fallback on rate-limit or timeout errors
-        if not (is_rl or isinstance(first_exc, (asyncio.TimeoutError, TimeoutError))):
-            raise
+    last_exc: Optional[Exception] = None
+    prev_provider: Optional[str] = None
+    prev_model: Optional[str] = None
+    n_attempted = 0
 
-        # Get fallback — same priority order as _pick_provider_and_model
-        fallback_candidates = (
-            [("groq_70b", settings.orchestrator_model),
-             ("gemini",   settings.gemini_orchestrator_model),
-             ("groq_8b",  settings.extraction_model)]
-            if role == "orchestrate"
-            else [("groq_8b",  settings.extraction_model),
-                  ("gemini",   settings.gemini_extraction_model),
-                  ("groq_70b", settings.orchestrator_model)]
-        )
-        for fb_provider, fb_model in fallback_candidates:
-            if fb_provider == provider and fb_model == model:
-                continue  # skip the one that just failed
-            if fb_provider == "gemini" and not settings.gemini_enabled:
-                continue
-            if not _model_open(fb_model):
-                continue
-            if not _provider_open(fb_provider):
-                continue
-            logger.info("🔄 provider.fallback  role=%s  from=%s/%s  to=%s/%s",
-                        role, provider, model, fb_provider, fb_model)
-            fb_timeout = timeout or (
-                settings.gemini_timeout if fb_provider == "gemini"
-                else settings.groq_timeout
+    for provider, model in all_candidates:
+        if provider == "gemini" and not settings.gemini_enabled:
+            continue
+        if not _model_open(model):
+            continue
+        if not _provider_open(provider):
+            continue
+
+        # Log fallback transitions (skip for the first attempt)
+        if n_attempted > 0:
+            logger.info(
+                "🔄 provider.fallback  role=%s  from=%s/%s  to=%s/%s",
+                role, prev_provider, prev_model, provider, model,
             )
+
+        fb_label = label if n_attempted == 0 else f"{label}_fb{n_attempted}"
+        eff_timeout = timeout or (
+            settings.gemini_timeout if provider == "gemini" else settings.groq_timeout
+        )
+
+        try:
             return await _call_llm(
                 messages,
-                provider=fb_provider, model=fb_model,
-                max_tokens=max_tokens, timeout=fb_timeout,
-                chat_id=chat_id, label=f"{label}_fb",
+                provider=provider, model=model,
+                max_tokens=max_tokens, timeout=eff_timeout,
+                chat_id=chat_id, label=fb_label,
             )
+        except Exception as exc:
+            last_exc = exc
+            exc_str = str(exc)
+            is_rl = (
+                "429" in exc_str
+                or "rate_limit" in exc_str.lower()
+                or "RESOURCE_EXHAUSTED" in exc_str
+            )
+            is_timeout = isinstance(exc, (asyncio.TimeoutError, TimeoutError))
 
-        raise  # all fallbacks exhausted
+            if is_rl or is_timeout:
+                # Retriable — continue to next candidate
+                prev_provider, prev_model = provider, model
+                n_attempted += 1
+                continue
+            else:
+                # Non-retriable (auth failure, bad request) — raise immediately
+                raise
+
+    # All candidates exhausted — produce a clear error instead of a silent crash
+    if n_attempted == 0:
+        raise RuntimeError(
+            f"No LLM provider available for role={role} — all circuits open."
+        )
+    logger.error(
+        "🚨 provider.all_exhausted  role=%s  tried=%d  last_err=%s",
+        role, n_attempted, str(last_exc)[:160],
+    )
+    raise last_exc
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -915,7 +938,16 @@ async def _dispatch_tool(
     _facts = facts or {}
 
     # ── Parse the tool_call from orchestrator output ──────────────────────
-    tool_call = parse_tool_call(tool_call_raw)
+    # FIX-D: Before parsing, if tool_call says web_search but has no query,
+    # inject the outer orchestrator query string so validation doesn't fail.
+    tool_call_raw_patched = tool_call_raw
+    if isinstance(tool_call_raw, dict):
+        t = str(tool_call_raw.get("tool", "")).strip().lower()
+        t = {"search": "web_search", "web": "web_search", "google": "web_search"}.get(t, t)
+        if t == "web_search" and not tool_call_raw.get("query"):
+            tool_call_raw_patched = {**tool_call_raw, "query": query or ""}
+
+    tool_call = parse_tool_call(tool_call_raw_patched)
 
     if tool_call is None:
         # Orchestrator did not provide a valid tool_call.
@@ -1586,12 +1618,12 @@ async def run_agent(
             # same (tool, query) pair it already tried, fall through to web_search
             # instead of looping with guaranteed-empty results.
             dispatch_key = f"{(orch.tool_call or {}).get('tool','web_search')}::{query}"
-            if dispatch_key in _dispatched_calls:
+            _was_duplicate = dispatch_key in _dispatched_calls
+            if _was_duplicate:
                 logger.warning(
                     "⚠️  search.duplicate_dispatch  iter=%d  key=%r — forcing web_search fallback",
                     iteration, dispatch_key,
                 )
-                # Override with a web_search on the same query instead
                 search_result = await _compound_beta_search(query, chat_id)
             else:
                 _dispatched_calls.add(dispatch_key)
@@ -1607,14 +1639,21 @@ async def run_agent(
                     }}
                 )
 
-            # FIX-B3: If we have a non-trivial result, force action=answer next
-            # iteration instead of letting the LLM re-search with the same query.
-            # This prevents the "I don't have real-time data" hallucination when
-            # search_result actually contains the answer.
-            if search_result and len(search_result.strip()) > 60:
-                # Rebuild messages with the result — the next _orchestrate call
-                # will see SEARCH_RESULT and should choose action=answer.
-                pass  # normal flow: loop continues, messages rebuilt at top with search_result
+            # FIX-C: If a duplicate was detected (LLM asked for the same search
+            # it already had results for) AND the fallback web_search returned
+            # substantive content, present it directly without another LLM round.
+            # This stops the gold-price / compound-beta loop where the model
+            # receives result_len=200+ three times but replies "not available".
+            if _was_duplicate and search_result and len(search_result.strip()) > 60:
+                logger.info(
+                    "🔍 search.force_answer  iter=%d  result_len=%d  "
+                    "(duplicate query resolved — presenting web_search result directly)",
+                    iteration, len(search_result),
+                )
+                return AgentResult(
+                    reply=ReplyPayload(type="text", text=search_result.strip()),
+                    iterations=iteration,
+                )
 
             # ── Early exit: tool returned an "unavailable" notice ────────────
             # When tool returns a non-empty message that signals unavailability
@@ -1872,6 +1911,27 @@ async def consolidate_user_facts(whatsapp_id: str) -> None:
         logger.debug("consolidate.no_duplicates  sender=%s  facts=%d", whatsapp_id, len(facts))
         return
 
+    # FIX-E: Hard runtime blocklist — reject merges the LLM hallucinates even
+    # with an explicit prompt. Protects semantically distinct keys that share
+    # surface similarity (goals vs fitness_goals, car vs bike, etc.).
+    # A merge is rejected if canonical OR any absorbed key is in the blocklist
+    # AND the merge crosses concept boundaries (canonical != absorbed concept).
+    _MERGE_BLOCKLIST = frozenset({
+        # Goal family — all kept separate; cross-merging loses information
+        "goals", "fitness_goals", "career_goals", "personal_goals",
+        # Vehicle — car and bike are always distinct
+        "car", "bike", "vehicle",
+        # Structural / system keys — must never be absorbed into anything
+        "name", "age", "city", "country", "postal_code",
+        "reminder_notes", "recent_activity",
+        "shopping_list", "grocery_list", "todo_list",
+        "trip_destination", "trip_duration", "next_trip_destination",
+        "next_trip_family", "next_trip_type", "next_trip_start_date",
+        "running_mileage", "language_goal",
+        "next_meeting_team", "next_meeting_topic", "next_meeting_time",
+        "pets",
+    })
+
     # ── apply merge plan ──────────────────────────────────────────────────────
     applied = 0
     for merge in merges:
@@ -1883,15 +1943,25 @@ async def consolidate_user_facts(whatsapp_id: str) -> None:
             if not canonical or not value:
                 continue
 
+            # FIX-E: Reject the merge if it crosses the blocklist boundary.
+            # A same-family merge (fitness_goal → fitness_goals) is fine because
+            # canonical == absorbed concept. A cross-family merge
+            # (goals absorbing fitness_goals, or car absorbing bike) is blocked.
+            blocked_absorb = [a for a in absorb if a in _MERGE_BLOCKLIST and a != canonical]
+            if canonical in _MERGE_BLOCKLIST and blocked_absorb:
+                logger.warning(
+                    "🚫 consolidate.blocked  sender=%s  canonical=%s  "
+                    "blocked_absorb=%s  (cross-concept merge rejected)",
+                    whatsapp_id, canonical, blocked_absorb,
+                )
+                continue
+
             # Write canonical key with the best value
             await sqlite_store.upsert_fact(whatsapp_id, canonical, value)
 
-            # Delete alias keys (skip if they already equal canonical — normalize_key
-            # may have already mapped them, in which case the row doesn't exist)
+            # Delete alias keys (skip if they already equal canonical)
             for alias in absorb:
                 if alias and alias != canonical:
-                    # Direct delete bypassing the allowlist guard — this is an
-                    # internal maintenance operation, not a user-initiated deletion.
                     await _consolidation_delete(whatsapp_id, alias)
 
             logger.info(
