@@ -69,7 +69,7 @@ from .retry import async_retry
 from .prompts import (
     ORCHESTRATOR_PROMPT, MEMORY_EXTRACTOR_PROMPT, REPLY_EXTRACTOR_PROMPT,
     VERIFIER_PROMPT, REPAIR_PROMPT, FORMATTER_PROMPT, LIVE_SEARCH_PROMPT,
-    KEY_CONSOLIDATION_PROMPT,
+    KEY_CONSOLIDATION_PROMPT, SUMMARY_PROMPT,
 )
 from .utils import sanitize_for_whatsapp
 from .database import normalize_key, Reminder
@@ -972,6 +972,12 @@ async def _dispatch_tool(
         search_query = raw_result[len(_WEB_SEARCH_SENTINEL):]
         return await _compound_beta_search(search_query, chat_id)
 
+    # ── Handle summarise sentinel (builds conversation summary) ─────────────
+    from .tools import _SUMMARISE_SENTINEL
+    if raw_result.startswith(_SUMMARISE_SENTINEL):
+        period = raw_result[len(_SUMMARISE_SENTINEL):]
+        return await _build_conversation_summary(period, chat_id)
+
     return raw_result
 
 
@@ -1028,6 +1034,142 @@ async def _compound_beta_search(query: str, chat_id: str) -> str:
             return f"Search failed: {s[:80]}"
 
     return "Search returned no result."
+
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Conversation summary helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _get_summary_window(period: str) -> tuple[str, str]:
+    """
+    Parse a period string into (from_ts_iso, to_ts_iso) in the user's local tz.
+
+    Supported periods:
+        today           — midnight today → now
+        yesterday       — midnight yesterday → midnight today
+        last_7_days     — 7 days ago → now  (also: last_week, this_week)
+        last_N_days     — N days ago → now  (e.g. last_3_days)
+        last_30_days    — 30 days ago → now
+        all             — epoch → now (capped at 90 days in practice by DB limit)
+    """
+    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
+    try:
+        tz = ZoneInfo(settings.app_timezone)
+    except (ZoneInfoNotFoundError, Exception):
+        tz = UTC
+
+    now       = datetime.now(tz)
+    today_mid = now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    p = (period or "today").strip().lower()
+
+    if p == "today":
+        from_dt = today_mid
+        to_dt   = now
+    elif p == "yesterday":
+        from_dt = today_mid - timedelta(days=1)
+        to_dt   = today_mid
+    elif p in ("last_7_days", "last_week", "this_week", "last week"):
+        from_dt = today_mid - timedelta(days=7)
+        to_dt   = now
+    elif p in ("last_30_days", "last_month", "this_month"):
+        from_dt = today_mid - timedelta(days=30)
+        to_dt   = now
+    elif p == "all":
+        from_dt = today_mid - timedelta(days=90)
+        to_dt   = now
+    else:
+        # Try "last_N_days"
+        import re as _re
+        m = _re.match(r"last[_\s](\d+)[_\s]days?", p)
+        if m:
+            n = min(int(m.group(1)), 90)   # cap at 90 days
+            from_dt = today_mid - timedelta(days=n)
+            to_dt   = now
+        else:
+            # Unknown — default to today
+            logger.warning("summary.unknown_period=%r — defaulting to today", period)
+            from_dt = today_mid
+            to_dt   = now
+
+    return from_dt.isoformat(), to_dt.isoformat()
+
+
+async def _build_conversation_summary(
+    period: str,
+    chat_id: str,
+) -> str:
+    """
+    Fetch messages for the period, build a transcript, and ask the LLM
+    to write a clean natural-language summary.
+
+    Returns the summary string (ready to inject as SEARCH_RESULT) or an
+    informative "no messages" string.
+    """
+    from .database import sqlite_store
+
+    if not sqlite_store:
+        return "Conversation history is not available."
+
+    from_ts, to_ts = _get_summary_window(period)
+
+    messages = await sqlite_store.get_messages_by_date_range(
+        chat_id=chat_id,
+        from_ts=from_ts,
+        to_ts=to_ts,
+        limit=300,
+    )
+
+    if not messages:
+        period_label = {
+            "today":        "today",
+            "yesterday":    "yesterday",
+            "last_7_days":  "the last 7 days",
+            "last_week":    "last week",
+            "last_30_days": "the last 30 days",
+        }.get(period, f"the period requested ({period})")
+        return f"No conversation messages found for {period_label}."
+
+    # Build a compact transcript — "user: ..." / "shimmi: ..."
+    lines = []
+    for msg in messages:
+        role = "user" if msg["direction"] == "in" else "shimmi"
+        text = (msg["text"] or "").strip()
+        if text:
+            lines.append(f"{role}: {text}")
+
+    transcript = "\n".join(lines)
+
+    # Truncate if very long — keep newest messages
+    if len(transcript) > 6000:
+        transcript = "...[earlier messages trimmed]...\n" + transcript[-5800:]
+
+    # Call the LLM to write the summary
+    llm_messages = [
+        {"role": "system", "content": SUMMARY_PROMPT},
+        {"role": "user",   "content": f"PERIOD: {period}\n\nTRANSCRIPT:\n{transcript}"},
+    ]
+    try:
+        raw = await _groq_raw(
+            llm_messages,
+            max_tokens=600,
+            chat_id=chat_id,
+            label="summarise",
+            role="extract",   # use cheap 8B model
+            timeout=25.0,
+        )
+        summary = raw.strip()
+        if not summary:
+            return "I wasn't able to generate a summary right now — please try again."
+        logger.info(
+            "📋 summary.done  chat=%s  period=%r  msgs=%d  summary_len=%d",
+            chat_id, period, len(messages), len(summary),
+        )
+        return summary
+    except Exception as exc:
+        logger.error("summary.failed  chat=%s  err=%s", chat_id, str(exc)[:120])
+        return "I had trouble summarising the conversation — please try again in a moment."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1286,6 +1428,18 @@ def _build_facts_str(facts: Dict[str, str]) -> str:
 
 
 def _build_reminders_str(reminders: List[Reminder]) -> str:
+    """
+    Build the reminders string shown to the LLM in every orchestrator prompt.
+
+    Each reminder is formatted as:
+        [ID:12] • haircut (in 43m)
+        [ID:7]  • meeting with product team about ML project (in 69h)
+
+    The ID prefix is the database row id — the LLM is instructed to include it
+    verbatim in the _cancel_reminder value so main.py can cancel by exact id
+    rather than relying on fuzzy text matching.  Foolproof: the user sees the
+    same IDs when they ask to list reminders, and can say "delete ID 12".
+    """
     if not reminders:
         return "No pending reminders."
     now = _now_local()
@@ -1304,7 +1458,15 @@ def _build_reminders_str(reminders: List[Reminder]) -> str:
                 when = f"in {int(diff.total_seconds()//3600)}h"
         except Exception:
             when = "at " + r.trigger_iso
-        parts.append(f"• {r.reminder_text} ({when})")
+
+        # Format the scheduled date/time for display
+        try:
+            trigger_dt = datetime.fromisoformat(r.trigger_iso)
+            time_label = trigger_dt.strftime("%-I:%M %p %a %d %b").lstrip("0")
+        except Exception:
+            time_label = r.trigger_iso[:16]
+
+        parts.append(f"[ID:{r.id}] • {r.reminder_text} — {time_label} ({when})")
     return "\n".join(parts)
 
 
@@ -1743,7 +1905,7 @@ async def extract_reply_memory(
         # from reply text. reminder_notes is written by the scheduler/orchestrator
         # directly; extract_reply_memory scanning the reply would overwrite it with
         # the reminder's description string, causing value drift on every message.
-        _REPLY_EXTRACT_SKIP = frozenset({"reminder_notes", "recent_activity"})
+        _REPLY_EXTRACT_SKIP = frozenset({"reminder_notes", "recent_activity", "reminders_pending", "pending_reminders", "reminders_pending", "pending_reminders"})
         if result.memory_updates:
             before = len(result.memory_updates)
             result.memory_updates = [

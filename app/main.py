@@ -554,6 +554,104 @@ async def process_message(
 
                     for mu in result.memory_updates:
                         try:
+                            # ── FIX-RD1: _cancel_reminder special key ─────────────
+                            # The orchestrator signals a reminder cancellation by
+                            # emitting {"key":"_cancel_reminder","value":"<text hint>"}.
+                            # We fuzzy-match against pending reminders and call
+                            # cancel_reminder() on the DB. This is the ONLY correct
+                            # path — previously the LLM was just writing a
+                            # reminders_pending fact and saying "deleted" with no
+                            # actual DB change, so reminders would still fire.
+                            if mu.key == "_cancel_reminder":
+                                hint = (mu.value or "").strip()
+                                if hint:
+                                    cancelled_rem = None
+
+                                    # ── Try ID-based cancel first (foolproof) ──
+                                    # The LLM is shown [ID:N] in the reminders list
+                                    # and echoes the number — parse and cancel by
+                                    # exact row id.  No fuzzy matching needed.
+                                    import re as _re
+                                    id_match = _re.search(r"\b(\d+)\b", hint)
+                                    if id_match:
+                                        reminder_id = int(id_match.group(1))
+                                        ok = await database.sqlite_store.cancel_reminder(
+                                            reminder_id
+                                        )
+                                        if ok:
+                                            # Fetch the text for the confirmation reply
+                                            all_rems = await database.sqlite_store.get_user_reminders(
+                                                sender_key, include_sent=True
+                                            )
+                                            for _r in all_rems:
+                                                if _r.id == reminder_id:
+                                                    cancelled_rem = _r
+                                                    break
+                                            if cancelled_rem is None:
+                                                # Cancelled but couldn't fetch text —
+                                                # create a minimal stand-in
+                                                from .database import Reminder as _Rem
+                                                import datetime as _dt
+                                                cancelled_rem = _Rem(
+                                                    id=reminder_id,
+                                                    whatsapp_id=sender_key,
+                                                    chat_id=chat_id,
+                                                    reminder_text=hint,
+                                                    trigger_iso="",
+                                                    created_at="",
+                                                )
+                                            logger.info(
+                                                "🔔 reminder.cancel_by_id  sender=%s  id=%d",
+                                                sender_key, reminder_id,
+                                            )
+
+                                    # ── Fallback: fuzzy text match ───────────
+                                    if cancelled_rem is None:
+                                        cancelled_rem = await database.sqlite_store.cancel_reminder_by_text(
+                                            sender_key, hint,
+                                        )
+
+                                    if cancelled_rem:
+                                        logger.info(
+                                            "🔔 reminder.cancel_ok  sender=%s  id=%d  text=%r",
+                                            sender_key, cancelled_rem.id,
+                                            cancelled_rem.reminder_text[:60],
+                                        )
+                                        saved += 1
+                                        cancel_confirm = (
+                                            f"✅ Reminder cancelled: "
+                                            f"*{cancelled_rem.reminder_text}*"
+                                        )
+                                        object.__setattr__(result.reply, "text", cancel_confirm)
+                                    else:
+                                        logger.warning(
+                                            "🔔 reminder.cancel_no_match  sender=%s  hint=%r",
+                                            sender_key, hint[:60],
+                                        )
+                                        no_match_reply = (
+                                            f"⚠️ I couldn't find a pending reminder matching "
+                                            f"*{hint}*.\n"
+                                            "Reply *what reminders do I have* to see "
+                                            "your current reminders with their IDs."
+                                        )
+                                        object.__setattr__(result.reply, "text", no_match_reply)
+                                continue  # do not fall through to upsert
+
+                            # ── FIX-RD2: block transient display keys from being ──
+                            # saved as permanent facts. The orchestrator sometimes
+                            # writes reminders_pending as a memory_update containing
+                            # the formatted reminder list string — this is a display
+                            # artifact, not a persistent fact.
+                            _TRANSIENT_KEYS = frozenset({
+                                "reminders_pending", "pending_reminders",
+                                "reminders_list", "active_reminders",
+                            })
+                            if mu.key in _TRANSIENT_KEYS:
+                                logger.debug(
+                                    "memory.skip_transient  sender=%s  key=%s",
+                                    sender_key, mu.key,
+                                )
+                                continue
                             if getattr(mu, "delete", False):
                                 # P1-FEAT-2 + P1-GUARD: guarded deletion
                                 confirmed = getattr(mu, "confirm", False)

@@ -121,9 +121,37 @@ class WebSearchTool(BaseModel):
         return str(v or "").strip()
 
 
+class SummariseTool(BaseModel):
+    """Summarise the conversation history for a given time period."""
+    tool: Literal["summarise"]
+    period: str = Field(
+        "today",
+        description=(
+            "Time window to summarise. One of: "
+            "'today', 'yesterday', 'last_week', 'last_7_days', "
+            "'last_N_days' (e.g. 'last_3_days'), or 'all'."
+        ),
+    )
+
+    @field_validator("period", mode="before")
+    @classmethod
+    def _normalise(cls, v: Any) -> str:
+        s = str(v or "today").strip().lower()
+        # Normalise common phrasings
+        aliases = {
+            "this week": "last_7_days",
+            "last week": "last_7_days",
+            "past week": "last_7_days",
+            "this month": "last_30_days",
+            "past month": "last_30_days",
+            "": "today",
+        }
+        return aliases.get(s, s)
+
+
 # Union type — used as the type annotation for OrchestratorResult.tool_call
 ToolCall = Annotated[
-    Union[WeatherTool, NewsTool, StocksTool, CurrencyTool, TimezoneTool, WebSearchTool],
+    Union[WeatherTool, NewsTool, StocksTool, CurrencyTool, TimezoneTool, WebSearchTool, SummariseTool],
     Field(discriminator="tool"),
 ]
 
@@ -176,6 +204,8 @@ class ToolDispatcher:
                 return await self._timezone(tool_call)                # type: ignore[arg-type]
             elif tool_name == "web_search":
                 return await self._web_search(tool_call)              # type: ignore[arg-type]
+            elif tool_name == "summarise":
+                return await self._summarise(tool_call)               # type: ignore[arg-type]
             else:
                 logger.warning("tools.dispatch — unknown tool=%r", tool_name)
                 return ""
@@ -250,6 +280,22 @@ class ToolDispatcher:
         result = await mcp_timezone(tc.city)
         return result or ""
 
+    async def _summarise(self, tc: SummariseTool) -> str:
+        """
+        Summarise the conversation history for the requested time period.
+        Fetches raw messages from message_log and formats them as a transcript
+        string — the caller (agent_engine) passes this as SEARCH_RESULT so
+        the orchestrator can write the actual summary prose.
+        """
+        # Import here to avoid circular deps
+        from .database import sqlite_store
+        from .agent_engine import _get_summary_window, SUMMARY_PROMPT
+        # _get_summary_window and SUMMARY_PROMPT defined in agent_engine.py
+        # We return the _SUMMARISE_SENTINEL so agent_engine knows to call
+        # _build_conversation_summary() directly with the chat_id.
+        logger.info("tools.summarise  period=%r", tc.period)
+        return f"{_SUMMARISE_SENTINEL}{tc.period}"
+
     async def _web_search(self, tc: WebSearchTool) -> str:
         # Web search is handled upstream in agent_engine._live_search_fallback()
         # We return a sentinel that signals the caller to use compound-beta-mini.
@@ -260,6 +306,9 @@ class ToolDispatcher:
 
 # Sentinel prefix — agent_engine inspects this to route to compound-beta-mini
 _WEB_SEARCH_SENTINEL = "__web_search__:"
+
+# Sentinel prefix — agent_engine inspects this to build a conversation summary
+_SUMMARISE_SENTINEL = "__summarise__:"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -302,6 +351,10 @@ def parse_tool_call(raw: Any) -> Optional[ToolCall]:
         "search":       "web_search",
         "web":          "web_search",
         "google":       "web_search",
+        "summary":      "summarise",
+        "summarize":    "summarise",
+        "recap":        "summarise",
+        "conversation_summary": "summarise",
     }
     tool_name = _ALIASES.get(tool_name, tool_name)
 
@@ -312,6 +365,7 @@ def parse_tool_call(raw: Any) -> Optional[ToolCall]:
         "currency":   CurrencyTool,
         "timezone":   TimezoneTool,
         "web_search": WebSearchTool,
+        "summarise":  SummariseTool,
     }
 
     cls = _TOOL_MAP.get(tool_name)
