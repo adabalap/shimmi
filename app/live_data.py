@@ -338,6 +338,16 @@ async def get_news(query: str = "India top news", country: str = "IN") -> Option
                 params={"q": query, "lang": "en", "country": country.lower(),
                         "max": 6, "apikey": GNEWS_KEY},
             )
+            # FIX-B2A: GNews returns HTTP 400 when the API key is wrong/expired
+            # (the key in env looks like a Google Maps key, not a GNews key).
+            # Don't crash or return empty — fall through to RSS immediately.
+            if resp.status_code != 200:
+                logger.warning(
+                    "live_data.news.gnews_bad_status  status=%d  "
+                    "(check GNEWS_API_KEY — must be a gnews.io key, not a Google Maps key)",
+                    resp.status_code,
+                )
+                raise ValueError(f"GNews HTTP {resp.status_code}")
             articles = resp.json().get("articles", [])
             if articles:
                 lines = ["📰 *Latest News*", ""]

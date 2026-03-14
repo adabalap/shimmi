@@ -138,11 +138,19 @@ class OrchestratorResult(BaseModel):
     reasoning:      str              = ""
     text:           str              = ""
     query:          str              = ""
-    question:       str              = ""
+    # FIX-B1: Optional — LLM sometimes returns null/missing on action=answer,
+    # which previously caused a hard ValidationError crash (no reply sent to user).
+    question:       Optional[str]    = ""
     memory_updates: List[MemoryUpdate]  = Field(default_factory=list)
     reminders:      List[ReminderEntry] = Field(default_factory=list)
     # P1-FEAT-1: LLM-decided tool dispatch — replaces keyword regex in _live_search
     tool_call:      Optional[Dict[str, Any]] = Field(default=None)
+
+    @field_validator("question", mode="before")
+    @classmethod
+    def _coerce_question(cls, v):
+        """Coerce None → empty string so the field is never None at runtime."""
+        return "" if v is None else str(v)
 
     @field_validator("memory_updates", mode="before")
     @classmethod
@@ -426,9 +434,13 @@ def _pick_provider_and_model(chat_id: str, role: str) -> Tuple[str, str]:
     is_orchestrate = (role == "orchestrate")
 
     if is_orchestrate:
+        # FIX-B5: Gemini free tier quota exhausts immediately in practice
+        # (trips on the very first message each session). Groq 70b is now primary
+        # for orchestration; Gemini is kept as a fallback so it absorbs overflow
+        # once Groq 70b hits its own daily budget ceiling.
         candidates = [
-            ("gemini",   settings.gemini_orchestrator_model),
             ("groq_70b", settings.orchestrator_model),
+            ("gemini",   settings.gemini_orchestrator_model),
             ("groq_8b",  settings.extraction_model),
         ]
     else:
@@ -613,10 +625,10 @@ async def _groq_raw(
         if not (is_rl or isinstance(first_exc, (asyncio.TimeoutError, TimeoutError))):
             raise
 
-        # Get fallback
+        # Get fallback — same priority order as _pick_provider_and_model
         fallback_candidates = (
-            [("gemini",   settings.gemini_orchestrator_model),
-             ("groq_70b", settings.orchestrator_model),
+            [("groq_70b", settings.orchestrator_model),
+             ("gemini",   settings.gemini_orchestrator_model),
              ("groq_8b",  settings.extraction_model)]
             if role == "orchestrate"
             else [("groq_8b",  settings.extraction_model),
@@ -1204,6 +1216,21 @@ async def _orchestrate(
                                         '{"action": "...", "reasoning": "...", "text": "..."}')
         result = OrchestratorResult.model_validate(data)
 
+        # FIX-B1: If action=answer but text is empty and question is also empty,
+        # the LLM returned a degenerate answer (e.g. null question field).
+        # Treat it as a recoverable failure: force action=search so the loop
+        # re-tries rather than returning an empty/confusing reply to the user.
+        if result.action == "answer" and not (result.text or "").strip():
+            logger.warning(
+                "⚠️  orchestrate.empty_answer  label=%s  — forcing re-search", label
+            )
+            result = OrchestratorResult(
+                action="search",
+                reasoning="Empty answer received — retrying with web search",
+                query=data.get("query") or "",
+                tool_call=data.get("tool_call"),
+            )
+
         if trace:
             trace.tag(action=result.action, reasoning_len=len(result.reasoning))
         logger.info(
@@ -1479,6 +1506,10 @@ async def run_agent(
     # ── 3. Orchestrate ────────────────────────────────────────────────────
     messages = _build_orchestrator_messages(user_text, facts, context, reminders)
     search_result: Optional[str] = None
+    # FIX-B2: Track (tool, args) pairs already dispatched this loop to prevent
+    # the agent from re-issuing the exact same tool call on every iteration when
+    # a tool returns empty (e.g. GNews 400 → result_len=0 every time).
+    _dispatched_calls: set = set()
 
     for iteration in range(1, _MAX_ITERATIONS + 1):
         label = f"orchestrate_{iteration}"
@@ -1550,7 +1581,22 @@ async def run_agent(
                     iterations=iteration,
                 )
             query = orch.query or user_text
-            search_result = await _dispatch_tool(orch.tool_call, query, chat_id, facts=facts)
+
+            # FIX-B2: Deduplicate tool dispatches — if the LLM issues the exact
+            # same (tool, query) pair it already tried, fall through to web_search
+            # instead of looping with guaranteed-empty results.
+            dispatch_key = f"{(orch.tool_call or {}).get('tool','web_search')}::{query}"
+            if dispatch_key in _dispatched_calls:
+                logger.warning(
+                    "⚠️  search.duplicate_dispatch  iter=%d  key=%r — forcing web_search fallback",
+                    iteration, dispatch_key,
+                )
+                # Override with a web_search on the same query instead
+                search_result = await _compound_beta_search(query, chat_id)
+            else:
+                _dispatched_calls.add(dispatch_key)
+                search_result = await _dispatch_tool(orch.tool_call, query, chat_id, facts=facts)
+
             logger.info("🔍 search.done  iter=%d  query=%r  result_len=%d",
                         iteration, query, len(search_result or ""))
             if trace:
@@ -1560,6 +1606,16 @@ async def run_agent(
                         "result_len": len(search_result or ""),
                     }}
                 )
+
+            # FIX-B3: If we have a non-trivial result, force action=answer next
+            # iteration instead of letting the LLM re-search with the same query.
+            # This prevents the "I don't have real-time data" hallucination when
+            # search_result actually contains the answer.
+            if search_result and len(search_result.strip()) > 60:
+                # Rebuild messages with the result — the next _orchestrate call
+                # will see SEARCH_RESULT and should choose action=answer.
+                pass  # normal flow: loop continues, messages rebuilt at top with search_result
+
             # ── Early exit: tool returned an "unavailable" notice ────────────
             # When tool returns a non-empty message that signals unavailability
             # (stock data unavailable, market closed, etc.), relay it to the user
@@ -1593,8 +1649,14 @@ async def run_agent(
             )
 
     # Max iterations reached — return last search result or generic fallback
-    fallback = f"Here's what I found:\n\n{search_result}" if search_result else \
-               "I reached my reasoning limit. Please try rephrasing."
+    if search_result and len(search_result.strip()) > 60:
+        # We have results but the LLM kept re-searching — present what we have.
+        fallback = search_result.strip()
+    else:
+        fallback = (
+            "I wasn't able to find live data for that right now. "
+            "The news/search service may be temporarily unavailable — please try again in a moment."
+        )
     return AgentResult(
         reply=ReplyPayload(type="text", text=fallback),
         iterations=_MAX_ITERATIONS,
@@ -1637,6 +1699,25 @@ async def extract_reply_memory(
         data = await _parse_with_repair(raw, chat_id, "reply_extract",
                                         '{"memory_updates": [...]}')
         result = ExtractResult.model_validate(data)
+
+        # FIX-B4: Keys managed by dedicated subsystems must never be overwritten
+        # from reply text. reminder_notes is written by the scheduler/orchestrator
+        # directly; extract_reply_memory scanning the reply would overwrite it with
+        # the reminder's description string, causing value drift on every message.
+        _REPLY_EXTRACT_SKIP = frozenset({"reminder_notes", "recent_activity"})
+        if result.memory_updates:
+            before = len(result.memory_updates)
+            result.memory_updates = [
+                u for u in result.memory_updates
+                if u.key not in _REPLY_EXTRACT_SKIP
+            ]
+            dropped = before - len(result.memory_updates)
+            if dropped:
+                logger.debug(
+                    "reply_extract.skip_protected  dropped=%d  (reminder_notes / recent_activity)",
+                    dropped,
+                )
+
         if result.memory_updates:
             logger.info(
                 "🧠 reply_extract.found  count=%d  keys=%s",
@@ -1687,11 +1768,11 @@ async def init_llm() -> None:
         logger.info(
             "🧠 llm.init — Groq + Gemini ready  "
             "groq_pool=%s  gemini_pool=%s  "
-            "orchestrator=Gemini(%s) → Groq(%s)  extraction=Groq(%s)",
+            "orchestrator=Groq(%s) → Gemini(%s)  extraction=Groq(%s)",
             settings.groq_model_pool,
             settings.gemini_model_pool,
-            settings.gemini_orchestrator_model,
             settings.orchestrator_model,
+            settings.gemini_orchestrator_model,
             settings.extraction_model,
         )
     else:

@@ -216,6 +216,21 @@ class ToolDispatcher:
         symbols = tc.symbols or []
         logger.info("tools.stocks  symbols=%r", symbols)
         result = await get_indian_stocks(symbols)
+
+        # FIX-B7: If result signals unavailability and at least one symbol lacks
+        # an exchange suffix, retry with .NS appended (NSE India).
+        # e.g. "PAYTM" → "PAYTM.NS". Skips symbols that already have a dot.
+        if result and ("unavailable" in result.lower() or "not recognised" in result.lower()):
+            ns_symbols = [
+                s if "." in s else f"{s}.NS"
+                for s in symbols
+            ]
+            if ns_symbols != symbols:
+                logger.info("tools.stocks.retry_ns  symbols=%r", ns_symbols)
+                retry = await get_indian_stocks(ns_symbols)
+                if retry and "unavailable" not in retry.lower():
+                    return retry or ""
+
         return result or ""
 
     async def _currency(self, tc: CurrencyTool) -> str:
