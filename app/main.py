@@ -1,14 +1,9 @@
 """
-main.py — Shimmi v3.0.3
+main.py — Shimmi v3.2.0
 
-Changes vs v3.0.2:
-  - Added Gemini to integrity check (GEMINI_API_KEY warning if absent)
-  - Updated startup log to show provider chain (Gemini → Groq 70B → Groq 8B)
-  - Improved _rate_limit_reply: handles both Groq and Gemini quota messages
-  - Health endpoint: shows per-provider circuit state + token budget usage
-  - _reply_extract_and_save_bg: uses updated extract_reply_memory() signature
-  - All LLM errors now always produce a user-facing WhatsApp reply (no silent
-    failures even when all providers are exhausted)
+Changes vs v3.1.0:
+  - Version bump to match agent_engine.py and mcp_server.py
+  - Health endpoint version updated
 """
 from __future__ import annotations
 
@@ -523,16 +518,14 @@ async def process_message(
                 trace.tag(final_len=len(reply_with_sig))
 
             # ── 5b. reply-extract (ambient memory) ──────────────────────────
-            # Awaited here — before memory_save — so facts found in the bot's
-            # own reply text land in the DB in the same turn they were said.
-            # Only runs when the reply is a statement (not a question/ask_user).
-            _re_action = getattr(result.reply, "action", None) or                          getattr(result.reply, "intent", None) or                          getattr(result.reply, "type", None)
-            _re_text = getattr(result.reply, "text", None) or ""
-            _reply_is_question = (
-                (isinstance(_re_action, str) and _re_action == "ask_user")
-                or (len(_re_text) < 120 and _re_text.rstrip().endswith("?"))
-            )
-            if not _reply_is_question and _re_text:
+            # Runs after a genuine LLM response to capture data the bot confirmed.
+            # Skipped for shortcut responses — the bot echoed an existing DB value;
+            # there is nothing new to extract. Running it there wastes ~140ms and
+            # risks re-saving a stale value over a freshly updated one.
+            _re_text     = getattr(result.reply, "text", None) or ""
+            _is_shortcut = getattr(result, "provider_used", "") == "shortcut"
+            _is_question = (len(_re_text) < 120 and _re_text.rstrip().endswith("?"))
+            if _re_text and not _is_shortcut and not _is_question:
                 with trace.step("reply_extract"):
                     await _reply_extract_and_save_bg(
                         chat_id=chat_id,
@@ -544,7 +537,7 @@ async def process_message(
 
             # ── 6. persist memory + reminders ──────────────────────────────
             with trace.step("memory_save"):
-                saved = created = updated = 0
+                saved = created = updated = unchanged = 0
                 save_errors: List[str] = []
 
                 if database.sqlite_store:
@@ -554,104 +547,6 @@ async def process_message(
 
                     for mu in result.memory_updates:
                         try:
-                            # ── FIX-RD1: _cancel_reminder special key ─────────────
-                            # The orchestrator signals a reminder cancellation by
-                            # emitting {"key":"_cancel_reminder","value":"<text hint>"}.
-                            # We fuzzy-match against pending reminders and call
-                            # cancel_reminder() on the DB. This is the ONLY correct
-                            # path — previously the LLM was just writing a
-                            # reminders_pending fact and saying "deleted" with no
-                            # actual DB change, so reminders would still fire.
-                            if mu.key == "_cancel_reminder":
-                                hint = (mu.value or "").strip()
-                                if hint:
-                                    cancelled_rem = None
-
-                                    # ── Try ID-based cancel first (foolproof) ──
-                                    # The LLM is shown [ID:N] in the reminders list
-                                    # and echoes the number — parse and cancel by
-                                    # exact row id.  No fuzzy matching needed.
-                                    import re as _re
-                                    id_match = _re.search(r"\b(\d+)\b", hint)
-                                    if id_match:
-                                        reminder_id = int(id_match.group(1))
-                                        ok = await database.sqlite_store.cancel_reminder(
-                                            reminder_id
-                                        )
-                                        if ok:
-                                            # Fetch the text for the confirmation reply
-                                            all_rems = await database.sqlite_store.get_user_reminders(
-                                                sender_key, include_sent=True
-                                            )
-                                            for _r in all_rems:
-                                                if _r.id == reminder_id:
-                                                    cancelled_rem = _r
-                                                    break
-                                            if cancelled_rem is None:
-                                                # Cancelled but couldn't fetch text —
-                                                # create a minimal stand-in
-                                                from .database import Reminder as _Rem
-                                                import datetime as _dt
-                                                cancelled_rem = _Rem(
-                                                    id=reminder_id,
-                                                    whatsapp_id=sender_key,
-                                                    chat_id=chat_id,
-                                                    reminder_text=hint,
-                                                    trigger_iso="",
-                                                    created_at="",
-                                                )
-                                            logger.info(
-                                                "🔔 reminder.cancel_by_id  sender=%s  id=%d",
-                                                sender_key, reminder_id,
-                                            )
-
-                                    # ── Fallback: fuzzy text match ───────────
-                                    if cancelled_rem is None:
-                                        cancelled_rem = await database.sqlite_store.cancel_reminder_by_text(
-                                            sender_key, hint,
-                                        )
-
-                                    if cancelled_rem:
-                                        logger.info(
-                                            "🔔 reminder.cancel_ok  sender=%s  id=%d  text=%r",
-                                            sender_key, cancelled_rem.id,
-                                            cancelled_rem.reminder_text[:60],
-                                        )
-                                        saved += 1
-                                        cancel_confirm = (
-                                            f"✅ Reminder cancelled: "
-                                            f"*{cancelled_rem.reminder_text}*"
-                                        )
-                                        object.__setattr__(result.reply, "text", cancel_confirm)
-                                    else:
-                                        logger.warning(
-                                            "🔔 reminder.cancel_no_match  sender=%s  hint=%r",
-                                            sender_key, hint[:60],
-                                        )
-                                        no_match_reply = (
-                                            f"⚠️ I couldn't find a pending reminder matching "
-                                            f"*{hint}*.\n"
-                                            "Reply *what reminders do I have* to see "
-                                            "your current reminders with their IDs."
-                                        )
-                                        object.__setattr__(result.reply, "text", no_match_reply)
-                                continue  # do not fall through to upsert
-
-                            # ── FIX-RD2: block transient display keys from being ──
-                            # saved as permanent facts. The orchestrator sometimes
-                            # writes reminders_pending as a memory_update containing
-                            # the formatted reminder list string — this is a display
-                            # artifact, not a persistent fact.
-                            _TRANSIENT_KEYS = frozenset({
-                                "reminders_pending", "pending_reminders",
-                                "reminders_list", "active_reminders",
-                            })
-                            if mu.key in _TRANSIENT_KEYS:
-                                logger.debug(
-                                    "memory.skip_transient  sender=%s  key=%s",
-                                    sender_key, mu.key,
-                                )
-                                continue
                             if getattr(mu, "delete", False):
                                 # P1-FEAT-2 + P1-GUARD: guarded deletion
                                 confirmed = getattr(mu, "confirm", False)
@@ -704,17 +599,20 @@ async def process_message(
                                 )
                                 if status == "created":
                                     created += 1
+                                    saved += 1
                                     logger.info(
                                         "🧠 memory.new      sender=%s  key=%s  value=%r",
                                         sender_key, mu.key, mu.value,
                                     )
                                 elif status == "updated":
                                     updated += 1
+                                    saved += 1
                                     logger.info(
                                         "🧠 memory.updated  sender=%s  key=%s  value=%r",
                                         sender_key, mu.key, mu.value,
                                     )
-                                saved += 1
+                                else:  # "unchanged"
+                                    unchanged += 1
                         except Exception as exc:
                             err_msg = f"{type(exc).__name__}: {exc}"
                             save_errors.append(f"{mu.key}: {err_msg}")
@@ -734,14 +632,14 @@ async def process_message(
 
                 trace.tag(
                     facts_saved=saved, facts_created=created, facts_updated=updated,
-                    facts_attempted=len(result.memory_updates),
+                    facts_unchanged=unchanged, facts_attempted=len(result.memory_updates),
                     **( {"save_errors": "; ".join(save_errors)} if save_errors else {} ),
                 )
                 if result.memory_updates:
                     logger.info(
                         "🧠 memory.summary  sender=%s  attempted=%d  "
-                        "created=%d  updated=%d  errors=%d",
-                        sender_key, len(result.memory_updates), created, updated, len(save_errors),
+                        "created=%d  updated=%d  unchanged=%d  errors=%d",
+                        sender_key, len(result.memory_updates), created, updated, unchanged, len(save_errors),
                     )
                 else:
                     logger.info("🧠 memory.none  sender=%s", sender_key)
@@ -829,27 +727,23 @@ async def lifespan(app: FastAPI):
     logger.info("🕐 scheduler.task_created")
 
     port = int(os.getenv("PORT", "6000"))
-    # FIX-A: Orchestrator priority is now Groq 70b → Gemini → Groq 8b.
-    # Gemini free tier exhausts immediately; Groq 70b is the real primary.
-    primary_orch = f"Groq({settings.orchestrator_model})"
-    fallback_orch = (
-        f" → Gemini({settings.gemini_orchestrator_model})"
-        if settings.gemini_enabled else ""
+    primary_orch = (
+        f"Gemini({settings.gemini_orchestrator_model})"
+        if settings.gemini_enabled
+        else f"Groq({settings.orchestrator_model})"
     )
     logger.info(
         "🚀 startup.ready  http://0.0.0.0:%d  "
         "allowlist=%d  allow_all=%s  live_search=%s  chroma=%s  "
-        "orchestrator=%s%s → Groq(%s)  extraction=%s  gemini=%s",
+        "primary_orchestrator=%s  extraction=%s  gemini=%s",
         port,
         len(settings.allowed_chat_jids or []),
         settings.allow_all_chats,
         settings.live_search_enabled,
         settings.chroma_enabled,
         primary_orch,
-        fallback_orch,
         settings.extraction_model,
-        settings.extraction_model,
-        "✅" if settings.gemini_enabled else "❌ (set GEMINI_API_KEY for extra quota)",
+        "✅" if settings.gemini_enabled else "❌ (set GEMINI_API_KEY for 15× more quota)",
     )
 
     yield
@@ -982,7 +876,7 @@ async def health():
     }
     return {
         "status":            "ok",
-        "version":           "3.0.3",
+        "version":           "3.2.0",
         "workers":           len(CHAT_WORKERS),
         "queues":            {cid: q.qsize() for cid, q in CHAT_QUEUES.items()},
         "providers": {

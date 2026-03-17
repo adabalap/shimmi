@@ -1,15 +1,25 @@
 """
-logging_setup.py — Shimmi v2.8.0
+logging_setup.py — Shimmi v3.2.0
 
-Changes vs v2.7.0:
-  - uvicorn.error set to INFO (not WARNING) so the startup "Uvicorn running on…"
-    message appears — this is the startup listener log the user needs.
-  - uvicorn.protocols.* stays at CRITICAL (port-scanner noise unchanged)
+Changes vs v2.8.0:
+  FIX   Added _InvalidHttpFilter to suppress "Invalid HTTP request received"
+        WARNING spam from port-scanners and health-check probes that hit the
+        plain-HTTP port with TLS or non-HTTP traffic. Completely harmless but
+        previously flooded the log on every port scan.
+  KEEP  uvicorn.error stays at INFO so the startup "Uvicorn running on…"
+        message still appears.
+  KEEP  uvicorn.protocols.* stays at CRITICAL (port-scanner noise).
 """
 from __future__ import annotations
 
 import logging
 import os
+
+
+class _InvalidHttpFilter(logging.Filter):
+    """Suppress uvicorn's harmless 'Invalid HTTP request received' warnings."""
+    def filter(self, record: logging.LogRecord) -> bool:
+        return "Invalid HTTP request received" not in record.getMessage()
 
 
 def setup_logging() -> None:
@@ -49,10 +59,14 @@ def setup_logging() -> None:
         logging.getLogger(name).setLevel(logging.CRITICAL)
 
     # ── uvicorn server lifecycle — INFO so startup message appears ────────
-    # This lets through: "Uvicorn running on http://0.0.0.0:6000 (Press CTRL+C to quit)"
     logging.getLogger("uvicorn").setLevel(logging.INFO)
     logging.getLogger("uvicorn.error").setLevel(logging.INFO)
 
-    # ── trace + tx always visible ──────────────────────────────────────────
+    # ── suppress port-scanner "Invalid HTTP request received" noise ───────
+    _filter = _InvalidHttpFilter()
+    logging.getLogger("uvicorn.error").addFilter(_filter)
+    logging.getLogger("uvicorn").addFilter(_filter)
+
+    # ── trace + tx always visible ─────────────────────────────────────────
     logging.getLogger("app.trace").setLevel(logging.INFO)
     logging.getLogger("app.tx").setLevel(logging.INFO)

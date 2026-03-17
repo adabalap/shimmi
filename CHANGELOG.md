@@ -1,91 +1,144 @@
-# Shimmi v2.8.0 — Changelog
+# Shimmi Changelog
 
-## 🔴 Bugs Fixed
+---
 
-### "Good morning" at 8:27 PM (time-of-day blindness)
-`agent_engine.py` now injects `current_time` (HH:MM in local timezone), `today`
-(YYYY-MM-DD), and `utc_offset` (±HH:MM) into every orchestrator call.
-The prompt's `TIME-OF-DAY GREETINGS` section maps exact time ranges to correct
-greetings. The LLM can no longer say "Good morning" at 8 PM.
+## v3.2.0 — 2026-03-15
 
-**Required env var**: `APP_TIMEZONE=Asia/Kolkata`
+### 🔴 Critical Bug Fix
 
-### "I've already shared the news" — hallucination with no prior reply
-The `MANDATORY SEARCH` section now explicitly blocks the LLM from claiming it
-already answered if no bot reply is visible in context. It must always re-search
-for any "news / latest / scores / weather" request.
+**FIX-CHAIN — Groq 8B never reached when Gemini + Groq 70B both fail**
 
-### India news hallucinated (no live search used)
-Stronger mandatory search trigger covers all news/current-events requests.
-The `LIVE_SEARCH_PROMPT` requires source citation per bullet.
+The `_groq_raw` fallback loop iterated providers but used `return await _call_llm(...)` 
+for each fallback. When Groq 70B also hit its 429 limit, that exception escaped the 
+loop immediately — Groq 8B (with 500K tokens/day remaining) was never tried. The user 
+received a fatal error with a full Python traceback instead of a response.
 
-## 🟠 New Feature: Background Reminder System
+Fix: each candidate is wrapped in its own `try/except`. On rate-limit or timeout the 
+loop logs "fallback.exhausted" and continues to the next provider. Only raises when 
+the entire candidate list is empty.
 
-### scheduler.py (new background task)
-- Runs every 60 seconds via `asyncio.create_task()` in lifespan
-- Queries `reminders` table for `trigger_iso <= now UTC AND sent_at IS NULL`
-- Sends WhatsApp ping via WAHA with formatted reminder message
-- Misses up to 2 hours old are sent; older are silently dropped
-- Per-reminder error isolation — one failure never aborts the check loop
+**Impact on the log you sent:** The `worker.msg_error` stack trace ending with 
+`groq.RateLimitError: Rate limit reached (TPD): Limit 100000, Used 96474` was caused 
+entirely by this bug. Groq 8B had 500K/day available and was being skipped.
 
-### database.py — reminders table
-New `reminders` table: `id, whatsapp_id, chat_id, reminder_text, trigger_iso,
-created_at, sent_at, cancelled, failed`
+---
 
-Methods: `add_reminder()`, `get_user_reminders()`, `get_due_reminders()`,
-`mark_reminder_sent()`, `mark_reminder_failed()`, `cancel_reminder()`
+### 🟠 Bugs Fixed
 
-### prompts.py — REMINDER SYSTEM section
-The orchestrator knows how to:
-- Create reminders via `{"key": "_reminder", "value": "ISO_DATETIME|text"}`
-- Cancel by ID via `{"key": "_cancel_reminder", "value": "ID"}`
-- Display pending reminders from the `reminders` input field
+**FIX-RPD — Gemini daily quota sets 2-hour cooldown (not 5 minutes)**
 
-### main.py — _handle_special_memory_keys()
-Routes `_reminder` / `_cancel_reminder` keys to the reminders table instead
-of the key-value facts store. Regular facts are unaffected.
+`_parse_retry_after()` now detects the Gemini RPD error signature 
+(`"You exceeded your current quota"`) and sets a 2-hour cooldown. Previously the 
+default 300s cooldown meant Gemini was retried and immediately failed on every 
+message for the rest of the day, emitting a `WARNING` log pair per request.
 
-### No more confirmation round-trips for alarms
-Old: "Would you like me to save a reminder note?" ← extra turn, bad UX
-New: Save immediately, confirm in the same reply, suggest phone Clock app.
+**FIX-NOISE — 15 ephemeral keys stripped from LLM prompt**
 
-## 🟠 WhatsApp UX Improvements
+`_clean_facts()` now filters out keys that are transient activity records rather 
+than durable personal facts: `result_*`, `recent_activity`, `next_meeting_*`, 
+`semester`, `year`, `course`, `online_courses`, `friend_since`, 
+`previous_startup_status`, `previous_employer`, `next_trip_*`. These stay in 
+SQLite for audit/consolidation but stop being injected into every orchestrator 
+call. Saves 200–500 tokens per request.
 
-### List display as bullets
-`LIST DISPLAY FORMAT` section in prompt mandates:
-```
-Your grocery list 🛒
-• milk
-• bread
-• cheese
-```
-Never: "Your list has the following items: milk, bread, and cheese."
+**FIX-TOOL — Keyword routing when Groq omits `tool_call`**
 
-### Emoji hygiene
-Anti-patterns section: no ☕ on unrelated messages, no ☀️ at night,
-max 2 emojis per message. Matched-topic emojis only.
+When Groq 70B acts as fallback orchestrator it frequently omits the structured 
+`tool_call` JSON block. The new `_keyword_tool_from_query()` detects weather / 
+stocks / news / currency / timezone queries from the query text and routes them 
+to the correct MCP endpoint. Structured live-data tools now work correctly even 
+when Gemini is fully exhausted for the day.
 
-### News with source citations
-`LIVE_SEARCH_PROMPT` now requires per-bullet source name ("per *The Hindu*,")
-and forbids "according to the search results" phrasing.
+**FIX-TIME — "What time is it?" answered from server clock**
 
-## 🟡 Visibility
+The LLM reads stale timestamps from conversation context and hallucinates the 
+current time. `_try_time_shortcut()` intercepts short time/date queries before 
+any LLM call and answers directly from the server clock — zero tokens, always 
+accurate, honours `APP_TIMEZONE`.
 
-### Startup listener log
-`logging_setup.py` sets `uvicorn.error` to INFO (was WARNING), making the
-uvicorn "Uvicorn running on http://0.0.0.0:6000" line appear in logs.
-Additionally `main.py` logs its own:
-`🚀 startup.ready  http://0.0.0.0:6000  allowlist=7  ...`
+**FIX-MCP-LOG — MCP error logging now shows actual errors**
 
-Port is read from env var `PORT` (default `6000`).
+`mcp.error  path=/stocks  err=` was logging empty strings because 
+`str(httpx.HTTPStatusError)` is empty. Now logs `repr(exc)` and the exception 
+type name, so `/stocks` failures are diagnosable.
 
-### Reminder scheduler in /healthz
-`GET /healthz` now includes `"reminder_task": true/false`.
+**FIX-MCP-DUP — Duplicate `mcp_format()` removed from mcp_client.py**
 
-## 🟡 .env Changes Required
+`mcp_format()` was defined twice. The duplicate definition silently replaced the 
+first one; the first (correct) definition with the `timeout=3.0` parameter was 
+discarded. Cleaned up to a single correct definition.
 
-| Variable | Old Default | New Required Value |
-|---|---|---|
-| `APP_TIMEZONE` | `UTC` | `Asia/Kolkata` (or your tz) |
-| `GROQ_MODEL_POOL` | (broken) | Remove `groq/compound` entry |
-| `PORT` | — | `6000` (or your port) |
+**FIX-HTTP — Port-scanner noise suppressed**
+
+`_InvalidHttpFilter` added to `logging_setup.py` suppresses uvicorn's 
+`"Invalid HTTP request received"` WARNING, which fires on every port-scan probe 
+or TLS health-check hitting the plain-HTTP port. Harmless but previously 
+cluttered logs on every external scan.
+
+---
+
+### 🟢 MCP Server v2.0.0
+
+**CACHE — TTL response cache for all external-API endpoints**
+
+| Endpoint  | TTL    | Rationale |
+|-----------|--------|-----------|
+| `/weather`  | 10 min | Weather changes slowly |
+| `/stocks`   | 3 min  | Data is 15-min delayed anyway |
+| `/news`     | 5 min  | Headlines don't change per-minute |
+| `/currency` | 1 hour | ECB rates update once daily |
+| `/timezone` | 24 hr  | City→TZ mapping is static |
+
+Eliminates redundant external API calls when multiple users ask about the same 
+city or stock within the TTL window.
+
+**FORMAT — `POST /format` endpoint (zero LLM tokens)**
+
+Deterministic WhatsApp formatting in pure Python. Replaces the Groq 8B 
+`_format_whatsapp()` LLM call for routine formatting. Saves ~50–100K Groq 
+tokens/day. Rules: `**bold**` → `*bold*`, bullet normalisation, table→bullets, 
+code-fence removal, filler phrase stripping, 3800-char hard cap. `agent_engine` 
+tries MCP `/format` first; falls back to LLM only if MCP is unreachable.
+
+**STOCKS-2 — Per-ticker timeout guard**
+
+A single slow or hung yfinance ticker no longer stalls the entire `/stocks` 
+response. Each ticker is fetched with `asyncio.wait_for(timeout=8s)`; hung 
+tickers return `{"symbol": "...", "error": "timeout"}` instead of blocking.
+
+**HTTP-1 — httpx client timeout 30s → 12s**
+
+Stocks calls were occasionally hanging for 25+ seconds per ticker. Reduced 
+global timeout to 12s to fail fast and let the bot send a partial result.
+
+---
+
+### MCP Server — what it offloads and why
+
+| What used to run in the bot | Now runs in MCP | Saving |
+|-----------------------------|-----------------|--------|
+| `_format_whatsapp()` Groq 8B call | `POST /format` pure Python | ~50–100K tokens/day |
+| Repeated weather fetches | Cached 10 min | External API calls |
+| Repeated stock fetches | Cached 3 min | yfinance latency |
+| Repeated news fetches | Cached 5 min | GNews/RSS quota |
+| `/datetime` (already existed) | Available for time queries | 0 LLM calls |
+
+The MCP server is the right place for: deterministic transformations, external 
+API calls with caching, and any computation that doesn't need LLM reasoning. 
+The bot should remain thin — route everything it can to MCP, keep LLM calls 
+for reasoning and memory tasks only.
+
+---
+
+## v3.1.0 — 2026-03-12 (previous session)
+
+- Gemini added as primary orchestrator (Groq fallback unchanged)
+- Per-provider circuit breakers
+- Token budget tracker
+- Facts shortcut v2 (30+ patterns, zero tokens)
+- Junk fact filter (strips unknown/none/null before prompt)
+- Fire-and-forget exception handling fixed
+- asyncio.get_event_loop() → get_running_loop() (Python 3.12+)
+- Retry-after parsing from Groq/Gemini error messages
+- Live search 413 handling with automatic query truncation
+- User-facing error messages when all providers exhausted

@@ -221,12 +221,7 @@ def normalize_key(raw: str) -> str:
     k = re.sub(r"_+", "_", k)
     if k.startswith("user_"):
         k = k[5:]
-    # Preserve leading underscore for special system keys before stripping
-    _is_special = any(k.startswith(p.lstrip("_")) for p in _SPECIAL_PREFIXES)
-    if _is_special and raw.strip().startswith("_"):
-        k = "_" + k.lstrip("_")
-    else:
-        k = k.strip("_")
+    k = k.strip("_")
     if not k or k == "user":
         return ""
     return _KEY_ALIASES.get(k, k)
@@ -567,39 +562,6 @@ class SQLiteMemory:
 
     # ── reminders API ──────────────────────────────────────────────────────
 
-    async def get_messages_by_date_range(
-        self,
-        chat_id: str,
-        from_ts: str,
-        to_ts: str,
-        limit: int = 300,
-    ) -> list:
-        """
-        Fetch message_log rows for chat_id between from_ts and to_ts (ISO strings).
-
-        Returns list of dicts: {direction, text, ts}
-        Ordered oldest-first so callers get a natural conversation arc.
-        Capped at `limit` rows (most recent within the window) to avoid
-        feeding a giant transcript to the LLM.
-        """
-        async with self._lock:
-            def _do():
-                with sqlite3.connect(self.path) as conn:
-                    conn.row_factory = sqlite3.Row
-                    rows = conn.execute(
-                        "SELECT direction, text, ts FROM message_log "
-                        "WHERE chat_id=? AND ts >= ? AND ts <= ? "
-                        "ORDER BY ts DESC LIMIT ?",
-                        (chat_id, from_ts, to_ts, limit),
-                    ).fetchall()
-                    # Reverse so oldest is first
-                    return [
-                        {"direction": r["direction"], "text": r["text"], "ts": r["ts"]}
-                        for r in reversed(rows)
-                    ]
-            return await asyncio.to_thread(_do)
-
-
     async def add_reminder(
         self,
         whatsapp_id: str,
@@ -818,81 +780,6 @@ class SQLiteMemory:
                     conn.commit()
                     return cur.rowcount > 0
             return await asyncio.to_thread(_do)
-
-    async def cancel_reminder_by_text(
-        self,
-        whatsapp_id: str,
-        text_hint: str,
-    ) -> Optional["Reminder"]:
-        """
-        Cancel the pending reminder whose text best matches text_hint.
-
-        Uses substring matching with a simple scoring heuristic:
-          - exact match scores 100
-          - all words in hint present in reminder text scores 80
-          - any word in hint present scores proportionally
-
-        Returns the cancelled Reminder object if found, None otherwise.
-        This is the primary cancel path used by the bot — the LLM provides
-        the reminder description as a text hint, we do the ID lookup.
-        """
-        import difflib
-
-        reminders = await self.get_user_reminders(whatsapp_id)
-        pending = [r for r in reminders if r.status == "pending"]
-        if not pending:
-            return None
-
-        hint_lower = text_hint.strip().lower()
-        hint_words = set(w for w in re.split(r"\W+", hint_lower) if len(w) > 2)
-
-        best_score = 0.0
-        best_reminder: Optional[Reminder] = None
-
-        for r in pending:
-            rt = r.reminder_text.strip().lower()
-
-            # Exact match
-            if hint_lower == rt:
-                best_score = 100.0
-                best_reminder = r
-                break
-
-            # Substring
-            if hint_lower in rt or rt in hint_lower:
-                score = 90.0
-            else:
-                # Word overlap
-                rt_words = set(w for w in re.split(r"\W+", rt) if len(w) > 2)
-                if hint_words and rt_words:
-                    overlap = len(hint_words & rt_words)
-                    score = 70.0 * overlap / max(len(hint_words), len(rt_words))
-                else:
-                    # Sequence matcher fallback
-                    score = difflib.SequenceMatcher(None, hint_lower, rt).ratio() * 60
-
-            if score > best_score:
-                best_score = score
-                best_reminder = r
-
-        # Require at least 40% confidence to avoid accidental cancellations
-        if best_score < 40.0 or best_reminder is None:
-            logger.warning(
-                "cancel_reminder_by_text.no_match  sender=%s  hint=%r  "
-                "best_score=%.1f  pending=%d",
-                whatsapp_id, text_hint[:60], best_score, len(pending),
-            )
-            return None
-
-        cancelled = await self.cancel_reminder(best_reminder.id)
-        if cancelled:
-            logger.info(
-                "🔔 reminder.cancelled  id=%d  sender=%s  text=%r  score=%.1f",
-                best_reminder.id, whatsapp_id, best_reminder.reminder_text[:60], best_score,
-            )
-            return best_reminder
-
-        return None
 
     async def get_due_reminders(self) -> List[Reminder]:
         """Return all unfired, non-cancelled reminders whose trigger time <= now (UTC).

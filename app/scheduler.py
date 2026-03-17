@@ -137,9 +137,7 @@ async def _fire_due_reminders() -> None:
         msg_lines.append("")
         msg_lines.append(r.reminder_text)
         msg_lines.append("")
-        # Include the reminder ID so the user can reference it to cancel
-        # e.g. "delete reminder 12" → exact ID-based cancel, no fuzzy matching
-        msg_lines.append(f"_[ID:{r.id}] — reply 'delete reminder {r.id}' to remove_")
+        msg_lines.append("_— Shimmi memory system_")
         msg = "\n".join(msg_lines)
 
         try:

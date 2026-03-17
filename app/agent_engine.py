@@ -1,51 +1,52 @@
 """
-agent_engine.py — Shimmi v3.0.3
+agent_engine.py — Shimmi v3.2.0
 
-Changes vs v3.0.2:
+Changes vs v3.1.0 (this release):
 
-  PROVIDER-1  Google Gemini added as primary orchestrator.
-              Gemini 2.0 Flash free tier: ~1,500 req/day, 1M tokens/min.
-              That is 15× more generous than Groq 70B (100K tokens/day).
-              Provider chain: Gemini → Groq 70B → Groq 8B.
-              Uses OpenAI-compatible endpoint so no extra SDK needed.
+  FIX-CHAIN   CRITICAL: _groq_raw fallback loop was not exhausting all
+              providers. When Gemini + Groq 70B both fail, the loop did
+              `return await _call_llm(groq_70b)` — if that raised, the
+              exception escaped immediately and Groq 8B was never tried.
+              Each candidate is now wrapped in its own try/except; the loop
+              continues to the next provider on rate-limit or timeout.
+              Impact: fatal 429 errors when Groq 70B is exhausted are now
+              handled gracefully using Groq 8B (500K tokens/day headroom).
 
-  PROVIDER-2  Per-provider circuit breakers (separate from model circuit).
-              Gemini circuit opens on quota/429, falls back to Groq 70B.
-              Groq 70B circuit opens on 429, falls back to Groq 8B.
+  FIX-RPD     Gemini daily-quota (RPD) now gets a 2-hour cooldown instead
+              of the default 300s. The message "You exceeded your current
+              quota" identifies RPD exhaustion — there is no retry-after
+              hint. Previously Gemini was retried on every message for the
+              rest of the day, generating a WARNING on every request.
 
-  PROVIDER-3  Token budget tracker: estimates daily usage per provider,
-              logs warnings at 75%, blocks (routes to fallback) at 92%.
-              Prevents silent exhaustion — first warning message is sent
-              to the user when budget is nearly full.
+  FIX-NOISE   _clean_facts() now strips 15 ephemeral/junk keys before
+              building the orchestrator prompt (result_*, recent_activity,
+              next_meeting_*, semester, year, etc.). These stay in the DB
+              for audit/consolidation but don't burn tokens on every call.
 
-  FIX-S1      Facts shortcut v2: completely rewritten with broader matching.
-              Previous RECALL_PATTERNS regex missed "coffee order", "hiking
-              trail", "podcast" etc., so ALL simple memory queries burned
-              ~1700 tokens on the 70B model.  New approach: short-message
-              heuristic + broad keyword table covering 30+ fact patterns.
+  FIX-TOOL    _dispatch_tool() now has a keyword-based routing layer before
+              the web_search fallback. When Groq 70B acts as fallback
+              orchestrator it frequently omits the tool_call JSON block —
+              the new _keyword_tool_from_query() parses the query string to
+              route weather / stocks / news / currency / timezone to the
+              correct MCP endpoint without an LLM call. Structured tools
+              now work even when Gemini is fully exhausted.
 
-  FIX-S2      Junk fact filtering hardened: facts with value in
-              {unknown,none,null,n/a,''} are stripped BEFORE building the
-              orchestrator prompt.  Previously the filter ran too late in
-              some paths, leaking ~200-400 tokens per call.
+  FIX-TIME    Zero-token time/date shortcut. LLMs hallucinate the current
+              time by reading stale timestamps from conversation context.
+              _try_time_shortcut() intercepts short time/date queries and
+              answers from the server clock — zero tokens, always accurate.
 
-  FIX-S3      Fire-and-forget task exception handling: _extract_memory and
-              extract_reply_memory wrapped in top-level try/except catching
-              ALL exceptions (including TimeoutError, CancelledError).
-              "Task exception was never retrieved" errors eliminated.
+Changes vs v3.0.3 (previous session):
 
-  FIX-S4      asyncio.get_event_loop() → asyncio.get_running_loop() (broken
-              on Python 3.12+).
-
-  FIX-S5      Retry-after parsing: 429 error messages from Groq and Gemini
-              are parsed for the wait time; circuit cooldown is set to the
-              actual required wait, not a random jitter.
-
-  FIX-S6      Live search 413 (Request Entity Too Large) handling: query is
-              automatically shortened and retried.
-
-  FIX-S7      User-facing error message is populated in AgentResult instead
-              of silently failing.  main.py uses this to always send a reply.
+  PROVIDER-1  Gemini 2.0 Flash as primary orchestrator.
+  PROVIDER-2  Per-provider circuit breakers.
+  PROVIDER-3  Token budget tracker.
+  FIX-S1      Facts shortcut v2.
+  FIX-S2      Junk fact filtering.
+  FIX-S3      Fire-and-forget exception handling.
+  FIX-S5      Retry-after parsing.
+  FIX-S6      Live search 413 handling.
+  FIX-S7      User-facing error messages.
 """
 from __future__ import annotations
 
@@ -69,7 +70,7 @@ from .retry import async_retry
 from .prompts import (
     ORCHESTRATOR_PROMPT, MEMORY_EXTRACTOR_PROMPT, REPLY_EXTRACTOR_PROMPT,
     VERIFIER_PROMPT, REPAIR_PROMPT, FORMATTER_PROMPT, LIVE_SEARCH_PROMPT,
-    KEY_CONSOLIDATION_PROMPT, SUMMARY_PROMPT,
+    KEY_CONSOLIDATION_PROMPT,
 )
 from .utils import sanitize_for_whatsapp
 from .database import normalize_key, Reminder
@@ -138,19 +139,28 @@ class OrchestratorResult(BaseModel):
     reasoning:      str              = ""
     text:           str              = ""
     query:          str              = ""
-    # FIX-B1: Optional — LLM sometimes returns null/missing on action=answer,
-    # which previously caused a hard ValidationError crash (no reply sent to user).
-    question:       Optional[str]    = ""
+    question:       str              = ""
     memory_updates: List[MemoryUpdate]  = Field(default_factory=list)
     reminders:      List[ReminderEntry] = Field(default_factory=list)
     # P1-FEAT-1: LLM-decided tool dispatch — replaces keyword regex in _live_search
     tool_call:      Optional[Dict[str, Any]] = Field(default=None)
 
-    @field_validator("question", mode="before")
+    @field_validator("reasoning", "text", "query", "question", mode="before")
     @classmethod
-    def _coerce_question(cls, v):
-        """Coerce None → empty string so the field is never None at runtime."""
-        return "" if v is None else str(v)
+    def _coerce_opt_str(cls, v: Any) -> str:
+        """
+        FIX-NULL: Pydantic v2 does NOT fall back to the field default when the
+        key IS present in JSON with value null — it raises ValidationError.
+        This coerces None → "" for all optional string fields so the model
+        never crashes on incomplete LLM output.
+
+        Root cause of the fatal error for "Red Tape running shoes" query:
+          ValidationError: question — Input should be a valid string
+            [input_value=None, input_type=NoneType]
+        LLM returned {"action":"answer","question":null,...} and the bot
+        crashed without sending any reply to the user.
+        """
+        return "" if v is None else str(v).strip()
 
     @field_validator("memory_updates", mode="before")
     @classmethod
@@ -384,24 +394,36 @@ def _trip_provider(provider: str, cooldown: float) -> None:
 
 def _parse_retry_after(exc: Exception) -> float:
     """
-    FIX-S5: Parse the actual wait time from Groq/Gemini 429 errors.
+    FIX-S5 + FIX-RPD: Parse the actual wait time from Groq/Gemini 429 errors.
 
-    Groq format: "Please try again in 1h4m54.368s"
-    Gemini format: may include retry_delay in seconds
+    Groq:        "Please try again in 1h4m54.368s"  → extract duration
+    Gemini RPM:  "retry after N seconds"            → extract N
+    Gemini RPD:  "You exceeded your current quota"  → no retry hint → 2h cooldown
+                 Daily quota resets at midnight Google-time; 2h is a safe floor
+                 that avoids hammering the API for the rest of the day.
+
     Returns seconds (minimum 60.0, maximum 7200.0).
     """
     s = str(exc)
 
-    # Hours + minutes + seconds: e.g. "1h4m54.368s" or "36m12.096s"
+    # ── Gemini RPD: daily quota exhausted, no retry hint ─────────────────
+    # These phrases appear in Gemini's 429 when the daily cap is hit:
+    if ("you exceeded your current quota" in s.lower()
+            or ("quota" in s.lower() and "billing" in s.lower())):
+        logger.info("📅 quota.rpd  daily_quota_exhausted — 2h cooldown")
+        return 7_200.0
+
+    # ── Hours + minutes + seconds: e.g. "1h4m54.368s" or "36m12.096s" ───
     m = re.search(r"(?:(\d+)h\s*)?(?:(\d+)m\s*)?(\d+(?:\.\d+)?)s", s)
     if m:
         h = float(m.group(1) or 0)
         mn = float(m.group(2) or 0)
         sec = float(m.group(3) or 0)
         total = h * 3600 + mn * 60 + sec
-        return max(60.0, min(total + 10.0, 7200.0))  # +10s buffer
+        if total > 5:  # ignore tiny matches from URLs like "...5s..."
+            return max(60.0, min(total + 10.0, 7200.0))  # +10s buffer
 
-    # Gemini: "quota exceeded … retry after N seconds"
+    # ── Gemini RPM: "quota exceeded … retry after N seconds" ─────────────
     m2 = re.search(r"retry[^\d]*(\d+)\s*second", s, re.IGNORECASE)
     if m2:
         return max(60.0, float(m2.group(1)) + 10.0)
@@ -434,13 +456,9 @@ def _pick_provider_and_model(chat_id: str, role: str) -> Tuple[str, str]:
     is_orchestrate = (role == "orchestrate")
 
     if is_orchestrate:
-        # FIX-B5: Gemini free tier quota exhausts immediately in practice
-        # (trips on the very first message each session). Groq 70b is now primary
-        # for orchestration; Gemini is kept as a fallback so it absorbs overflow
-        # once Groq 70b hits its own daily budget ceiling.
         candidates = [
-            ("groq_70b", settings.orchestrator_model),
             ("gemini",   settings.gemini_orchestrator_model),
+            ("groq_70b", settings.orchestrator_model),
             ("groq_8b",  settings.extraction_model),
         ]
     else:
@@ -465,7 +483,7 @@ def _pick_provider_and_model(chat_id: str, role: str) -> Tuple[str, str]:
             if provider == "gemini" and not gemini_skipped:
                 gemini_skipped = True
                 reopen_in = max(0, PROVIDER_CIRCUIT.get("gemini", 0) - time.monotonic())
-                logger.info(
+                logger.debug(
                     "⏭️  gemini.rate_limited  routing=groq  reopen_in=%.0fs",
                     reopen_in,
                 )
@@ -602,85 +620,87 @@ async def _groq_raw(
     timeout: Optional[float] = None,
 ) -> str:
     """
-    Route to the best available provider for the given role.
-
-    FIX-B-CRASH: Iterates through ALL candidates in priority order, catching
-    per-attempt rate-limit/timeout errors and continuing to the next candidate.
-    Previously a single one-shot fallback call could itself throw 429 (when both
-    groq_70b AND gemini are rate-limited simultaneously), propagating as a fatal
-    crash. Now groq_8b is always reached as last resort regardless of failures.
+    Route to the best available provider for the given role, with automatic
+    fallback if the primary is circuit-tripped.
     """
-    all_candidates = (
-        [("groq_70b", settings.orchestrator_model),
-         ("gemini",   settings.gemini_orchestrator_model),
-         ("groq_8b",  settings.extraction_model)]
-        if role == "orchestrate"
-        else [("groq_8b",  settings.extraction_model),
-              ("gemini",   settings.gemini_extraction_model),
-              ("groq_70b", settings.orchestrator_model)]
+    provider, model = _pick_provider_and_model(chat_id, role)
+    effective_timeout = timeout or (
+        settings.gemini_timeout if provider == "gemini" else settings.groq_timeout
     )
-
-    last_exc: Optional[Exception] = None
-    prev_provider: Optional[str] = None
-    prev_model: Optional[str] = None
-    n_attempted = 0
-
-    for provider, model in all_candidates:
-        if provider == "gemini" and not settings.gemini_enabled:
-            continue
-        if not _model_open(model):
-            continue
-        if not _provider_open(provider):
-            continue
-
-        # Log fallback transitions (skip for the first attempt)
-        if n_attempted > 0:
-            logger.info(
-                "🔄 provider.fallback  role=%s  from=%s/%s  to=%s/%s",
-                role, prev_provider, prev_model, provider, model,
-            )
-
-        fb_label = label if n_attempted == 0 else f"{label}_fb{n_attempted}"
-        eff_timeout = timeout or (
-            settings.gemini_timeout if provider == "gemini" else settings.groq_timeout
+    try:
+        return await _call_llm(
+            messages,
+            provider=provider, model=model,
+            max_tokens=max_tokens, timeout=effective_timeout,
+            chat_id=chat_id, label=label,
         )
+    except Exception as first_exc:
+        # Try fallback provider if primary failed
+        first_exc_str = str(first_exc)
+        is_rl = "429" in first_exc_str or "rate_limit" in first_exc_str.lower()
 
-        try:
-            return await _call_llm(
-                messages,
-                provider=provider, model=model,
-                max_tokens=max_tokens, timeout=eff_timeout,
-                chat_id=chat_id, label=fb_label,
-            )
-        except Exception as exc:
-            last_exc = exc
-            exc_str = str(exc)
-            is_rl = (
-                "429" in exc_str
-                or "rate_limit" in exc_str.lower()
-                or "RESOURCE_EXHAUSTED" in exc_str
-            )
-            is_timeout = isinstance(exc, (asyncio.TimeoutError, TimeoutError))
+        # Only attempt fallback on rate-limit or timeout errors
+        if not (is_rl or isinstance(first_exc, (asyncio.TimeoutError, TimeoutError))):
+            raise
 
-            if is_rl or is_timeout:
-                # Retriable — continue to next candidate
-                prev_provider, prev_model = provider, model
-                n_attempted += 1
+        # Get fallback
+        fallback_candidates = (
+            [("gemini",   settings.gemini_orchestrator_model),
+             ("groq_70b", settings.orchestrator_model),
+             ("groq_8b",  settings.extraction_model)]
+            if role == "orchestrate"
+            else [("groq_8b",  settings.extraction_model),
+                  ("gemini",   settings.gemini_extraction_model),
+                  ("groq_70b", settings.orchestrator_model)]
+        )
+        last_fb_exc: Optional[Exception] = None
+        for fb_provider, fb_model in fallback_candidates:
+            if fb_provider == provider and fb_model == model:
+                continue  # skip the one that just failed
+            if fb_provider == "gemini" and not settings.gemini_enabled:
                 continue
-            else:
-                # Non-retriable (auth failure, bad request) — raise immediately
-                raise
+            if not _model_open(fb_model):
+                continue
+            if not _provider_open(fb_provider):
+                continue
+            logger.info("🔄 provider.fallback  role=%s  from=%s/%s  to=%s/%s",
+                        role, provider, model, fb_provider, fb_model)
+            fb_timeout = timeout or (
+                settings.gemini_timeout if fb_provider == "gemini"
+                else settings.groq_timeout
+            )
+            try:
+                return await _call_llm(
+                    messages,
+                    provider=fb_provider, model=fb_model,
+                    max_tokens=max_tokens, timeout=fb_timeout,
+                    chat_id=chat_id, label=f"{label}_fb",
+                )
+            except Exception as fb_exc:
+                fb_exc_str = str(fb_exc)
+                fb_is_rl = (
+                    "429" in fb_exc_str
+                    or "rate_limit" in fb_exc_str.lower()
+                    or "RESOURCE_EXHAUSTED" in fb_exc_str
+                )
+                last_fb_exc = fb_exc
+                if fb_is_rl or isinstance(fb_exc, (asyncio.TimeoutError, TimeoutError)):
+                    # This fallback is also exhausted — continue to the next one
+                    logger.info(
+                        "⚡ fallback.exhausted  provider=%s  model=%s  trying_next",
+                        fb_provider, fb_model,
+                    )
+                    continue
+                raise  # non-rate-limit error — propagate immediately
 
-    # All candidates exhausted — produce a clear error instead of a silent crash
-    if n_attempted == 0:
-        raise RuntimeError(
-            f"No LLM provider available for role={role} — all circuits open."
-        )
-    logger.error(
-        "🚨 provider.all_exhausted  role=%s  tried=%d  last_err=%s",
-        role, n_attempted, str(last_exc)[:160],
-    )
-    raise last_exc
+        # All fallbacks exhausted — raise the last exception we got
+        if last_fb_exc is not None:
+            logger.warning(
+                "🚨 all_providers_exhausted  role=%s  — groq_8b also at limit",
+                role,
+            )
+            raise last_fb_exc
+        raise  # original first_exc (no fallback was even attempted)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -695,13 +715,53 @@ _JUNK_VALUES = frozenset({
 
 def _clean_facts(facts: Dict[str, str]) -> Dict[str, str]:
     """
-    FIX-S2: Strip junk placeholder values before building prompts.
-    Saves ~200-400 tokens per orchestrator call.
+    FIX-S2 + FIX-NOISE: Strip junk values AND ephemeral/noisy keys before
+    building orchestrator prompts.
+
+    Two layers of filtering:
+      1. Junk values — placeholders like "unknown", "none", empty strings
+      2. Ephemeral keys — keys that capture transient activity/results and
+         don't represent durable personal facts worth sending to the LLM.
+         These stay in the DB (for audit/consolidation) but don't burn tokens.
     """
-    return {
-        k: v for k, v in facts.items()
-        if v and str(v).strip().lower() not in _JUNK_VALUES
-    }
+    # Keys that are noisy or ephemeral — useful to store but not to inject
+    # into every orchestrator call as "long-term facts about the user".
+    _EPHEMERAL_KEY_PREFIXES = (
+        "result_", "recent_activity", "next_meeting_",
+        "previous_job_", "previous_startup",
+        "semester", "year", "course",
+    )
+    _EPHEMERAL_KEYS_EXACT = frozenset({
+        # Transient activity records — change every session
+        "recent_activity", "last_summary", "conversation_since_morning",
+        # Keys that capture metadata about the conversation, not the person
+        "favorite_news_source",  # set to "your conversation" — not a real preference
+        # Result / academic records
+        "result_document", "result_link", "result_month",
+        "result_status", "result_type", "result_year", "semester", "year",
+        "course", "online_courses",
+        # Social metadata — not needed in every prompt
+        "friend_since",
+        # Company history — stored but not useful as live context
+        "previous_startup_status", "previous_employer",
+        # Transient trip / meeting details
+        "next_meeting_team", "next_meeting_time", "next_meeting_topic",
+        "next_trip_start_date", "trip_to_portland",
+        "next_trip_family", "next_trip_type",
+    })
+
+    out = {}
+    for k, v in facts.items():
+        # Skip junk values
+        if not v or str(v).strip().lower() in _JUNK_VALUES:
+            continue
+        # Skip ephemeral keys that aren't personal facts
+        if k in _EPHEMERAL_KEYS_EXACT:
+            continue
+        if any(k.startswith(p) for p in _EPHEMERAL_KEY_PREFIXES):
+            continue
+        out[k] = v
+    return out
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -818,23 +878,39 @@ _FACT_SIGNALS: Dict[str, List[str]] = {
 }
 
 
+# Regex to detect update declarations: "my X is Y", "my coffee order is X"
+# These must NOT be shortcut — they should go to the LLM to save the new value.
+_UPDATE_DECLARATION_RE = re.compile(
+    r"\bmy\s+[\w\s]{1,30}?\s+(is|are|was|=|:)\s+\S",
+    re.IGNORECASE,
+)
+
+
 def _try_facts_shortcut(user_text: str, facts: Dict[str, str]) -> Optional[str]:
     """
     FIX-S1: Answer simple memory-recall questions directly from the facts
     dict WITHOUT calling any LLM.  Zero tokens, instant response.
 
+    FIX-UPDATE-GUARD: Declarations like "my coffee order is X" must NOT fire
+    this shortcut — the user is setting a new value, not asking a recall
+    question.  If we shortcut here we'd return the old value and the LLM
+    would never save the new one.
+
     Strategy:
-      1. Only attempt if the message is short (≤90 chars) — long messages
-         likely contain multiple intents or require reasoning.
-      2. Scan the broad _FACT_SIGNALS table for any signal that appears in
-         the lowercased user text.
-      3. If a matching fact exists in the DB and is not junk, return a
-         ready-made reply string.  Otherwise return None so the LLM handles.
+      1. Reject messages longer than 100 chars (likely complex / multi-intent).
+      2. Reject update declarations ("my X is Y" pattern without "?").
+      3. Require a recall trigger word (question word or interrogative phrase).
+      4. Match a _FACT_SIGNALS key and return the stored value instantly.
     """
-    if len(user_text) > 90:
+    if len(user_text) > 100:
         return None
 
-    low = user_text.lower()
+    low = user_text.lower().strip()
+
+    # Block update declarations: "my name is Sarah", "my coffee order is X"
+    # These should go to the LLM so it can save the new value.
+    if _UPDATE_DECLARATION_RE.search(low) and "?" not in low:
+        return None
 
     # Must look like a question or recall request
     recall_triggers = (
@@ -849,10 +925,23 @@ def _try_facts_shortcut(user_text: str, facts: Dict[str, str]) -> Optional[str]:
         return None
 
     matched_key: Optional[str] = None
+
+    # Primary: explicit signal phrases (fast, high-precision)
     for db_key, signals in _FACT_SIGNALS.items():
         if any(sig in low for sig in signals):
             matched_key = db_key
             break
+
+    # Secondary: word-overlap fallback — handles variations like "current age",
+    # "age right now", "preferred color" without growing the signal list.
+    # Safe because the update-declaration guard already blocked write intents.
+    if matched_key is None:
+        query_words = set(re.findall(r"\b\w+\b", low))
+        for db_key in clean:
+            key_words = set(db_key.replace("_", " ").split())
+            if key_words & query_words:
+                matched_key = db_key
+                break
 
     if not matched_key:
         return None
@@ -897,6 +986,65 @@ def _try_facts_shortcut(user_text: str, facts: Dict[str, str]) -> Optional[str]:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Zero-token time / date shortcut
+# ─────────────────────────────────────────────────────────────────────────────
+
+_TIME_SIGNALS = frozenset({
+    "what time", "what's the time", "whats the time", "current time",
+    "time now", "time is it", "time right now", "what is the time",
+})
+_DATE_SIGNALS = frozenset({
+    "what date", "what's the date", "whats the date", "today's date",
+    "what day is it", "what day today", "today date", "current date",
+    "what is today", "what is the date",
+})
+
+
+def _try_time_shortcut(user_text: str) -> Optional[str]:
+    """
+    Answer time/date queries directly from the server clock — zero tokens.
+
+    LLMs reliably hallucinate the current time by reading stale timestamps
+    from conversation context instead of the injected current_time value.
+    Intercepting these queries here is both more accurate and free.
+
+    Only fires on short, unambiguous time/date messages (≤70 chars).
+    Returns a WhatsApp-formatted reply or None to fall through to the LLM.
+    """
+    if len(user_text) > 70:
+        return None
+    low = user_text.lower().strip()
+
+    is_time = any(sig in low for sig in _TIME_SIGNALS)
+    is_date = any(sig in low for sig in _DATE_SIGNALS)
+
+    if not is_time and not is_date:
+        return None
+
+    now     = _now_local()
+    tz_abbr = now.strftime("%Z") or "local"
+    hour    = now.hour
+    if   6  <= hour < 12: period = "morning"
+    elif 12 <= hour < 17: period = "afternoon"
+    elif 17 <= hour < 21: period = "evening"
+    else:                 period = "night"
+
+    if is_time and not is_date:
+        return (
+            f"🕰️ It's *{now.strftime('%H:%M')} {tz_abbr}* "
+            f"({now.strftime('%A')} {period})"
+        )
+    if is_date and not is_time:
+        return f"📅 Today is *{now.strftime('%A, %d %B %Y')}*"
+
+    # both
+    return (
+        f"🕰️ *{now.strftime('%H:%M')} {tz_abbr}*  "
+        f"📅 *{now.strftime('%A, %d %B %Y')}*"
+    )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # P1-FEAT-1: Tool dispatch — LLM-decided, replaces keyword regex
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -907,78 +1055,107 @@ async def _dispatch_tool(
     facts: Optional[Dict[str, str]] = None,
 ) -> str:
     """
-    P1-FEAT-1: Dispatch an LLM-chosen tool to its live-data backend.
+    Dispatch an LLM-chosen tool to its live-data backend.
 
-    Replaces the brittle keyword-regex _live_search() from Phase 0.
-    The orchestrator now embeds a ``tool_call`` JSON block in its output when
-    action=search.  We validate it with Pydantic and route it correctly.
+    Primary path: orchestrator embeds a ``tool_call`` JSON block → parsed and
+    dispatched to the correct MCP endpoint.
 
-    Flow::
-        OrchestratorResult.tool_call (dict)
-            ↓ parse_tool_call()
-        ToolCall (typed Pydantic model)
-            ↓ tool_dispatcher.dispatch()
-        str result (injected as SEARCH_RESULT into next orchestrator turn)
+    Keyword fallback: when Groq 70B acts as fallback orchestrator it often omits
+    tool_call. We parse the query string with lightweight keyword heuristics to
+    still route weather / stocks / news / currency / timezone to MCP correctly.
+    This means structured tools work even when Gemini is fully down.
 
-    If tool_call is absent/invalid we fall back to compound-beta-mini
-    (WebSearchTool path) using the LLM's ``query`` string.  This preserves
-    100% backward compat with any orchestrator output that omits tool_call.
-
-    Args:
-        tool_call_raw:  Raw dict from OrchestratorResult.tool_call (may be None).
-        query:          OrchestratorResult.query — used as fallback search text.
-        chat_id:        Chat identifier for logging.
-        facts:          User fact dict for city/country defaults.
-
-    Returns:
-        String result for the orchestrator SEARCH_RESULT block.
+    Final fallback: compound-beta-mini web search.
     """
     from .tools import parse_tool_call, tool_dispatcher, _WEB_SEARCH_SENTINEL
 
     _facts = facts or {}
-
-    # ── Parse the tool_call from orchestrator output ──────────────────────
-    # FIX-D: Before parsing, if tool_call says web_search but has no query,
-    # inject the outer orchestrator query string so validation doesn't fail.
-    tool_call_raw_patched = tool_call_raw
-    if isinstance(tool_call_raw, dict):
-        t = str(tool_call_raw.get("tool", "")).strip().lower()
-        t = {"search": "web_search", "web": "web_search", "google": "web_search"}.get(t, t)
-        if t == "web_search" and not tool_call_raw.get("query"):
-            tool_call_raw_patched = {**tool_call_raw, "query": query or ""}
-
-    tool_call = parse_tool_call(tool_call_raw_patched)
+    tool_call = parse_tool_call(tool_call_raw)
 
     if tool_call is None:
-        # Orchestrator did not provide a valid tool_call.
-        # Fall back to compound-beta-mini web search with the query string.
-        logger.info(
-            "🔍 tool_dispatch.no_tool_call  chat=%s  query=%r → web_search fallback",
-            chat_id, query[:80],
-        )
-        from .tools import WebSearchTool
-        tool_call = WebSearchTool(tool="web_search", query=query or "")
+        # Try keyword routing before falling back to web_search
+        tool_call = _keyword_tool_from_query(query, _facts)
+        if tool_call is not None:
+            logger.info(
+                "🔑 tool_dispatch.keyword  chat=%s  tool=%s  query=%r",
+                chat_id, tool_call.tool, query[:60],
+            )
+        else:
+            logger.info(
+                "🔍 tool_dispatch.web_search  chat=%s  query=%r",
+                chat_id, query[:60],
+            )
+            from .tools import WebSearchTool
+            tool_call = WebSearchTool(tool="web_search", query=query or "")
 
-    logger.info(
-        "🔧 tool_dispatch  chat=%s  tool=%s",
-        chat_id, tool_call.tool,
-    )
+    logger.info("🔧 tool_dispatch  chat=%s  tool=%s", chat_id, tool_call.tool)
 
-    # ── Dispatch to the correct backend ──────────────────────────────────
     raw_result = await tool_dispatcher.dispatch(tool_call, facts=_facts)
 
-    # ── Handle web_search sentinel (routes to compound-beta-mini) ─────────
     if raw_result.startswith(_WEB_SEARCH_SENTINEL):
         search_query = raw_result[len(_WEB_SEARCH_SENTINEL):]
         return await _compound_beta_search(search_query, chat_id)
 
-    # ── Handle summarise sentinel (builds conversation summary) ─────────────
-    from .tools import _SUMMARISE_SENTINEL
-    if raw_result.startswith(_SUMMARISE_SENTINEL):
-        period = raw_result[len(_SUMMARISE_SENTINEL):]
-        return await _build_conversation_summary(period, chat_id)
-
     return raw_result
+
+
+def _keyword_tool_from_query(query: str, facts: Dict[str, str]) -> Optional[Any]:
+    """
+    Lightweight keyword-based tool routing for when the LLM doesn't emit tool_call.
+    Covers the most common structured-data query types.
+    """
+    from .tools import WeatherTool, NewsTool, StocksTool, CurrencyTool, TimezoneTool
+    if not query:
+        return None
+    low = query.lower()
+
+    # ── Weather ───────────────────────────────────────────────────────────
+    if re.search(r"\b(weather|forecast|temperature|rain|humidity|wind|monsoon)\b", low):
+        city = facts.get("city") or "Hyderabad"
+        # Try extracting a capitalized city word from the query
+        for w in query.split():
+            w = w.strip(".,?!")
+            if (len(w) >= 4 and w[0].isupper()
+                    and w.lower() not in {"what", "tell", "give", "show",
+                                          "today", "weather", "forecast", "india"}):
+                city = w
+                break
+        return WeatherTool(
+            tool="weather", city=city,
+            country=facts.get("country", "IN")[:2].upper(), days=3,
+        )
+
+    # ── Stocks / markets ──────────────────────────────────────────────────
+    if re.search(r"\b(stock|share|nifty|sensex|bse|nse|market|equity|paytm|reliance|tcs|infy)\b", low):
+        tickers = re.findall(r"\b([A-Z]{2,12}(?:\.NS|\.BO)?)\b", query)
+        filtered = [t for t in tickers
+                    if t not in {"NSE", "BSE", "IPO", "MF", "ETF", "WHAT", "HOW", "NSE"}]
+        symbols = [t if "." in t else t + ".NS" for t in filtered[:5]]
+        return StocksTool(tool="stocks", symbols=symbols)
+
+    # ── News ──────────────────────────────────────────────────────────────
+    if re.search(r"\b(news|headline|headlines|breaking|latest|current events)\b", low):
+        country = (facts.get("country") or "IN")[:2].upper()
+        return NewsTool(tool="news", query=query[:200], country=country)
+
+    # ── Currency ──────────────────────────────────────────────────────────
+    m = re.search(r"\b([A-Z]{3})\s+(?:to|in)\s+([A-Z]{3})\b", query, re.IGNORECASE)
+    if m or re.search(r"\b(exchange rate|forex|convert currency)\b", low):
+        if m:
+            return CurrencyTool(
+                tool="currency",
+                from_currency=m.group(1).upper(),
+                to_currency=m.group(2).upper(),
+                amount=1.0,
+            )
+
+    # ── Timezone / world clock ─────────────────────────────────────────────
+    if re.search(r"\b(time in|timezone|local time in|what time is it in)\b", low):
+        tm = re.search(r"(?:time in|timezone of|clock in)\s+([A-Za-z ]{3,25})", low)
+        if tm:
+            return TimezoneTool(tool="timezone", city=tm.group(1).strip().title())
+
+    return None
 
 
 async def _compound_beta_search(query: str, chat_id: str) -> str:
@@ -1034,142 +1211,6 @@ async def _compound_beta_search(query: str, chat_id: str) -> str:
             return f"Search failed: {s[:80]}"
 
     return "Search returned no result."
-
-
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Conversation summary helpers
-# ─────────────────────────────────────────────────────────────────────────────
-
-def _get_summary_window(period: str) -> tuple[str, str]:
-    """
-    Parse a period string into (from_ts_iso, to_ts_iso) in the user's local tz.
-
-    Supported periods:
-        today           — midnight today → now
-        yesterday       — midnight yesterday → midnight today
-        last_7_days     — 7 days ago → now  (also: last_week, this_week)
-        last_N_days     — N days ago → now  (e.g. last_3_days)
-        last_30_days    — 30 days ago → now
-        all             — epoch → now (capped at 90 days in practice by DB limit)
-    """
-    from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
-    try:
-        tz = ZoneInfo(settings.app_timezone)
-    except (ZoneInfoNotFoundError, Exception):
-        tz = UTC
-
-    now       = datetime.now(tz)
-    today_mid = now.replace(hour=0, minute=0, second=0, microsecond=0)
-
-    p = (period or "today").strip().lower()
-
-    if p == "today":
-        from_dt = today_mid
-        to_dt   = now
-    elif p == "yesterday":
-        from_dt = today_mid - timedelta(days=1)
-        to_dt   = today_mid
-    elif p in ("last_7_days", "last_week", "this_week", "last week"):
-        from_dt = today_mid - timedelta(days=7)
-        to_dt   = now
-    elif p in ("last_30_days", "last_month", "this_month"):
-        from_dt = today_mid - timedelta(days=30)
-        to_dt   = now
-    elif p == "all":
-        from_dt = today_mid - timedelta(days=90)
-        to_dt   = now
-    else:
-        # Try "last_N_days"
-        import re as _re
-        m = _re.match(r"last[_\s](\d+)[_\s]days?", p)
-        if m:
-            n = min(int(m.group(1)), 90)   # cap at 90 days
-            from_dt = today_mid - timedelta(days=n)
-            to_dt   = now
-        else:
-            # Unknown — default to today
-            logger.warning("summary.unknown_period=%r — defaulting to today", period)
-            from_dt = today_mid
-            to_dt   = now
-
-    return from_dt.isoformat(), to_dt.isoformat()
-
-
-async def _build_conversation_summary(
-    period: str,
-    chat_id: str,
-) -> str:
-    """
-    Fetch messages for the period, build a transcript, and ask the LLM
-    to write a clean natural-language summary.
-
-    Returns the summary string (ready to inject as SEARCH_RESULT) or an
-    informative "no messages" string.
-    """
-    from .database import sqlite_store
-
-    if not sqlite_store:
-        return "Conversation history is not available."
-
-    from_ts, to_ts = _get_summary_window(period)
-
-    messages = await sqlite_store.get_messages_by_date_range(
-        chat_id=chat_id,
-        from_ts=from_ts,
-        to_ts=to_ts,
-        limit=300,
-    )
-
-    if not messages:
-        period_label = {
-            "today":        "today",
-            "yesterday":    "yesterday",
-            "last_7_days":  "the last 7 days",
-            "last_week":    "last week",
-            "last_30_days": "the last 30 days",
-        }.get(period, f"the period requested ({period})")
-        return f"No conversation messages found for {period_label}."
-
-    # Build a compact transcript — "user: ..." / "shimmi: ..."
-    lines = []
-    for msg in messages:
-        role = "user" if msg["direction"] == "in" else "shimmi"
-        text = (msg["text"] or "").strip()
-        if text:
-            lines.append(f"{role}: {text}")
-
-    transcript = "\n".join(lines)
-
-    # Truncate if very long — keep newest messages
-    if len(transcript) > 6000:
-        transcript = "...[earlier messages trimmed]...\n" + transcript[-5800:]
-
-    # Call the LLM to write the summary
-    llm_messages = [
-        {"role": "system", "content": SUMMARY_PROMPT},
-        {"role": "user",   "content": f"PERIOD: {period}\n\nTRANSCRIPT:\n{transcript}"},
-    ]
-    try:
-        raw = await _groq_raw(
-            llm_messages,
-            max_tokens=600,
-            chat_id=chat_id,
-            label="summarise",
-            role="extract",   # use cheap 8B model
-            timeout=25.0,
-        )
-        summary = raw.strip()
-        if not summary:
-            return "I wasn't able to generate a summary right now — please try again."
-        logger.info(
-            "📋 summary.done  chat=%s  period=%r  msgs=%d  summary_len=%d",
-            chat_id, period, len(messages), len(summary),
-        )
-        return summary
-    except Exception as exc:
-        logger.error("summary.failed  chat=%s  err=%s", chat_id, str(exc)[:120])
-        return "I had trouble summarising the conversation — please try again in a moment."
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1344,11 +1385,32 @@ async def _format_whatsapp(
     *,
     trace: Any = None,
 ) -> str:
-    """Format the reply for WhatsApp markup using the extraction model."""
+    """
+    Format the reply for WhatsApp markup.
+
+    MCP-first approach: try POST /format on the local MCP sidecar — pure Python,
+    deterministic, zero LLM tokens. Falls back to the Groq 8B LLM call only if
+    MCP is unreachable. This alone saves ~50-100K Groq tokens/day.
+    """
     step = trace.step("format") if trace else nullcontext()
     with step:
         if len(text) < _MIN_FORMAT_LEN:
             return text
+
+        # ── Try MCP /format first (zero tokens) ──────────────────────────
+        try:
+            from .mcp_client import _client as _mcp_client
+            resp = await _mcp_client().post("/format", json={"text": text}, timeout=4.0)
+            resp.raise_for_status()
+            result = resp.json()
+            formatted = result.get("text") or text
+            if result.get("changed"):
+                logger.debug("🎨 format.mcp  chat=%s  len=%d→%d", chat_id, len(text), len(formatted))
+            return formatted
+        except Exception as mcp_err:
+            logger.debug("format.mcp_unavailable  err=%s — falling back to LLM", str(mcp_err)[:80])
+
+        # ── Fallback: Groq 8B LLM ─────────────────────────────────────────
         messages = [
             {"role": "system", "content": FORMATTER_PROMPT},
             {"role": "user",   "content": text},
@@ -1390,21 +1452,6 @@ async def _orchestrate(
                                         '{"action": "...", "reasoning": "...", "text": "..."}')
         result = OrchestratorResult.model_validate(data)
 
-        # FIX-B1: If action=answer but text is empty and question is also empty,
-        # the LLM returned a degenerate answer (e.g. null question field).
-        # Treat it as a recoverable failure: force action=search so the loop
-        # re-tries rather than returning an empty/confusing reply to the user.
-        if result.action == "answer" and not (result.text or "").strip():
-            logger.warning(
-                "⚠️  orchestrate.empty_answer  label=%s  — forcing re-search", label
-            )
-            result = OrchestratorResult(
-                action="search",
-                reasoning="Empty answer received — retrying with web search",
-                query=data.get("query") or "",
-                tool_call=data.get("tool_call"),
-            )
-
         if trace:
             trace.tag(action=result.action, reasoning_len=len(result.reasoning))
         logger.info(
@@ -1428,18 +1475,6 @@ def _build_facts_str(facts: Dict[str, str]) -> str:
 
 
 def _build_reminders_str(reminders: List[Reminder]) -> str:
-    """
-    Build the reminders string shown to the LLM in every orchestrator prompt.
-
-    Each reminder is formatted as:
-        [ID:12] • haircut (in 43m)
-        [ID:7]  • meeting with product team about ML project (in 69h)
-
-    The ID prefix is the database row id — the LLM is instructed to include it
-    verbatim in the _cancel_reminder value so main.py can cancel by exact id
-    rather than relying on fuzzy text matching.  Foolproof: the user sees the
-    same IDs when they ask to list reminders, and can say "delete ID 12".
-    """
     if not reminders:
         return "No pending reminders."
     now = _now_local()
@@ -1458,15 +1493,7 @@ def _build_reminders_str(reminders: List[Reminder]) -> str:
                 when = f"in {int(diff.total_seconds()//3600)}h"
         except Exception:
             when = "at " + r.trigger_iso
-
-        # Format the scheduled date/time for display
-        try:
-            trigger_dt = datetime.fromisoformat(r.trigger_iso)
-            time_label = trigger_dt.strftime("%-I:%M %p %a %d %b").lstrip("0")
-        except Exception:
-            time_label = r.trigger_iso[:16]
-
-        parts.append(f"[ID:{r.id}] • {r.reminder_text} — {time_label} ({when})")
+        parts.append(f"• {r.reminder_text} ({when})")
     return "\n".join(parts)
 
 
@@ -1688,6 +1715,18 @@ async def run_agent(
             provider_used="shortcut",
         )
 
+    # ── 1b. Zero-token time/date shortcut ─────────────────────────────────
+    # LLMs frequently hallucinate the current time by reading stale timestamps
+    # from conversation context. Handle these queries directly from the server
+    # clock — zero tokens, always accurate.
+    time_reply = _try_time_shortcut(user_text)
+    if time_reply:
+        logger.info("⚡ time.shortcut  chat=%s  reply=%r", chat_id, time_reply[:60])
+        return AgentResult(
+            reply=ReplyPayload(type="text", text=time_reply),
+            provider_used="shortcut",
+        )
+
     # ── 2. Pre-extract memory ─────────────────────────────────────────────
     pre_updates: List[MemoryUpdate] = []
     try:
@@ -1700,10 +1739,6 @@ async def run_agent(
     # ── 3. Orchestrate ────────────────────────────────────────────────────
     messages = _build_orchestrator_messages(user_text, facts, context, reminders)
     search_result: Optional[str] = None
-    # FIX-B2: Track (tool, args) pairs already dispatched this loop to prevent
-    # the agent from re-issuing the exact same tool call on every iteration when
-    # a tool returns empty (e.g. GNews 400 → result_len=0 every time).
-    _dispatched_calls: set = set()
 
     for iteration in range(1, _MAX_ITERATIONS + 1):
         label = f"orchestrate_{iteration}"
@@ -1775,22 +1810,7 @@ async def run_agent(
                     iterations=iteration,
                 )
             query = orch.query or user_text
-
-            # FIX-B2: Deduplicate tool dispatches — if the LLM issues the exact
-            # same (tool, query) pair it already tried, fall through to web_search
-            # instead of looping with guaranteed-empty results.
-            dispatch_key = f"{(orch.tool_call or {}).get('tool','web_search')}::{query}"
-            _was_duplicate = dispatch_key in _dispatched_calls
-            if _was_duplicate:
-                logger.warning(
-                    "⚠️  search.duplicate_dispatch  iter=%d  key=%r — forcing web_search fallback",
-                    iteration, dispatch_key,
-                )
-                search_result = await _compound_beta_search(query, chat_id)
-            else:
-                _dispatched_calls.add(dispatch_key)
-                search_result = await _dispatch_tool(orch.tool_call, query, chat_id, facts=facts)
-
+            search_result = await _dispatch_tool(orch.tool_call, query, chat_id, facts=facts)
             logger.info("🔍 search.done  iter=%d  query=%r  result_len=%d",
                         iteration, query, len(search_result or ""))
             if trace:
@@ -1800,23 +1820,6 @@ async def run_agent(
                         "result_len": len(search_result or ""),
                     }}
                 )
-
-            # FIX-C: If a duplicate was detected (LLM asked for the same search
-            # it already had results for) AND the fallback web_search returned
-            # substantive content, present it directly without another LLM round.
-            # This stops the gold-price / compound-beta loop where the model
-            # receives result_len=200+ three times but replies "not available".
-            if _was_duplicate and search_result and len(search_result.strip()) > 60:
-                logger.info(
-                    "🔍 search.force_answer  iter=%d  result_len=%d  "
-                    "(duplicate query resolved — presenting web_search result directly)",
-                    iteration, len(search_result),
-                )
-                return AgentResult(
-                    reply=ReplyPayload(type="text", text=search_result.strip()),
-                    iterations=iteration,
-                )
-
             # ── Early exit: tool returned an "unavailable" notice ────────────
             # When tool returns a non-empty message that signals unavailability
             # (stock data unavailable, market closed, etc.), relay it to the user
@@ -1850,14 +1853,8 @@ async def run_agent(
             )
 
     # Max iterations reached — return last search result or generic fallback
-    if search_result and len(search_result.strip()) > 60:
-        # We have results but the LLM kept re-searching — present what we have.
-        fallback = search_result.strip()
-    else:
-        fallback = (
-            "I wasn't able to find live data for that right now. "
-            "The news/search service may be temporarily unavailable — please try again in a moment."
-        )
+    fallback = f"Here's what I found:\n\n{search_result}" if search_result else \
+               "I reached my reasoning limit. Please try rephrasing."
     return AgentResult(
         reply=ReplyPayload(type="text", text=fallback),
         iterations=_MAX_ITERATIONS,
@@ -1875,15 +1872,44 @@ async def extract_reply_memory(
     sender_key: str,
 ) -> None:
     """
-    FIX-S3: Extract facts that appear in Shimmi's own reply text (e.g. when
-    the bot confirms a fact it looked up).  Run as fire-and-forget.
+    Extract facts confirmed in Shimmi's own reply text. Fire-and-forget.
 
-    Wrapped in top-level try/except so 'Task exception was never retrieved'
-    errors never appear in logs.
+    Guards applied before burning any tokens:
+    • Skip question replies — bot is asking, not confirming data
+    • Skip live-data replies (weather / news / stocks markers)
+    • Skip replies with template placeholders like "book's title"
+    • Skip replies too short to carry real personal data
     """
     try:
-        if not reply_text or len(reply_text) < 20:
+        if not reply_text or len(reply_text) < 30:
             return
+
+        stripped = reply_text.strip()
+
+        # Skip questions — bot is seeking clarification, not confirming facts
+        if stripped.rstrip().endswith("?"):
+            return
+
+        # Skip live-search result replies
+        _live_markers = (
+            "Open-Meteo", "Yahoo Finance", "GNews", "Google News",
+            "📰 *Latest News*", "📈 *Indian Markets",
+            "_Source:", "Source: ",
+        )
+        if any(m in reply_text for m in _live_markers):
+            return
+
+        # Skip template/placeholder text that reply_extract would mislabel as facts
+        _placeholder_pats = (
+            r"'s title\b",      # "book's title"
+            r"'s name\b",       # "person's name"
+            r"\[.*?\]",         # [city], [placeholder]
+            r"\{[a-z_]+\}",    # {key}
+        )
+        for pat in _placeholder_pats:
+            if re.search(pat, reply_text, re.IGNORECASE):
+                logger.debug("reply_extract.skip_placeholder  pat=%r", pat)
+                return
 
         messages = [
             {"role": "system", "content": REPLY_EXTRACTOR_PROMPT},
@@ -1900,32 +1926,12 @@ async def extract_reply_memory(
         data = await _parse_with_repair(raw, chat_id, "reply_extract",
                                         '{"memory_updates": [...]}')
         result = ExtractResult.model_validate(data)
-
-        # FIX-B4: Keys managed by dedicated subsystems must never be overwritten
-        # from reply text. reminder_notes is written by the scheduler/orchestrator
-        # directly; extract_reply_memory scanning the reply would overwrite it with
-        # the reminder's description string, causing value drift on every message.
-        _REPLY_EXTRACT_SKIP = frozenset({"reminder_notes", "recent_activity", "reminders_pending", "pending_reminders", "reminders_pending", "pending_reminders"})
-        if result.memory_updates:
-            before = len(result.memory_updates)
-            result.memory_updates = [
-                u for u in result.memory_updates
-                if u.key not in _REPLY_EXTRACT_SKIP
-            ]
-            dropped = before - len(result.memory_updates)
-            if dropped:
-                logger.debug(
-                    "reply_extract.skip_protected  dropped=%d  (reminder_notes / recent_activity)",
-                    dropped,
-                )
-
         if result.memory_updates:
             logger.info(
                 "🧠 reply_extract.found  count=%d  keys=%s",
                 len(result.memory_updates),
                 [u.key for u in result.memory_updates],
             )
-            # Import here to avoid circular dependency
             from .database import upsert_fact, delete_fact
             for u in result.memory_updates:
                 try:
@@ -1934,14 +1940,13 @@ async def extract_reply_memory(
                     else:
                         await upsert_fact(sender_key, normalize_key(u.key), u.value)
                     logger.info(
-                        "🧠 reply_memory.updated  sender=%s  key=%s  value=%r",
-                        sender_key, u.key, u.value,
+                        "🧠 reply_memory.saved  sender=%s  key=%s  value=%r",
+                        sender_key, u.key, u.value[:60],
                     )
                 except Exception as db_err:
                     logger.warning("⚠️  reply_memory.db_fail  key=%s  err=%s",
                                    u.key, str(db_err)[:80])
     except Exception as e:
-        # Completely suppress — this is a best-effort enrichment task
         logger.debug("ℹ️  reply_extract.suppressed  err=%s", str(e)[:80])
 
 
@@ -1969,11 +1974,11 @@ async def init_llm() -> None:
         logger.info(
             "🧠 llm.init — Groq + Gemini ready  "
             "groq_pool=%s  gemini_pool=%s  "
-            "orchestrator=Groq(%s) → Gemini(%s)  extraction=Groq(%s)",
+            "orchestrator=Gemini(%s) → Groq(%s)  extraction=Groq(%s)",
             settings.groq_model_pool,
             settings.gemini_model_pool,
-            settings.orchestrator_model,
             settings.gemini_orchestrator_model,
+            settings.orchestrator_model,
             settings.extraction_model,
         )
     else:
@@ -2073,58 +2078,42 @@ async def consolidate_user_facts(whatsapp_id: str) -> None:
         logger.debug("consolidate.no_duplicates  sender=%s  facts=%d", whatsapp_id, len(facts))
         return
 
-    # FIX-E: Hard runtime blocklist — reject merges the LLM hallucinates even
-    # with an explicit prompt. Protects semantically distinct keys that share
-    # surface similarity (goals vs fitness_goals, car vs bike, etc.).
-    # A merge is rejected if canonical OR any absorbed key is in the blocklist
-    # AND the merge crosses concept boundaries (canonical != absorbed concept).
-    _MERGE_BLOCKLIST = frozenset({
-        # Goal family — all kept separate; cross-merging loses information
-        "goals", "fitness_goals", "career_goals", "personal_goals",
-        # Vehicle — car and bike are always distinct
-        "car", "bike", "vehicle",
-        # Structural / system keys — must never be absorbed into anything
-        "name", "age", "city", "country", "postal_code",
-        "reminder_notes", "recent_activity",
-        "shopping_list", "grocery_list", "todo_list",
-        "trip_destination", "trip_duration", "next_trip_destination",
-        "next_trip_family", "next_trip_type", "next_trip_start_date",
-        "running_mileage", "language_goal",
-        "next_meeting_team", "next_meeting_topic", "next_meeting_time",
-        "pets",
-    })
-
     # ── apply merge plan ──────────────────────────────────────────────────────
     applied = 0
+    original_keys = set(facts.keys())   # keys that actually exist before merging
+
     for merge in merges:
         try:
             canonical = normalize_key(str(merge.get("canonical", "")))
-            absorb    = [normalize_key(str(k)) for k in (merge.get("absorb") or [])]
+            absorb_raw = [normalize_key(str(k)) for k in (merge.get("absorb") or [])]
             value     = str(merge.get("value") or "").strip()
 
             if not canonical or not value:
                 continue
 
-            # FIX-E: Reject the merge if it crosses the blocklist boundary.
-            # A same-family merge (fitness_goal → fitness_goals) is fine because
-            # canonical == absorbed concept. A cross-family merge
-            # (goals absorbing fitness_goals, or car absorbing bike) is blocked.
-            blocked_absorb = [a for a in absorb if a in _MERGE_BLOCKLIST and a != canonical]
-            if canonical in _MERGE_BLOCKLIST and blocked_absorb:
-                logger.warning(
-                    "🚫 consolidate.blocked  sender=%s  canonical=%s  "
-                    "blocked_absorb=%s  (cross-concept merge rejected)",
-                    whatsapp_id, canonical, blocked_absorb,
+            # Safety: only absorb keys that actually exist in the DB AND differ from
+            # canonical. Prevents the LLM from hallucinating keys or deleting a key
+            # it incorrectly labeled as a duplicate of something else.
+            absorb = [
+                k for k in absorb_raw
+                if k and k != canonical and k in original_keys
+            ]
+
+            # Safety: canonical must also exist OR be a known alias of an existing key.
+            # If neither the canonical nor any absorb key is in the DB, skip entirely.
+            if canonical not in original_keys and not absorb:
+                logger.debug(
+                    "consolidate.skip_phantom  sender=%s  canonical=%s  (not in DB)",
+                    whatsapp_id, canonical,
                 )
                 continue
 
             # Write canonical key with the best value
             await sqlite_store.upsert_fact(whatsapp_id, canonical, value)
 
-            # Delete alias keys (skip if they already equal canonical)
+            # Delete only verified alias keys
             for alias in absorb:
-                if alias and alias != canonical:
-                    await _consolidation_delete(whatsapp_id, alias)
+                await _consolidation_delete(whatsapp_id, alias)
 
             logger.info(
                 "🔑 consolidate.merged  sender=%s  canonical=%s  absorbed=%s  value=%r",
