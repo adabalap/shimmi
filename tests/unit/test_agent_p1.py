@@ -125,18 +125,39 @@ class TestOrchestratorResultToolCall:
 class TestDispatchTool:
     @pytest.mark.asyncio
     async def test_none_tool_call_falls_back_to_web_search(self):
-        """If tool_call is None, dispatch should use compound-beta-mini fallback."""
+        """
+        When tool_call is None AND the query has no keyword-routable intent
+        (not weather/stocks/news/currency/timezone), dispatch falls back to
+        compound-beta-mini web search.
+
+        Note: structured queries like "latest cricket score" are now correctly
+        keyword-routed to the news MCP tool — that is the RIGHT behaviour.
+        This test uses an open-ended factual question that has no structured
+        tool match to verify the web-search fallback path.
+        """
         from app.agent_engine import _dispatch_tool
-        from app.tools import _WEB_SEARCH_SENTINEL
 
         with patch("app.agent_engine._compound_beta_search", new_callable=AsyncMock) as mock:
             mock.return_value = "Some web result"
             result = await _dispatch_tool(
-                None, "latest cricket score", "test-chat", facts={}
+                None, "explain the theory of relativity", "test-chat", facts={}
             )
 
-        mock.assert_called_once_with("latest cricket score", "test-chat")
+        mock.assert_called_once_with("explain the theory of relativity", "test-chat")
         assert result == "Some web result"
+
+    @pytest.mark.asyncio
+    async def test_cricket_score_keyword_routes_to_news(self):
+        """
+        'latest cricket score' with no tool_call should be keyword-routed to
+        the news MCP tool (not web_search fallback). This verifies that the
+        keyword router intercepts news queries before the final fallback.
+        """
+        from app.agent_engine import _dispatch_tool, _keyword_tool_from_query
+
+        tc = _keyword_tool_from_query("latest cricket score", {})
+        assert tc is not None
+        assert tc.tool == "news"
 
     @pytest.mark.asyncio
     async def test_valid_weather_tool_call_routed(self):

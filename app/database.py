@@ -350,6 +350,22 @@ class SQLiteMemory:
             )
             conn.commit()
 
+        # ARCH-1: Provenance column. Every fact records whether it came directly
+        # from the user ("user_stated") or was inferred by the bot ("bot_inferred").
+        # Only user_stated facts reach the orchestrator prompt — this permanently
+        # replaces all ephemeral key filtering and reply_extract guards.
+        if "source" not in um_cols:
+            conn.execute(
+                "ALTER TABLE user_memory ADD COLUMN source TEXT NOT NULL DEFAULT 'user_stated'"
+            )
+            # Back-fill: existing facts are assumed user_stated (safe default —
+            # they were already being served to the LLM without issue)
+            conn.execute(
+                "UPDATE user_memory SET source = 'user_stated' WHERE source IS NULL"
+            )
+            conn.commit()
+            logger.info("🗄️  migrate — added source column to user_memory ✓")
+
         # ── FIX-P0-4: delete junk fact values persisted by early bot versions ──
         _JUNK = ("unknown", "none", "null", "n/a", "-", "")
         placeholders = ",".join("?" * len(_JUNK))
@@ -485,19 +501,41 @@ class SQLiteMemory:
 
     # ── facts API ──────────────────────────────────────────────────────────
 
-    async def get_all_facts(self, whatsapp_id: str) -> Dict[str, str]:
+    async def get_all_facts(
+        self,
+        whatsapp_id: str,
+        source_filter: str = "user_stated",
+    ) -> Dict[str, str]:
+        """
+        Load facts for a user.
+
+        source_filter:
+          "user_stated"  — only facts the user directly stated (default, for LLM prompts)
+          "all"          — every fact including bot_inferred (for consolidation/analytics)
+
+        ARCH-1: source_filter="user_stated" permanently replaces the _EPHEMERAL_KEYS_EXACT
+        and _EPHEMERAL_KEY_PREFIXES guards — bot-inferred facts simply never reach the LLM.
+        """
         async with self._lock:
             def _do():
                 with sqlite3.connect(self.path) as conn:
-                    cur = conn.execute(
-                        "SELECT fact_key, fact_value FROM user_memory "
-                        "WHERE whatsapp_id=? ORDER BY updated_at DESC",
-                        (whatsapp_id,),
-                    )
+                    if source_filter == "all":
+                        cur = conn.execute(
+                            "SELECT fact_key, fact_value FROM user_memory "
+                            "WHERE whatsapp_id=? ORDER BY updated_at DESC",
+                            (whatsapp_id,),
+                        )
+                    else:
+                        cur = conn.execute(
+                            "SELECT fact_key, fact_value FROM user_memory "
+                            "WHERE whatsapp_id=? AND (source IS NULL OR source='user_stated') "
+                            "ORDER BY updated_at DESC",
+                            (whatsapp_id,),
+                        )
                     _JUNK = frozenset({"unknown", "none", "null", "n/a", "-", ""})
                     out: Dict[str, str] = {}
                     for raw_key, val in cur.fetchall():
-                        if (val or "").strip().lower() in _JUNK:  # FIX-P0-4
+                        if (val or "").strip().lower() in _JUNK:
                             continue
                         canon = normalize_key(raw_key)
                         if canon and canon not in out:
@@ -505,17 +543,34 @@ class SQLiteMemory:
                     return out
             return await asyncio.to_thread(_do)
 
-    async def upsert_fact(self, whatsapp_id: str, raw_key: str, value: str) -> str:
+    async def upsert_fact(
+        self,
+        whatsapp_id: str,
+        raw_key: str,
+        value: str,
+        source: str = "user_stated",
+    ) -> str:
+        """
+        Upsert a user fact.
+
+        source: "user_stated"  — came directly from the user (shown in LLM prompts)
+                "bot_inferred" — derived by the bot from context (never shown to LLM,
+                                 used only for consolidation and analytics)
+
+        ARCH-1: Provenance replaces all rule-based ephemeral key filtering.
+        """
         key   = normalize_key(raw_key)
         value = (value or "").strip()
         if not key or not value:
             return "unchanged"
+        valid_sources = {"user_stated", "bot_inferred"}
+        safe_source = source if source in valid_sources else "user_stated"
         async with self._lock:
             def _do():
                 now = datetime.now(UTC).isoformat()
                 with sqlite3.connect(self.path) as conn:
                     cur = conn.execute(
-                        "SELECT fact_value FROM user_memory "
+                        "SELECT fact_value, source FROM user_memory "
                         "WHERE whatsapp_id=? AND fact_key=?",
                         (whatsapp_id, key),
                     )
@@ -523,18 +578,21 @@ class SQLiteMemory:
                     if row is None:
                         conn.execute(
                             "INSERT INTO user_memory "
-                            "(whatsapp_id, fact_key, fact_value, created_at, updated_at) "
-                            "VALUES (?,?,?,?,?)",
-                            (whatsapp_id, key, value, now, now),
+                            "(whatsapp_id, fact_key, fact_value, created_at, updated_at, source) "
+                            "VALUES (?,?,?,?,?,?)",
+                            (whatsapp_id, key, value, now, now, safe_source),
                         )
                         conn.commit()
                         return "created"
                     if (row[0] or "").strip() == value:
                         return "unchanged"
+                    # When a user explicitly states something (user_stated), upgrade
+                    # any previously bot_inferred record — user wins.
+                    new_source = safe_source if safe_source == "user_stated" else (row[1] or safe_source)
                     conn.execute(
-                        "UPDATE user_memory SET fact_value=?, updated_at=? "
+                        "UPDATE user_memory SET fact_value=?, updated_at=?, source=? "
                         "WHERE whatsapp_id=? AND fact_key=?",
-                        (value, now, whatsapp_id, key),
+                        (value, now, new_source, whatsapp_id, key),
                     )
                     conn.commit()
                     return "updated"

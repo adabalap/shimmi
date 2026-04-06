@@ -277,18 +277,26 @@ NEVER extract from:
   • Questions (reply ends with "?")
   • Live-data replies: weather, news, stock prices, search results
   • Template / placeholder text: "book's title", "[city]", "{key}"
-  • Bot's own knowledge or general statements
+  • Bot's own knowledge or general statements about the world
   • The signature line (Shimmi, ─────, 🤖)
   • Replies that are just acknowledgments: "Got it", "Done", "Sure"
+  • Bot INFERENCES or categorisations: "this seems like your favourite X",
+    "you appear to enjoy Y", "based on your reading you might like Z" —
+    these are the bot's analysis, not the user's stated facts.
+    Evidence of this pattern: favorite_biography, favorite_history,
+    favorite_self_development — these must NEVER be saved as facts.
+  • Book titles already in reading_list or read_books
 
 ONLY extract from confirmed saves like:
   "Your shopping list: milk, bread, cheese" → shopping_list="milk, bread, cheese"
   "Reminder saved for 6 AM tomorrow"        → reminder_notes="6 AM tomorrow"
   "Updated list: milk, cheese (removed jam)"→ shopping_list="milk, cheese"
+  "Got it, I'll remember your name is Sarah"→ name="Sarah"
 
 Rules:
   • Canonical snake_case keys only: shopping_list, grocery_list, todo_list,
-    reminder_notes, name, city, car, bike, interests, favorite_drink.
+    reminder_notes, name, city, car, bike, interests, favorite_drink, reading_list.
+  • Do NOT create new favorite_* keys. Do NOT extract book titles as individual facts.
   • Lists → comma-separated string. Values must be non-empty and non-template.
   • If in doubt → {"memory_updates": []}
 
@@ -408,10 +416,17 @@ MERGE ONLY when keys are IDENTICAL CONCEPTS with different names:
   ✓ "fitness_goal" / "fitness_goals"         → singular/plural
   ✓ "career_aspiration" / "career_goals"     → synonym keys
   ✓ "vehicle" / "car"                        → synonym keys
+  ✓ "read_books" / "reading_list"            → same concept, different key names
+  ✓ "books_read" / "reading_list"            → same concept
+  ✓ "book_list" / "reading_list"             → same concept
+  When merging read_books/reading_list, keep reading_list as canonical.
+  For value: use the version with author names if one exists (more informative).
 
 DO NOT MERGE different concepts, even if values look similar:
   ✗ "interests" and "reading_list"           → completely different
   ✗ "interests" and "hobbies"                → may overlap but are distinct
+  ✗ "favorite_*" keys created by inference   → bot-inferred categories, not user facts
+  ✗ "conversation_summary" / "last_summary"  → transient, never merge with personal facts
   ✗ "city" and "country"                     → different facts
   ✗ "work_experience" and "occupation"       → different granularity
   ✗ "travel_plans" and "trip_destination"    → different facts
@@ -427,11 +442,17 @@ Canonical key selection:
 For merged value: keep the more informative / recent one.
 Only include groups with 2+ genuinely duplicate keys. If unsure → skip.
 
+CRITICAL: The "absorb" list causes DELETION of those keys.
+  • If absorb would be empty [] — omit the entry entirely. An entry with absorb=[]
+    is useless: it upserts the same value and deletes nothing.
+  • Never include read_books or reading_list in absorb of each other without checking
+    that the OTHER key actually exists in the input facts.
+
 Output JSON only, no prose, no fences:
   {"merges": [
     {"canonical": "favorite_color", "absorb": ["favourite_colour"], "value": "Green"}
   ]}
-If no safe merges: {"merges": []}
+If no safe merges, or all groups would have absorb=[]: {"merges": []}
 """.strip()
 
 # ---------------------------------------------------------------------------
@@ -444,3 +465,54 @@ def render(template: str, **kwargs: str) -> str:
     for key, value in kwargs.items():
         result = result.replace(f"<<{key}>>", str(value))
     return result
+
+# ─────────────────────────────────────────────────────────────────────────────
+# ORCHESTRATOR_COMPACT_PROMPT
+# Used when Groq 8B is the orchestrator (budget.block or fallback chain).
+# Same rules as ORCHESTRATOR_PROMPT, 75% fewer tokens.
+# ─────────────────────────────────────────────────────────────────────────────
+
+ORCHESTRATOR_COMPACT_PROMPT = """
+You are Spock — a WhatsApp AI assistant. Smart, warm, concise.
+
+OUTPUT: valid JSON only, no prose.
+{
+  "action":         "answer" | "search" | "ask_user",
+  "reasoning":      "brief reasoning",
+  "text":           "reply (when action=answer)",
+  "query":          "search query (when action=search)",
+  "tool_call":      {"tool":"weather"|"news"|"stocks"|"currency"|"timezone"|"web_search", ...params},
+  "question":       "one question (when action=ask_user)",
+  "memory_updates": [{"key":"...", "value":"..."}],
+  "reminders":      [{"text":"...", "trigger_iso":"YYYY-MM-DDTHH:MM:SS+05:30"}]
+}
+
+MEMORY RULES:
+• ONLY save facts the user EXPLICITLY stated. Never infer or categorise.
+• Use canonical keys: name, age, city, country, occupation, favorite_drink,
+  favorite_food, favorite_color, interests, hobbies, fitness_goals, travel_plans,
+  car, pets, allergies, dietary_restriction, shopping_list, grocery_list, todo_list,
+  reading_list, reminder_notes, education, company.
+• For lists: always write the full list, not a delta. Read facts first, then apply change.
+• If no facts to save → memory_updates: []
+
+LIVE DATA (always use action=search, never guess):
+• Weather, news, stocks, scores, exchange rates, "today"/"current"/"latest"
+
+SEARCH TOOLS:
+• weather: {"tool":"weather","city":"Hyderabad","country":"IN","days":3}
+• news:    {"tool":"news","query":"India cricket score","country":"IN"}
+• stocks:  {"tool":"stocks","symbols":["RELIANCE.NS"]}
+• currency:{"tool":"currency","from_currency":"USD","to_currency":"INR","amount":1}
+• timezone:{"tool":"timezone","city":"Tokyo"}
+• fallback:{"tool":"web_search","query":"..."}
+
+FACTS POLICY:
+• facts = permanent database. Trust it. Never invent attributes not in facts.
+• context = recent conversation. Good for what was just discussed.
+• search_results = live data this turn. Use it to answer live queries.
+
+NEVER: claim no live data without searching. Hallucinate dates or history.
+Use city from facts in weather/news queries.
+""".strip()
+

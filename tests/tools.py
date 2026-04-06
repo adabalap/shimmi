@@ -203,17 +203,14 @@ class ToolDispatcher:
         return result or ""
 
     async def _news(self, tc: NewsTool, facts: Dict[str, str]) -> str:
-        from .live_data import get_news, _normalize_news_query
+        from .live_data import get_news
 
         country = tc.country or facts.get("country") or "IN"
-        # Normalize meta-phrase queries (e.g. "morning news round up" → "India news today")
-        # BEFORE sending to live_data so the normalization fires even when the query
-        # arrives via tool_call JSON rather than through the live_data.get_news path.
-        effective_query = _normalize_news_query(tc.query or "India top news")
-        if effective_query != tc.query:
-            logger.info("tools.news.query_normalised  %r → %r", tc.query, effective_query)
-        logger.info("tools.news  query=%r  country=%r", effective_query, country)
-        result = await get_news(effective_query, country[:2].upper())
+        query = tc.query or "India top news"
+        # ARCH-3: query rewriting is now handled inside get_news() via the
+        # async LLM rewriter (_rewrite_news_query). No pre-processing needed here.
+        logger.info("tools.news  query=%r  country=%r", query, country)
+        result = await get_news(query, country[:2].upper())
         return result or ""
 
     async def _stocks(self, tc: StocksTool) -> str:

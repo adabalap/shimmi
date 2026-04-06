@@ -165,6 +165,11 @@ async def get_news(
                 for a in data.get("articles", [])
             ]
             result = {"source": "gnews", "query": q, "count": len(articles), "articles": articles}
+            # FIX-EMPTY-CACHE: Never cache an empty result. If GNews returned 0 articles
+            # for this query, the next call should try again (or try the RSS fallback)
+            # rather than serving the empty result from cache for the full TTL.
+            if not articles:
+                result = None
         except Exception as e:
             logger.warning("gnews.error  q=%r  err=%s", q, e)
 
@@ -191,7 +196,11 @@ async def get_news(
         except Exception as e:
             raise HTTPException(status_code=502, detail=f"news fetch failed: {e}")
 
-    _cache_set(ck, result, _TTL_NEWS)
+    # Only cache non-empty results — empty results should be retried next call
+    if result and result.get("count", 0) > 0:
+        _cache_set(ck, result, _TTL_NEWS)
+    elif result is None:
+        result = {"source": "none", "query": q, "count": 0, "articles": []}
     return result
 
 

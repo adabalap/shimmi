@@ -314,18 +314,111 @@ def _format_news_mcp(data: dict, query: str) -> Optional[str]:
     return "\n".join(lines)
 
 
+# Meta-phrases that GNews treats as literal search terms and returns 0 results.
+# Map them to sensible topic queries that actually match headlines.
+async def _rewrite_news_query(raw_query: str) -> str:
+    """
+    ARCH-3: Replace the lookup table with a lightweight 8B LLM rewriter.
+
+    A lookup table of meta-phrases is a maintenance debt — every new phrasing
+    needs a code change. An LLM rewriter handles any variant the user sends
+    without touching the codebase.
+
+    The 8B model rewrites "morning news round up" → "India top news today",
+    "latest cricket score" → "India cricket live score", etc.
+    Costs ~50 tokens (negligible vs compound-beta's 800+).
+
+    Falls back to the raw query if the LLM is unavailable — GNews will try
+    and the RSS fallback covers the case where it returns 0 articles.
+    """
+    # Only rewrite if the query looks like a meta-phrase, not a real topic.
+    # Real topics: "Red Sea crisis", "India GDP", "IPL Kolkata Knight Riders"
+    # Meta-phrases: "morning news", "latest news", "top stories", "news round up"
+    _META_SIGNALS = re.compile(
+        r"\b(morning|round up|roundup|briefing|summary|update|top (news|stories|headlines)|"
+        r"latest news|news today|current news|daily news|headlines today|"
+        r"cricket score|cricket update|ipl score)\b",
+        re.IGNORECASE,
+    )
+    if not _META_SIGNALS.search(raw_query):
+        return raw_query  # looks like a real topic — send as-is
+
+    try:
+        from .agent_engine import _groq_raw
+        result = await _groq_raw(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        "Convert the user's news request into a concise GNews search term (2-5 words). "
+                        "GNews is a keyword search engine — return only searchable topic words, "
+                        "no meta-phrases like 'round up', 'morning', 'briefing', 'update'. "
+                        "Examples:\n"
+                        "  'morning news round up' → 'India top news today'\n"
+                        "  'give me the latest cricket score' → 'India cricket live score'\n"
+                        "  'IPL score today' → 'IPL cricket score today'\n"
+                        "  'world news today' → 'world top headlines today'\n"
+                        "Return ONLY the search term, nothing else."
+                    ),
+                },
+                {"role": "user", "content": raw_query},
+            ],
+            max_tokens=20,
+            chat_id="news_rewrite",
+            label="news_query_rewrite",
+            role="extract",
+            timeout=5.0,
+        )
+        rewritten = result.strip().strip('"\'`').strip()
+        if rewritten and len(rewritten) < 80 and rewritten.lower() != raw_query.lower():
+            logger.info("📰 news.query_rewritten  %r → %r", raw_query[:60], rewritten[:60])
+            return rewritten
+    except Exception as e:
+        logger.debug("news.rewrite_skip  err=%s", e)
+
+    return raw_query
+
+
 async def get_news(query: str = "India top news", country: str = "IN") -> Optional[str]:
     """Fetch news headlines. Tries MCP first, then GNews / RSS fallback."""
+
+    # ARCH-3: Rewrite meta-phrase queries via lightweight 8B LLM call.
+    # This handles ANY phrasing variant without a lookup table.
+    effective_query = await _rewrite_news_query(query)
 
     # ── Try MCP ──────────────────────────────────────────────────────────────
     try:
         from .mcp_client import mcp_news
-        data = await mcp_news(query=query, country=country.lower())
+        data = await mcp_news(query=effective_query, country=country.lower())
         if data and data.get("articles"):
-            result = _format_news_mcp(data, query)
+            count = len(data["articles"])
+            result = _format_news_mcp(data, effective_query)
             if result:
-                logger.info("📰 live_data.news.mcp  count=%d", len(data["articles"]))
+                logger.info("📰 live_data.news.mcp  count=%d", count)
+                # FIX-THIN-RESULT: If we got fewer than 3 articles and the user asked
+                # for a roundup/top-N, try a broader fallback query to get more.
+                # Evidence: "top news stories India" → count=1, result_len=120.
+                if count < 3:
+                    logger.info("📰 live_data.news.thin_result  count=%d  trying broader query", count)
+                    fallback_q = f"{country} news today"
+                    data2 = await mcp_news(query=fallback_q, country=country.lower())
+                    if data2 and len(data2.get("articles", [])) > count:
+                        r2 = _format_news_mcp(data2, fallback_q)
+                        if r2:
+                            logger.info("📰 live_data.news.mcp_broader  count=%d", len(data2["articles"]))
+                            return r2
                 return result
+        # FIX-EMPTY-RESULT: GNews returned 0 articles (200 OK, empty body).
+        # The original query was a meta-phrase. Try the country-level fallback.
+        if not data or data.get("count", 0) == 0:
+            fallback_q = f"{country} news today"
+            logger.info("📰 live_data.news.empty_fallback  %r → %r", query, fallback_q)
+            data2 = await mcp_news(query=fallback_q, country=country.lower())
+            if data2 and data2.get("articles"):
+                result = _format_news_mcp(data2, fallback_q)
+                if result:
+                    logger.info("📰 live_data.news.mcp_fallback  count=%d", len(data2["articles"]))
+                    return result
     except Exception as e:
         logger.debug("live_data.news.mcp_skip  err=%s", e)
 

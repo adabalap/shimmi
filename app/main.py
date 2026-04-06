@@ -311,8 +311,11 @@ async def _ambient_extract_bg(*, chat_id: str, sender_key: str, text: str) -> No
         for u in approved:
             if getattr(u, "delete", False):
                 continue   # never auto-delete from ambient observation
+            # Ambient extractions are background observations, not explicit
+            # user declarations — mark as bot_inferred so they never pollute
+            # the LLM prompt (only user_stated facts reach the orchestrator).
             status = await database.sqlite_store.upsert_fact(
-                sender_key, normalize_key(u.key), u.value
+                sender_key, normalize_key(u.key), u.value, source="bot_inferred"
             )
             if status == "created":
                 created += 1
@@ -417,7 +420,9 @@ async def process_message(
             # ── 1. load facts ───────────────────────────────────────────────
             with trace.step("facts_load"):
                 facts = (
-                    await database.sqlite_store.get_all_facts(sender_key)
+                    await database.sqlite_store.get_all_facts(
+                        sender_key, source_filter="user_stated"
+                    )
                     if database.sqlite_store else {}
                 )
                 trace.tag(
@@ -517,23 +522,10 @@ async def process_message(
                 reply_with_sig = append_signature(result.reply.text, chat_id)
                 trace.tag(final_len=len(reply_with_sig))
 
-            # ── 5b. reply-extract (ambient memory) ──────────────────────────
-            # Runs after a genuine LLM response to capture data the bot confirmed.
-            # Skipped for shortcut responses — the bot echoed an existing DB value;
-            # there is nothing new to extract. Running it there wastes ~140ms and
-            # risks re-saving a stale value over a freshly updated one.
-            _re_text     = getattr(result.reply, "text", None) or ""
-            _is_shortcut = getattr(result, "provider_used", "") == "shortcut"
-            _is_question = (len(_re_text) < 120 and _re_text.rstrip().endswith("?"))
-            if _re_text and not _is_shortcut and not _is_question:
-                with trace.step("reply_extract"):
-                    await _reply_extract_and_save_bg(
-                        chat_id=chat_id,
-                        sender_key=sender_key,
-                        user_text=user_text,
-                        bot_reply=_re_text,
-                        known_facts=facts,
-                    )
+            # ── 5b. reply-extract ────────────────────────────────────────────
+            # ARCH-3: Removed. The orchestrator's memory_updates field is the
+            # single source of memory writes. A second extraction pass on the bot's
+            # own reply was causing circular pollution (see extract_reply_memory docstring).
 
             # ── 6. persist memory + reminders ──────────────────────────────
             with trace.step("memory_save"):
@@ -594,8 +586,10 @@ async def process_message(
                                     )
                                     save_errors.append(f"{mu.key}: {outcome}")
                             else:
+                                # Orchestrator memory_updates come from verified
+                                # user statements — always user_stated.
                                 status = await database.sqlite_store.upsert_fact(
-                                    sender_key, mu.key, mu.value,
+                                    sender_key, mu.key, mu.value, source="user_stated"
                                 )
                                 if status == "created":
                                     created += 1

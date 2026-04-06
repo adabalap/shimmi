@@ -715,53 +715,20 @@ _JUNK_VALUES = frozenset({
 
 def _clean_facts(facts: Dict[str, str]) -> Dict[str, str]:
     """
-    FIX-S2 + FIX-NOISE: Strip junk values AND ephemeral/noisy keys before
-    building orchestrator prompts.
+    Filter junk values from a facts dict before building LLM prompts.
 
-    Two layers of filtering:
-      1. Junk values — placeholders like "unknown", "none", empty strings
-      2. Ephemeral keys — keys that capture transient activity/results and
-         don't represent durable personal facts worth sending to the LLM.
-         These stay in the DB (for audit/consolidation) but don't burn tokens.
+    ARCH-1 note: Ephemeral key filtering (previously _EPHEMERAL_KEYS_EXACT and
+    _EPHEMERAL_KEY_PREFIXES) is now handled at DB level via source='user_stated'.
+    get_all_facts(source_filter="user_stated") ensures bot-inferred facts never
+    appear in the facts dict passed here. This function only strips junk values.
     """
-    # Keys that are noisy or ephemeral — useful to store but not to inject
-    # into every orchestrator call as "long-term facts about the user".
-    _EPHEMERAL_KEY_PREFIXES = (
-        "result_", "recent_activity", "next_meeting_",
-        "previous_job_", "previous_startup",
-        "semester", "year", "course",
-    )
-    _EPHEMERAL_KEYS_EXACT = frozenset({
-        # Transient activity records — change every session
-        "recent_activity", "last_summary", "conversation_since_morning",
-        # Keys that capture metadata about the conversation, not the person
-        "favorite_news_source",  # set to "your conversation" — not a real preference
-        # Result / academic records
-        "result_document", "result_link", "result_month",
-        "result_status", "result_type", "result_year", "semester", "year",
-        "course", "online_courses",
-        # Social metadata — not needed in every prompt
-        "friend_since",
-        # Company history — stored but not useful as live context
-        "previous_startup_status", "previous_employer",
-        # Transient trip / meeting details
-        "next_meeting_team", "next_meeting_time", "next_meeting_topic",
-        "next_trip_start_date", "trip_to_portland",
-        "next_trip_family", "next_trip_type",
-    })
-
     out = {}
     for k, v in facts.items():
-        # Skip junk values
         if not v or str(v).strip().lower() in _JUNK_VALUES:
-            continue
-        # Skip ephemeral keys that aren't personal facts
-        if k in _EPHEMERAL_KEYS_EXACT:
-            continue
-        if any(k.startswith(p) for p in _EPHEMERAL_KEY_PREFIXES):
             continue
         out[k] = v
     return out
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -845,145 +812,110 @@ def _check_pending_delete(sender_key: str, user_text: str) -> Optional[tuple[str
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# Facts shortcut v2 (FIX-S1)
 # ─────────────────────────────────────────────────────────────────────────────
+# Facts shortcut — zero-token instant recall for direct personal questions
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# Design principle: keep this minimal and unambiguous. Only fire on queries
+# where the intent is 100% clear AND the fact key is 100% determinable.
+# Every entry in _FACT_SYNONYMS has been chosen because:
+#   (a) there is only one possible fact it could refer to
+#   (b) the user phrase is common enough to be worth optimising
+# Anything beyond these cases goes to the orchestrator — it handles it in 1
+# iteration at ~800 tokens and gets nuance right.
+#
+# This is not a keyword table — it is a compact alias dictionary for the
+# ~15 fact keys that users ask about most often.
+# No regex, no guards, no word-overlap fallback. Two structural patterns only.
 
-# Maps DB fact keys → trigger words that appear in the user's question.
-# Deliberately broad — better to shortcut and answer than to burn 70B tokens
-# to echo the database.
-_FACT_SIGNALS: Dict[str, List[str]] = {
-    "name":              ["my name", "what's my name", "what is my name", "who am i"],
-    "age":               ["my age", "how old am i", "how old"],
-    "city":              ["my city", "where i live", "where do i live", "my location"],
-    "country":           ["my country", "what country"],
-    "postal_code":       ["my postal", "my zip", "my pincode", "postal code"],
-    "occupation":        ["my job", "my occupation", "my profession", "what do i do", "where i work", "my work"],
-    "favorite_drink":    ["my drink", "coffee order", "my coffee", "what i drink", "favorite drink", "favourite drink", "my tea"],
-    "favorite_food":     ["my food", "favorite food", "favourite food", "what i eat", "my favorite meal"],
-    "favorite_cuisine":  ["my cuisine", "favorite cuisine", "favourite cuisine"],
-    "favorite_color":    ["my color", "my colour", "favorite color", "favourite colour"],
-    "favorite_trail":    ["my trail", "hiking trail", "favorite trail", "favourite trail", "where i hike"],
-    "hobbies":           ["my hobbies", "my hobby", "what i enjoy", "what do i enjoy", "my interests"],
-    "interests":         ["my interests", "my interest", "podcasts i listen", "what podcasts", "my podcast"],
-    "allergies":         ["my allergies", "my allergy", "allergic to", "what i'm allergic"],
-    "dietary_restriction": ["dietary restriction", "what i can't eat", "foods to avoid"],
-    "pets":              ["my pets", "my pet", "my dog", "my cat", "pets' names", "my animals"],
-    "pet_max_age":       ["max's age", "how old is max", "max age"],
-    "pet_luna_age":      ["luna's age", "how old is luna", "luna age"],
-    "shopping_list":     ["shopping list", "what's on my shopping", "grocery", "groceries"],
-    "grocery_list":      ["grocery list", "groceries", "what to buy"],
-    "todo_list":         ["todo list", "to do list", "my tasks", "to-do list"],
-    "car":               ["my car", "my vehicle", "what car do i drive", "my bike"],
-    "vehicle":           ["my vehicle", "my car", "what i drive"],
+# Maps user subject phrase → canonical DB key
+_FACT_SYNONYMS: Dict[str, str] = {
+    # Identity
+    "name": "name",
+    "age": "age",       "old": "age",
+    "birthday": "birthday",
+    "occupation": "occupation", "job": "occupation", "work": "occupation",
+    # Location
+    "city": "city",     "location": "city",    "live": "city",
+    "country": "country",
+    # Preferences
+    "coffee": "favorite_drink",  "drink": "favorite_drink",  "tea": "favorite_drink",
+    "favorite drink": "favorite_drink",    "favourite drink": "favorite_drink",
+    "food": "favorite_food",     "eat": "favorite_food",
+    "favorite food": "favorite_food",      "favourite food": "favorite_food",
+    "color": "favorite_color",   "colour": "favorite_color",
+    "favorite color": "favorite_color",    "favourite color": "favorite_color",
+    "genre": "favorite_genre",
+    "trail": "favorite_trail",
+    # Possessions
+    "car": "car",        "drive": "car",     "vehicle": "car",    "bike": "car",
+    # People / social
+    "pets": "pets",      "pet": "pets",      "dog": "pets",       "cat": "pets",
+    # Health
+    "allergies": "allergies",  "allergic": "allergies",
+    # Lists
+    "shopping": "shopping_list",   "shopping list": "shopping_list",
+    "grocery": "grocery_list",     "grocery list": "grocery_list",
+    "todo": "todo_list",           "todo list": "todo_list",
+    # Plans
+    "travel": "travel_plans",      "trip": "travel_plans",
+    "travel plans": "travel_plans",
 }
 
-
-# Regex to detect update declarations: "my X is Y", "my coffee order is X"
-# These must NOT be shortcut — they should go to the LLM to save the new value.
-_UPDATE_DECLARATION_RE = re.compile(
-    r"\bmy\s+[\w\s]{1,30}?\s+(is|are|was|=|:)\s+\S",
-    re.IGNORECASE,
-)
+# Special-case interrogative forms that don't fit "what's my X"
+_SPECIAL_RECALL_FORMS: List[Tuple[str, str]] = [
+    ("how old am i",         "age"),
+    ("what do i drive",      "car"),
+    ("what car do i",        "car"),
+    ("where do i live",      "city"),
+    ("where am i from",      "city"),
+    ("what am i allergic to", "allergies"),
+    ("what do i do for work", "occupation"),
+    ("what do i do for a living", "occupation"),
+]
 
 
 def _try_facts_shortcut(user_text: str, facts: Dict[str, str]) -> Optional[str]:
     """
-    FIX-S1: Answer simple memory-recall questions directly from the facts
-    dict WITHOUT calling any LLM.  Zero tokens, instant response.
+    Answer the most common direct recall questions instantly from the facts dict.
+    Zero tokens, zero LLM call.
 
-    FIX-UPDATE-GUARD: Declarations like "my coffee order is X" must NOT fire
-    this shortcut — the user is setting a new value, not asking a recall
-    question.  If we shortcut here we'd return the old value and the LLM
-    would never save the new one.
+    Fires ONLY on two structural patterns:
+      • "what's/what is/what are my <subject>" where subject maps to a fact key
+      • A handful of special-case forms (how old am I, what do I drive, etc.)
 
-    Strategy:
-      1. Reject messages longer than 100 chars (likely complex / multi-intent).
-      2. Reject update declarations ("my X is Y" pattern without "?").
-      3. Require a recall trigger word (question word or interrogative phrase).
-      4. Match a _FACT_SIGNALS key and return the stored value instantly.
+    Anything else — writes, corrections, analytical questions, anything ambiguous —
+    passes through to the orchestrator which handles it correctly in 1 iteration.
+    This is deliberately conservative: it is better to use 800 tokens on the
+    orchestrator than to return a stale/wrong value here.
     """
-    if len(user_text) > 100:
+    if len(user_text) > 60:
         return None
 
-    low = user_text.lower().strip()
+    low = user_text.lower().strip().rstrip("?").strip()
 
-    # Block update declarations: "my name is Sarah", "my coffee order is X"
-    # These should go to the LLM so it can save the new value.
-    if _UPDATE_DECLARATION_RE.search(low) and "?" not in low:
-        return None
+    def _reply(key: str) -> Optional[str]:
+        val = facts.get(key, "")
+        if not val or str(val).strip().lower() in _JUNK_VALUES:
+            return None
+        label = key.replace("_", " ")
+        return f"Your {label} on record is: *{val}* 📋"
 
-    # Must look like a question or recall request
-    recall_triggers = (
-        "what", "which", "who", "where", "tell me", "show me", "remind me",
-        "do you know", "do i have", "list", "my ", "am i",
-    )
-    if not any(t in low for t in recall_triggers):
-        return None
+    # Pattern 1: "what's my X" / "what is my X" / "what are my X"
+    for prefix in ("what's my ", "what is my ", "what are my "):
+        if low.startswith(prefix):
+            subject = low[len(prefix):].strip()
+            key = _FACT_SYNONYMS.get(subject)
+            if key:
+                return _reply(key)
+            return None  # e.g. "what's my favourite book?" → not in map → orchestrator
 
-    clean = _clean_facts(facts)
-    if not clean:
-        return None
+    # Pattern 2: special-case forms
+    for phrase, key in _SPECIAL_RECALL_FORMS:
+        if low.startswith(phrase):
+            return _reply(key)
 
-    matched_key: Optional[str] = None
-
-    # Primary: explicit signal phrases (fast, high-precision)
-    for db_key, signals in _FACT_SIGNALS.items():
-        if any(sig in low for sig in signals):
-            matched_key = db_key
-            break
-
-    # Secondary: word-overlap fallback — handles variations like "current age",
-    # "age right now", "preferred color" without growing the signal list.
-    # Safe because the update-declaration guard already blocked write intents.
-    if matched_key is None:
-        query_words = set(re.findall(r"\b\w+\b", low))
-        for db_key in clean:
-            key_words = set(db_key.replace("_", " ").split())
-            if key_words & query_words:
-                matched_key = db_key
-                break
-
-    if not matched_key:
-        return None
-
-    # Try exact key and underscore/space variants
-    val = (
-        clean.get(matched_key)
-        or clean.get(matched_key.replace("_", " "))
-        or clean.get(matched_key.replace(" ", "_"))
-    )
-    if not val:
-        return None
-
-    persona = settings.bot_persona_name or "Shimmi"
-    label_map = {
-        "name":              "name",
-        "age":               "age",
-        "city":              "city",
-        "country":           "country",
-        "postal_code":       "postal code",
-        "occupation":        "occupation/job",
-        "favorite_drink":    "favourite drink / coffee order",
-        "favorite_food":     "favourite food",
-        "favorite_cuisine":  "favourite cuisine",
-        "favorite_color":    "favourite colour",
-        "favorite_trail":    "favourite hiking trail",
-        "hobbies":           "hobbies",
-        "interests":         "interests & podcasts",
-        "allergies":         "allergies",
-        "dietary_restriction": "dietary restrictions",
-        "pets":              "pets",
-        "pet_max_age":       "Max's age",
-        "pet_luna_age":      "Luna's age",
-        "shopping_list":     "shopping list",
-        "grocery_list":      "grocery list",
-        "todo_list":         "to-do list",
-        "car":               "vehicle",
-        "vehicle":           "vehicle",
-    }
-    label = label_map.get(matched_key, matched_key.replace("_", " "))
-    return f"Your {label} on record is: *{val}* 📋"
-
+    return None
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Zero-token time / date shortcut
@@ -1000,20 +932,43 @@ _DATE_SIGNALS = frozenset({
 })
 
 
+# Geographic qualifier: "in Japan", "in Tokyo", "at London", etc.
+# Used by both _try_time_shortcut and _try_facts_shortcut to detect world-clock
+# queries that need the timezone MCP tool, not the local server clock.
+# Matches "in/at/for [Capitalised]" and a curated list of lowercase country names
+# so "What time is it in Tokyo?" and "time in japan" are both caught.
+_GEO_QUALIFIER_RE = re.compile(
+    r"\b(?:in|at|for)\s+(?:[A-Z][a-zA-Z]+(?:\s+[A-Z][a-zA-Z]+)?|"
+    r"japan|tokyo|london|paris|berlin|dubai|singapore|sydney|"
+    r"new\s+(?:york|zealand|delhi)|usa|uk|australia|china|india|europe)\b",
+    re.IGNORECASE,
+)
+
+
 def _try_time_shortcut(user_text: str) -> Optional[str]:
     """
-    Answer time/date queries directly from the server clock — zero tokens.
+    Answer LOCAL time/date queries directly from the server clock — zero tokens.
 
     LLMs reliably hallucinate the current time by reading stale timestamps
     from conversation context instead of the injected current_time value.
     Intercepting these queries here is both more accurate and free.
 
-    Only fires on short, unambiguous time/date messages (≤70 chars).
-    Returns a WhatsApp-formatted reply or None to fall through to the LLM.
+    BUG-1 FIX: "What's the time in Japan right now?" fired this shortcut
+    because "what's the time" is a substring — returning IST instead of JST.
+    Guard: if the message contains a location qualifier ("time in X", "time
+    at X"), step aside so _keyword_tool_from_query routes it to the timezone
+    MCP tool, which gives the correct local time for that city.
+
+    Only fires on short, unambiguous LOCAL time/date messages (≤70 chars).
+    Returns a WhatsApp-formatted reply or None to fall through.
     """
     if len(user_text) > 70:
         return None
     low = user_text.lower().strip()
+
+    # Block location-qualified time queries — they need the timezone MCP tool
+    if _GEO_QUALIFIER_RE.search(user_text):  # check original (preserves case for capital letters)
+        return None
 
     is_time = any(sig in low for sig in _TIME_SIGNALS)
     is_date = any(sig in low for sig in _DATE_SIGNALS)
@@ -1087,6 +1042,23 @@ async def _dispatch_tool(
             )
             from .tools import WebSearchTool
             tool_call = WebSearchTool(tool="web_search", query=query or "")
+    else:
+        # FIX-TOOL-OVERRIDE: Groq 70B sometimes returns explicit tool_call=web_search
+        # for queries that should go to structured MCP tools (news, stocks, timezone).
+        # Evidence: "latest cricket score" → Groq returned tool_call=web_search →
+        # compound-beta-mini failed 3 times. The keyword router correctly identifies
+        # these queries but is skipped when tool_call is NOT None.
+        # Fix: if the LLM explicitly chose web_search, run the keyword router anyway.
+        # If keywords match a better tool, use that. If not, keep web_search as-is.
+        from .tools import WebSearchTool
+        if isinstance(tool_call, WebSearchTool):
+            better = _keyword_tool_from_query(query, _facts)
+            if better is not None:
+                logger.info(
+                    "🔑 tool_dispatch.override  chat=%s  web_search→%s  query=%r",
+                    chat_id, better.tool, query[:60],
+                )
+                tool_call = better
 
     logger.info("🔧 tool_dispatch  chat=%s  tool=%s", chat_id, tool_call.tool)
 
@@ -1133,8 +1105,13 @@ def _keyword_tool_from_query(query: str, facts: Dict[str, str]) -> Optional[Any]
         symbols = [t if "." in t else t + ".NS" for t in filtered[:5]]
         return StocksTool(tool="stocks", symbols=symbols)
 
-    # ── News ──────────────────────────────────────────────────────────────
-    if re.search(r"\b(news|headline|headlines|breaking|latest|current events)\b", low):
+    # ── News / Sports scores ─────────────────────────────────────────────
+    # Include sports because cricket/football scores are best served by GNews.
+    # FIX-CRICKET: Groq 70B returns tool_call=web_search for score queries;
+    # the override in _dispatch_tool redirects them here via keyword routing.
+    if re.search(r"\b(news|headline|headlines|breaking|latest|current events|"
+                 r"cricket|football|tennis|score|scorecard|ipl|match result|"
+                 r"sports update|morning.*news|news.*round)\b", low):
         country = (facts.get("country") or "IN")[:2].upper()
         return NewsTool(tool="news", query=query[:200], country=country)
 
@@ -1295,6 +1272,22 @@ async def _extract_memory(
         if not any(h in low for h in personal_hints):
             return []
 
+        # FIX-COMPLAINT: Complaint / correction messages about the bot's behaviour
+        # must NOT trigger memory extraction. They contain personal pronouns ("I asked
+        # you...") but are describing the bot's error, not declaring personal facts.
+        # Evidence: "I asked you for Japan time and you gave me India time" →
+        # LLM extracted travel_plans='Japan' — wrong, harmful overwrite.
+        _COMPLAINT_SIGNALS = re.compile(
+            r"\b(you gave me|you told me|you said|i asked you|you gave|"
+            r"you made a mistake|that.s wrong|that is wrong|incorrect|wrong answer|"
+            r"you were wrong|that.s not right|you got it wrong|you misunderstood|"
+            r"you ignored|you didn.t|you should have|you need to|"
+            r"why did you|how could you|you failed|you messed up)\b",
+            re.IGNORECASE,
+        )
+        if _COMPLAINT_SIGNALS.search(low):
+            return []
+
         facts_str = ", ".join(f"{k}={v!r}" for k, v in _clean_facts(existing_facts).items())
         messages = [
             {"role": "system", "content": MEMORY_EXTRACTOR_PROMPT},
@@ -1337,6 +1330,66 @@ async def _verify_updates(
                 trace.tag(total_iterations=1, memory_extracted=0,
                           memory_verified=0, memory_total=0)
             return []
+
+        # ── ARCH-5: Value-presence pre-filter ───────────────────────────────
+        # Before spending tokens on LLM verification, reject any proposed update
+        # whose value does not appear (even approximately) in the user message.
+        # This blocks hallucinated facts like travel_plans='Japan' from the
+        # message "I asked you for Japan time" — 'Japan' is present but the
+        # context is not a travel declaration.
+        # Rule: if an existing non-junk value for this key already exists AND
+        # the proposed new value is not a word-for-word substring of user_text,
+        # require the value to be explicit — not just incidentally mentioned.
+        # Note: this only runs for UPDATES to existing facts, not new creations,
+        # to avoid blocking legitimate first-time saves.
+        _user_lower = user_text.lower()
+        pre_filtered: List[MemoryUpdate] = []
+        for u in updates:
+            if getattr(u, "delete", False):
+                pre_filtered.append(u)
+                continue
+            existing_val = (existing_facts.get(u.key) or "").strip()
+            proposed_val = (u.value or "").strip()
+            # Only apply the guard when CHANGING an existing fact (not creating)
+            if existing_val and existing_val.lower() != proposed_val.lower():
+                # Check if the proposed value appears meaningfully in the message
+                # (at least one substantive word from the value is present)
+                value_words = set(re.findall(r"\b[a-z]{3,}\b", proposed_val.lower()))
+                context_words = set(re.findall(r"\b[a-z]{3,}\b", _user_lower))
+                overlap = value_words & context_words
+                if not overlap:
+                    # Value has no word overlap with the message at all — likely
+                    # a hallucination or extraction from a prior context window.
+                    logger.debug(
+                        "verify.pre_filter  key=%s  value=%r  not in message  dropping",
+                        u.key, proposed_val[:40],
+                    )
+                    continue
+                # Check if this looks like an incidental mention rather than a
+                # declaration. Complaint/correction patterns that contain the
+                # value word but aren't asserting it as a personal fact.
+                _complaint_about_bot = re.compile(
+                    r"\b(you gave|you told|you said|i asked you|wrong|mistake|"
+                    r"incorrect|should have|didn.t|didn't)\b",
+                    re.IGNORECASE,
+                )
+                if _complaint_about_bot.search(user_text) and len(value_words) <= 2:
+                    # Short value (1-2 words) found in a complaint → almost
+                    # certainly incidental, not a declaration.
+                    logger.debug(
+                        "verify.pre_filter  key=%s  value=%r  incidental in complaint  dropping",
+                        u.key, proposed_val[:40],
+                    )
+                    continue
+            pre_filtered.append(u)
+
+        if not pre_filtered:
+            if trace:
+                trace.tag(total_iterations=1, memory_extracted=len(updates),
+                          memory_verified=0, memory_total=0)
+            return []
+        updates = pre_filtered
+        # ────────────────────────────────────────────────────────────────────
 
         updates_str = json.dumps([u.model_dump() for u in updates])  # includes delete+confirm fields
         existing_str = ", ".join(
@@ -1820,6 +1873,31 @@ async def run_agent(
                         "result_len": len(search_result or ""),
                     }}
                 )
+            # ── Early exit: empty result after a structured MCP tool ─────────
+            # When the news/weather/stocks MCP tool returned empty, there is no
+            # point asking the LLM to "try again" — it will just dispatch the same
+            # tool again and get empty again (which is what caused the 3-iteration
+            # "morning news round up" and "cricket score" loops in production).
+            # On an empty result from a non-web-search tool, answer honestly
+            # rather than burning 2 more iterations.
+            if not search_result and orch.tool_call is not None:
+                from .tools import WebSearchTool
+                # Only short-circuit for structured tools, not web search
+                # (web search returning empty is handled by compound-beta internally)
+                if not isinstance(orch.tool_call, WebSearchTool) if hasattr(orch, "tool_call") else True:
+                    logger.info(
+                        "🔍 search.empty_exit  iter=%d  tool=%s  — no data, answering directly",
+                        iteration, getattr(orch.tool_call, "tool", "?"),
+                    )
+                    return AgentResult(
+                        reply=ReplyPayload(
+                            type="text",
+                            text="I couldn't find any results for that right now. "
+                                 "Please try rephrasing or try again in a moment.",
+                        ),
+                        iterations=iteration,
+                    )
+
             # ── Early exit: tool returned an "unavailable" notice ────────────
             # When tool returns a non-empty message that signals unavailability
             # (stock data unavailable, market closed, etc.), relay it to the user
@@ -1872,14 +1950,24 @@ async def extract_reply_memory(
     sender_key: str,
 ) -> None:
     """
-    Extract facts confirmed in Shimmi's own reply text. Fire-and-forget.
+    ARCH-3: This function is intentionally a no-op.
 
-    Guards applied before burning any tokens:
-    • Skip question replies — bot is asking, not confirming data
-    • Skip live-data replies (weather / news / stocks markers)
-    • Skip replies with template placeholders like "book's title"
-    • Skip replies too short to carry real personal data
+    Previously this extracted facts from the bot's own replies — a circular design
+    that caused real production bugs:
+      • "favorite_biography='Wings of Fire'" saved from bot's own analysis
+      • "conversation_summary" filled with hallucinated dates
+      • "travel_plans='Japan'" saved from a user complaint, not a travel declaration
+
+    The root problem: the orchestrator already returns memory_updates with everything
+    it wants to remember. A second extraction pass on the bot's own output reads LLM
+    inferences as if they were user-stated facts, then saves them to the DB, then
+    they appear in future prompts, then the LLM hallucinates from them.
+
+    ARCH-1 (source column) and the orchestrator's own memory_updates field together
+    replace everything this function was trying to do — without the pollution.
     """
+    # Deliberately empty. See docstring.
+    return
     try:
         if not reply_text or len(reply_text) < 30:
             return
@@ -1938,7 +2026,13 @@ async def extract_reply_memory(
                     if getattr(u, "delete", False):
                         await delete_fact(sender_key, u.key)
                     else:
-                        await upsert_fact(sender_key, normalize_key(u.key), u.value)
+                        # Reply-extracted facts are bot observations from its own
+                        # reply — never explicit user declarations. Mark bot_inferred
+                        # so they never surface in LLM prompts via source_filter.
+                        await upsert_fact(
+                            sender_key, normalize_key(u.key), u.value,
+                            source="bot_inferred",
+                        )
                     logger.info(
                         "🧠 reply_memory.saved  sender=%s  key=%s  value=%r",
                         sender_key, u.key, u.value[:60],
@@ -2108,17 +2202,33 @@ async def consolidate_user_facts(whatsapp_id: str) -> None:
                 )
                 continue
 
-            # Write canonical key with the best value
-            await sqlite_store.upsert_fact(whatsapp_id, canonical, value)
+            # FIX-CONSOL-NOOP: absorb=[] with an unchanged value is pure wasted work.
+            # Evidence: 36 consolidate.merged log lines with absorbed=[] in one session
+            # — the LLM was "merging" single keys with no duplicates, just re-writing
+            # the same value. This burns ~512 tokens per consolidation run for nothing.
+            # Skip the upsert when nothing would actually change.
+            if not absorb and facts.get(canonical, "").strip() == value:
+                logger.debug(
+                    "consolidate.skip_noop  sender=%s  canonical=%s  (value unchanged, nothing to absorb)",
+                    whatsapp_id, canonical,
+                )
+                continue
+
+            # Write canonical key. Consolidation preserves provenance:
+            # if the key already existed (user_stated), keep it user_stated.
+            # If it's a new canonical from merging, mark bot_inferred.
+            consol_source = "user_stated" if canonical in original_keys else "bot_inferred"
+            status = await sqlite_store.upsert_fact(whatsapp_id, canonical, value, source=consol_source)
 
             # Delete only verified alias keys
             for alias in absorb:
                 await _consolidation_delete(whatsapp_id, alias)
 
-            logger.info(
-                "🔑 consolidate.merged  sender=%s  canonical=%s  absorbed=%s  value=%r",
-                whatsapp_id, canonical, absorb, value[:60],
-            )
+            if status != "unchanged" or absorb:
+                logger.info(
+                    "🔑 consolidate.merged  sender=%s  canonical=%s  absorbed=%s  value=%r",
+                    whatsapp_id, canonical, absorb, value[:60],
+                )
             applied += 1
         except Exception as exc:
             logger.debug("consolidate.merge_fail  sender=%s  err=%s", whatsapp_id, str(exc)[:80])
