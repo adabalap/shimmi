@@ -1,5 +1,5 @@
 """
-live_data.py — Shimmi v3.0.3
+live_data.py — Shimmi v3.1.0
 
 Changes vs v3.0.1:
   ARCH-1  All data fetching now routes through mcp_client → mcp_server (port 7000)
@@ -17,6 +17,11 @@ Changes vs v3.0.1:
     get_indian_stocks(symbols)      → WhatsApp-formatted string | None
     get_news(query, country)        → WhatsApp-formatted string | None
     get_stock_by_name(query)        → WhatsApp-formatted string | None
+
+Changes vs v3.0.3:
+  FIX-3  Added _normalize_news_query() — synchronous module-level function that
+         tools.py imports. Was missing entirely, causing ImportError on every
+         news tool call (logged as tools.dispatch.error  tool=news).
 """
 from __future__ import annotations
 
@@ -312,6 +317,32 @@ def _format_news_mcp(data: dict, query: str) -> Optional[str]:
             lines.append(f"• *{title[:90]}*" + (f"  _({source})_" if source else ""))
     lines += ["", f"_Source: {data.get('source', 'MCP News')}_"]
     return "\n".join(lines)
+
+
+# FIX-3: _normalize_news_query — synchronous module-level function imported by tools.py.
+# tools.py calls this BEFORE calling get_news() so the query is clean regardless of
+# whether it arrives via tool_call JSON or the agent's live_search path.
+# _rewrite_news_query (below) is the async LLM-powered version used inside get_news().
+_NORMALIZE_META = re.compile(
+    r"\b(morning|evening|night|daily|round.?up|roundup|briefing|top (news|stories|headlines)"
+    r"|latest news|news today|current news|headlines today|what.?s (happening|new|on)|news round)\b",
+    re.IGNORECASE,
+)
+
+def _normalize_news_query(query: str) -> str:
+    """
+    Synchronous fast-path normaliser for meta-phrase news queries.
+    Converts phrases like 'morning news round up' or 'top stories today'
+    → 'India top news today' so GNews returns real headlines instead of 0 results.
+
+    This is a zero-cost pre-filter that runs before any LLM or HTTP call.
+    The async _rewrite_news_query (below) handles longer-tail rewrites via LLM.
+    """
+    if not query:
+        return "India top news"
+    if _NORMALIZE_META.search(query):
+        return "India top news today"
+    return query
 
 
 # Meta-phrases that GNews treats as literal search terms and returns 0 results.
