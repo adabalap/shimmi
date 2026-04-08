@@ -1,5 +1,5 @@
 """
-database.py — Shimmi v3.4.0
+database.py — Shimmi v3.7.0
 
 Changes vs v2.7.0:
   ① reminders table + ReminderStore methods
@@ -955,7 +955,20 @@ class SQLiteMemory:
 class SentenceTransformerEmbedding:
     def __init__(self, model_name: str):
         from sentence_transformers import SentenceTransformer
-        self._model = SentenceTransformer(model_name, device="cpu")
+        import os
+        # Use cached model without checking HuggingFace Hub for updates.
+        # The model is already downloaded; the Hub check adds 40+ seconds of
+        # network timeouts on every startup when huggingface.co is unreachable.
+        # Set HF_HUB_OFFLINE=1 env var OR use local_files_only=True here.
+        # Falls back to online mode if the model isn't cached yet.
+        _offline = os.getenv("HF_HUB_OFFLINE", "0") == "1"
+        try:
+            self._model = SentenceTransformer(
+                model_name, device="cpu", local_files_only=True,
+            )
+        except Exception:
+            # Model not cached yet — download it (first-run or cache cleared)
+            self._model = SentenceTransformer(model_name, device="cpu")
 
     def __call__(self, input: List[str]) -> List[List[float]]:
         emb = self._model.encode(

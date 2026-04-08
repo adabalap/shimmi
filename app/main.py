@@ -1,11 +1,12 @@
 """
-main.py — Shimmi v3.7.0
+main.py — Shimmi v3.8.0
 
-Changes vs v3.3.0:
-  FIX-1   "Is typing" indicator now fires at enqueue time (CHAT_TYPING_EVENTS dict).
-          Previously only started inside process_message — missed the queue wait gap.
-  IMPR-1  source_filter="all" so bot_inferred (ambient) facts reach orchestrator.
-  IMPR-2  consolidate_user_facts only scheduled when user has >= 5 facts.
+Changes vs v3.8.0:
+  FIX-TYPING  Reverted to exact original single-keepalive pattern (process_message only).
+              Removed CHAT_TYPING_EVENTS and the enqueue-time second task — two
+              simultaneous startTyping calls every 4s were interfering with each other.
+  FIX-TYPING  waha_provider now resolves @lid/@c.us → @s.whatsapp.net for presence,
+              which is the correct JID format for Baileys/NOWEB engine presence updates.
 
 Changes vs v3.2.0:
   FIX-1  "Is typing" now shown immediately at enqueue (was only shown after worker
@@ -60,11 +61,6 @@ UTC    = timezone.utc
 CHAT_QUEUES:      Dict[str, asyncio.Queue] = {}
 CHAT_WORKERS:     Dict[str, asyncio.Task]  = {}
 CHAT_LAST_MSG_TS: Dict[str, float]          = {}
-# FIX-1: Per-chat typing stop events.  Created at enqueue time so the "is typing"
-# indicator appears immediately — before the message even reaches the worker.
-# process_message reuses the same event rather than creating a new one, so there
-# is no gap or double-fire when the worker picks the item up.
-CHAT_TYPING_EVENTS: Dict[str, asyncio.Event] = {}
 _WORKER_IDLE_TIMEOUT_SEC: float = 3_600.0
 BOT_IDENTITY = "shimmi-bot"
 _REMINDER_TASK: Optional[asyncio.Task] = None
@@ -419,15 +415,12 @@ async def process_message(
 ) -> None:
     async with Trace(event_id=event_id, chat_id=chat_id, sender_id=sender_id) as trace:
 
-        # Typing keepalive: started here inside process_message (the proven-working
-        # original approach). The webhook handler also fires one at enqueue time
-        # to cover the queue-wait gap. Both use the SAME stop_evt so they coordinate:
-        # when we set stop_evt, both keepalives stop and call stopTyping.
-        # Two overlapping startTyping calls are harmless — WAHA deduplicates them.
-        stop_evt = CHAT_TYPING_EVENTS.pop(chat_id, None) or asyncio.Event()
+        # Single typing keepalive — exact original pattern that worked.
+        # Starts immediately when process_message begins, stops when reply is sent.
+        stop_evt      = asyncio.Event()
         keepalive_task = asyncio.create_task(
             typing_keepalive(chat_id, stop_evt),
-            name=f"typing_pm:{chat_id}",
+            name=f"typing:{chat_id}",
         )
 
         sender_key = canonical_user_key(sender_id) or sender_id or ""
@@ -864,26 +857,12 @@ async def webhook(request: Request):
         CHAT_QUEUES[chat_id]  = q
         CHAT_WORKERS[chat_id] = asyncio.create_task(_chat_worker(chat_id, q))
 
-    # FIX-1 (v3.5): Start typing BEFORE q.put() so the keepalive is always running
-    # before the worker can dequeue and reach process_message. Storing the event
-    # before enqueue eliminates the race condition where process_message.pop()
-    # returned None (event not yet stored) and spawned a competing keepalive task.
-    typing_stop = asyncio.Event()
-    CHAT_TYPING_EVENTS[chat_id] = typing_stop
-    asyncio.create_task(
-        typing_keepalive(chat_id, typing_stop),
-        name=f"typing:{chat_id}",
-    )
-    logger.debug("⌨️  typing.start  chat=%s", chat_id)
-
     try:
         await asyncio.wait_for(
             q.put({"text": text or "", "sender_id": sender_id, "event_id": event_id, "from_me": from_me}),
             timeout=settings.llm_queue_wait_sec,
         )
     except asyncio.TimeoutError:
-        # Cancel the typing indicator we just started
-        typing_stop.set()
         await send_text(chat_id, "I'm busy right now — try again in a moment.")
         logger.warning("⏳ queue.timeout  chat=%s  event=%s", chat_id, event_id)
         return JSONResponse({"status": "ok", "message": "queue timeout"})
