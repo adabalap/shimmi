@@ -1,10 +1,3 @@
-"""
-utils.py — Shimmi v2.4.0
-
-New in this version:
-  - bot_signature()  — appends emoji + rotating AI tagline to every reply
-  - Dynamic tagline pool (deterministic rotation by message count / hash)
-"""
 from __future__ import annotations
 
 import base64
@@ -16,73 +9,6 @@ from typing import List, Optional
 
 from .config import settings
 
-# ---------------------------------------------------------------------------
-# Bot signature & dynamic taglines
-# ---------------------------------------------------------------------------
-
-_TAGLINES = [
-    "Intelligence that listens",
-    "Thinking in milliseconds, speaking your language",
-    "AI that remembers, learns, evolves",
-    "Context-aware. Always.",
-    "Your AI, personalised",
-    "Not just smart — present",
-    "Learning with every message",
-    "Where language meets intelligence",
-    "Powered by curiosity",
-    "AI that grows with you",
-    "Fluent in human",
-    "Every answer, thoughtfully crafted",
-]
-
-_tagline_counter: int = 0
-
-
-def _next_tagline(seed: str = "") -> str:
-    """
-    Return a deterministic-but-rotating tagline.
-    Uses a seed (e.g. chat_id + event_id) so the same event always gets
-    the same tagline, but different chats/events get different ones.
-    """
-    if seed:
-        idx = int(hashlib.md5(seed.encode()).hexdigest(), 16) % len(_TAGLINES)
-    else:
-        global _tagline_counter
-        idx = _tagline_counter % len(_TAGLINES)
-        _tagline_counter += 1
-    return _TAGLINES[idx]
-
-
-def bot_signature(seed: str = "") -> str:
-    """
-    Returns the standard bot footer to append to every outgoing message.
-    Format:
-        ─────────────────────
-        🤖 _Thinking in milliseconds, speaking your language_
-    """
-    tagline = _next_tagline(seed)
-    return f"\n─────────────────────\n🤖 _{tagline}_"
-
-
-def sign_message(text: str, seed: str = "") -> str:
-    """
-    Append the bot signature to `text`.
-    Respects the 3800-char limit: signature is only added if the result fits.
-    """
-    if not text:
-        return text
-    sig = bot_signature(seed)
-    combined = text + sig
-    # Hard cap — truncate body, keep signature
-    if len(combined) > 3800:
-        max_body = 3800 - len(sig) - 1
-        combined = text[:max_body].rstrip() + "…" + sig
-    return combined
-
-
-# ---------------------------------------------------------------------------
-# Canonical helpers
-# ---------------------------------------------------------------------------
 
 def canonical_text(text: str, cap: int = 4000) -> str:
     t = re.sub(r"\s+", " ", (text or "").strip())
@@ -122,7 +48,7 @@ def verify_signature(raw: bytes, header_value: Optional[str]) -> bool:
 def canonical_user_key(jid: Optional[str]) -> str:
     if not jid:
         return ""
-    head = jid.split("@", 1)[0]
+    head = jid.split('@', 1)[0]
     digits = re.sub(r"\D+", "", head)
     return digits
 
@@ -148,6 +74,7 @@ def compile_prefix_re() -> None:
         _PREFIX_ANY_RE = re.compile(r"a^")
         _PREFIX_TOKEN_RE = re.compile(r"a^")
         return
+
     _PREFIX_ANY_RE = re.compile(r"(?i)@?(?:%s)\b" % alt)
     _PREFIX_TOKEN_RE = re.compile(r"(?i)(?:^|[\s,;:–—-]+)@?(?:%s)\b[\s,;:!?\.]*" % alt)
 
@@ -165,6 +92,7 @@ def strip_invocation(text: str) -> str:
         return ""
     if _PREFIX_TOKEN_RE is None:
         compile_prefix_re()
+
     out = _PREFIX_TOKEN_RE.sub(" ", text)
     out = re.sub(r"\s+([,;:!?\.])", r"\1", out)
     out = re.sub(r"([,;:!?\.])\s+", r"\1 ", out)
@@ -173,8 +101,6 @@ def strip_invocation(text: str) -> str:
 
 
 def chat_is_allowed(chat_id: Optional[str]) -> bool:
-    if settings.allow_all_chats:
-        return bool(chat_id)
     allow = settings.allowed_chat_jids
     if not allow:
         return False
@@ -194,26 +120,28 @@ def sanitize_for_whatsapp(text: str) -> str:
     out = re.sub(r"(?m)^\s*[-*]\s+", "• ", out)
 
     lines = out.splitlines()
-    looks_like_table = (
-        any("|" in ln for ln in lines)
-        and any(set(ln.strip()) <= set("|:- ") for ln in lines)
-    )
+    looks_like_table = any('|' in ln for ln in lines) and any(set(ln.strip()) <= set('|:- ') for ln in lines)
     if looks_like_table:
         cleaned: List[str] = []
         for ln in lines:
             s = ln.strip()
-            if not s or set(s) <= set("|:- "):
+            if not s:
                 continue
-            if "|" in s:
-                cells = [c.strip() for c in s.strip("|").split("|") if c.strip()]
+            if set(s) <= set('|:- '):
+                continue
+            if '|' in s:
+                cells = [c.strip() for c in s.strip('|').split('|') if c.strip()]
                 if cells:
-                    cleaned.append("• " + " — ".join(cells))
+                    cleaned.append('• ' + ' — '.join(cells))
             else:
                 cleaned.append(s)
         out = "\n".join(cleaned)
 
     out = re.sub(r"\n{3,}", "\n\n", out)
     out = re.sub(r"[ \t]{2,}", " ", out)
+
+    if has_prefix(out):
+        out = strip_invocation(out)
 
     if len(out) > 3800:
         out = out[:3800].rstrip() + "…"
