@@ -1,5 +1,5 @@
 """
-waha_provider.py — Shimmi v3.8.0
+waha_provider.py — Shimmi v3.9.0
 
 Improvements:
   - Robust msg_id extraction: tries all known WAHA response shapes before
@@ -122,35 +122,29 @@ async def close_waha() -> None:
             HTTPX_WAHA = None
 
 
-def _resolve_typing_jid(chat_id: str) -> str:
-    """
-    Resolve chat_id to the correct JID format for WAHA presence (startTyping).
-
-    WhatsApp multi-device uses @lid JIDs for linked devices internally.
-    WAHA's NOWEB engine (Baileys) requires @s.whatsapp.net for presence updates.
-    Group JIDs (@g.us) are passed through unchanged.
-    """
-    if "@g.us" in chat_id:
-        return chat_id                                     # groups: unchanged
-    if "@" in chat_id:
-        number = chat_id.split("@")[0]
-        return f"{number}@s.whatsapp.net"                 # personal: force s.whatsapp.net
-    return chat_id                                        # fallback: use as-is
-
-
 async def start_typing(chat_id: str) -> None:
+    """
+    Send startTyping to WAHA. Uses the raw chat_id exactly as received from
+    the webhook — the original format that worked before any JID conversion.
+    Logs the full WAHA response body at INFO so we can see exactly what
+    WAHA says, not just the status code.
+    """
     if not HTTPX_WAHA:
         return
-    jid = _resolve_typing_jid(chat_id)
     try:
         resp = await HTTPX_WAHA.post(
             f"{settings.waha_api_url}/startTyping",
-            json={"session": settings.waha_session, "chatId": jid},
+            json={"session": settings.waha_session, "chatId": chat_id},
         )
-        logger.info("⌨️  typing.start  chat=%s  jid=%s  status=%d", chat_id, jid, resp.status_code)
-        if resp.status_code >= 400:
+        body = ""
+        try:
             body = resp.text[:200]
-            logger.warning("typing.start_rejected  status=%d  body=%s", resp.status_code, body)
+        except Exception:
+            pass
+        logger.info(
+            "⌨️  typing.start  chat=%s  status=%d  body=%s",
+            chat_id, resp.status_code, body,
+        )
     except Exception as exc:
         logger.warning("typing.start_fail  chat=%s  err=%s", chat_id, str(exc)[:120])
 
@@ -158,13 +152,20 @@ async def start_typing(chat_id: str) -> None:
 async def stop_typing(chat_id: str) -> None:
     if not HTTPX_WAHA:
         return
-    jid = _resolve_typing_jid(chat_id)
     try:
         resp = await HTTPX_WAHA.post(
             f"{settings.waha_api_url}/stopTyping",
-            json={"session": settings.waha_session, "chatId": jid},
+            json={"session": settings.waha_session, "chatId": chat_id},
         )
-        logger.info("⌨️  typing.stop  chat=%s  jid=%s  status=%d", chat_id, jid, resp.status_code)
+        body = ""
+        try:
+            body = resp.text[:200]
+        except Exception:
+            pass
+        logger.info(
+            "⌨️  typing.stop  chat=%s  status=%d  body=%s",
+            chat_id, resp.status_code, body,
+        )
     except Exception as exc:
         logger.warning("typing.stop_fail  chat=%s  err=%s", chat_id, str(exc)[:120])
 
