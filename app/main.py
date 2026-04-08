@@ -1,5 +1,5 @@
 """
-main.py — Shimmi v3.5.0
+main.py — Shimmi v3.6.0
 
 Changes vs v3.3.0:
   FIX-1   "Is typing" indicator now fires at enqueue time (CHAT_TYPING_EVENTS dict).

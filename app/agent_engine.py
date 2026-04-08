@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.5.0
+agent_engine.py — Shimmi v3.6.0
 
 Changes vs v3.3.0:
 
@@ -551,12 +551,21 @@ async def _call_llm(
     timeout: float,
     chat_id: str,
     label: str,
+    json_mode: bool = True,
 ) -> str:
     """
     Single attempt to call the LLM.  Handles circuit-tripping and budget tracking.
     Raises the original exception on failure.
+
+    json_mode=True  (default) — forces response_format=json_object. Required for all
+                                structured extraction/orchestration calls.
+    json_mode=False            — plain text response. Required when the prompt does
+                                not contain the word "json" (e.g. summary shortcut).
+                                Groq returns HTTP 400 if json_mode=True but the prompt
+                                has no "json" mention.
     """
     t0 = time.monotonic()
+    fmt = {"type": "json_object"} if json_mode else {"type": "text"}
 
     async def _attempt():
         if provider == "gemini":
@@ -568,7 +577,7 @@ async def _call_llm(
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=0.3,
-                    response_format={"type": "json_object"},
+                    response_format=fmt,
                 ),
                 timeout=timeout,
             )
@@ -581,7 +590,7 @@ async def _call_llm(
                     messages=messages,
                     max_tokens=max_tokens,
                     temperature=0.3,
-                    response_format={"type": "json_object"},
+                    response_format=fmt,
                 ),
                 timeout=timeout,
             )
@@ -645,10 +654,14 @@ async def _groq_raw(
     label: str,
     role: str,
     timeout: Optional[float] = None,
+    json_mode: bool = True,
 ) -> str:
     """
     Route to the best available provider for the given role, with automatic
     fallback if the primary is circuit-tripped.
+
+    json_mode=False must be passed for plain-text calls (e.g. summary_shortcut)
+    where the prompt contains no "json" mention — Groq 400s otherwise.
     """
     provider, model = _pick_provider_and_model(chat_id, role)
     effective_timeout = timeout or (
@@ -659,7 +672,7 @@ async def _groq_raw(
             messages,
             provider=provider, model=model,
             max_tokens=max_tokens, timeout=effective_timeout,
-            chat_id=chat_id, label=label,
+            chat_id=chat_id, label=label, json_mode=json_mode,
         )
     except Exception as first_exc:
         # Try fallback provider if primary failed
@@ -701,7 +714,7 @@ async def _groq_raw(
                     messages,
                     provider=fb_provider, model=fb_model,
                     max_tokens=max_tokens, timeout=fb_timeout,
-                    chat_id=chat_id, label=f"{label}_fb",
+                    chat_id=chat_id, label=f"{label}_fb", json_mode=json_mode,
                 )
             except Exception as fb_exc:
                 fb_exc_str = str(fb_exc)
@@ -1929,6 +1942,7 @@ async def _try_summary_shortcut(
             label="summary_shortcut",
             role="extract",
             timeout=20.0,
+            json_mode=False,   # plain text — no JSON structure needed for summaries
         )
     except Exception as exc:
         logger.warning("summary_shortcut.llm_fail  chat=%s  err=%s", chat_id, str(exc)[:150])

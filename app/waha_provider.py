@@ -1,5 +1,5 @@
 """
-waha_provider.py — Shimmi v3.5.0
+waha_provider.py — Shimmi v3.6.0
 
 Improvements:
   - Robust msg_id extraction: tries all known WAHA response shapes before
@@ -122,31 +122,46 @@ async def close_waha() -> None:
             HTTPX_WAHA = None
 
 
+def _typing_jid(chat_id: str) -> str:
+    """
+    WAHA's startTyping/stopTyping endpoints require a standard JID.
+    Multi-device sessions use @lid JIDs internally, but WAHA's typing API
+    only accepts @c.us (personal) or @g.us (group) formats.
+    Remap @lid → @c.us so typing calls reach WhatsApp correctly.
+    Group JIDs (@g.us) are passed through unchanged.
+    """
+    if chat_id.endswith("@lid"):
+        return chat_id.replace("@lid", "@c.us")
+    return chat_id
+
+
 async def start_typing(chat_id: str) -> None:
     if not HTTPX_WAHA:
         logger.debug("typing.skip  reason=no_client  chat=%s", chat_id)
         return
+    jid = _typing_jid(chat_id)
     try:
         resp = await HTTPX_WAHA.post(
             f"{settings.waha_api_url}/startTyping",
-            json={"session": settings.waha_session, "chatId": chat_id},
+            json={"session": settings.waha_session, "chatId": jid},
         )
-        logger.debug("typing.start  chat=%s  status=%d", chat_id, resp.status_code)
+        logger.debug("typing.start  chat=%s  jid=%s  status=%d", chat_id, jid, resp.status_code)
     except Exception as exc:
-        logger.warning("typing.start_fail  chat=%s  err=%s", chat_id, str(exc)[:120])
+        logger.warning("typing.start_fail  chat=%s  jid=%s  err=%s", chat_id, jid, str(exc)[:120])
 
 
 async def stop_typing(chat_id: str) -> None:
     if not HTTPX_WAHA:
         return
+    jid = _typing_jid(chat_id)
     try:
         await HTTPX_WAHA.post(
             f"{settings.waha_api_url}/stopTyping",
-            json={"session": settings.waha_session, "chatId": chat_id},
+            json={"session": settings.waha_session, "chatId": jid},
         )
-        logger.debug("typing.stop  chat=%s", chat_id)
+        logger.debug("typing.stop  chat=%s  jid=%s", chat_id, jid)
     except Exception as exc:
-        logger.warning("typing.stop_fail  chat=%s  err=%s", chat_id, str(exc)[:120])
+        logger.warning("typing.stop_fail  chat=%s  jid=%s  err=%s", chat_id, jid, str(exc)[:120])
 
 
 async def typing_keepalive(chat_id: str, stop_event: asyncio.Event) -> None:
