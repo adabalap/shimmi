@@ -1,5 +1,5 @@
 """
-waha_provider.py — Shimmi v2.7.0
+waha_provider.py — Shimmi v3.5.0
 
 Improvements:
   - Robust msg_id extraction: tries all known WAHA response shapes before
@@ -124,14 +124,16 @@ async def close_waha() -> None:
 
 async def start_typing(chat_id: str) -> None:
     if not HTTPX_WAHA:
+        logger.debug("typing.skip  reason=no_client  chat=%s", chat_id)
         return
     try:
-        await HTTPX_WAHA.post(
+        resp = await HTTPX_WAHA.post(
             f"{settings.waha_api_url}/startTyping",
             json={"session": settings.waha_session, "chatId": chat_id},
         )
-    except Exception:
-        pass
+        logger.debug("typing.start  chat=%s  status=%d", chat_id, resp.status_code)
+    except Exception as exc:
+        logger.warning("typing.start_fail  chat=%s  err=%s", chat_id, str(exc)[:120])
 
 
 async def stop_typing(chat_id: str) -> None:
@@ -142,8 +144,9 @@ async def stop_typing(chat_id: str) -> None:
             f"{settings.waha_api_url}/stopTyping",
             json={"session": settings.waha_session, "chatId": chat_id},
         )
-    except Exception:
-        pass
+        logger.debug("typing.stop  chat=%s", chat_id)
+    except Exception as exc:
+        logger.warning("typing.stop_fail  chat=%s  err=%s", chat_id, str(exc)[:120])
 
 
 async def typing_keepalive(chat_id: str, stop_event: asyncio.Event) -> None:

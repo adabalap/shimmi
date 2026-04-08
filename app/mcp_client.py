@@ -1,5 +1,12 @@
 """
-mcp_client.py — Shimmi v3.2.0
+mcp_client.py — Shimmi v3.4.0
+
+Changes vs v3.2.0:
+  FIX-STOCKS  Per-endpoint timeouts: stocks=20s, news=10s, weather=10s (was 8s flat).
+              The /stocks ReadTimeout error was causing PAYTM and all stock queries
+              to fail — yfinance cold-starts take 15-20s on first call.
+  FIX         Explicit httpx.Timeout object (connect=5s, read=default) for cleaner
+              per-call overrides. timeout param added to _get().
 
 Changes vs v3.0.3:
   FIX   Duplicate mcp_format() definition removed (was defined twice).
@@ -20,23 +27,33 @@ import httpx
 logger = logging.getLogger("app.mcp")
 
 _MCP_BASE = os.getenv("MCP_SERVER_URL", "http://localhost:7000")
-_TIMEOUT  = float(os.getenv("MCP_TIMEOUT", "8"))
+_TIMEOUT  = float(os.getenv("MCP_TIMEOUT", "12"))
+
+# Per-endpoint timeout overrides — stocks/yfinance is slow on cold start
+_TIMEOUT_STOCKS  = float(os.getenv("MCP_TIMEOUT_STOCKS",  "20"))
+_TIMEOUT_NEWS    = float(os.getenv("MCP_TIMEOUT_NEWS",    "10"))
+_TIMEOUT_WEATHER = float(os.getenv("MCP_TIMEOUT_WEATHER", "10"))
 
 _CLIENT: Optional[httpx.AsyncClient] = None
 
 
 def _client() -> httpx.AsyncClient:
     global _CLIENT
+    # Use connect=5s but no read timeout at client level — per-call timeouts handle it
     if _CLIENT is None or _CLIENT.is_closed:
-        _CLIENT = httpx.AsyncClient(base_url=_MCP_BASE, timeout=_TIMEOUT)
+        _CLIENT = httpx.AsyncClient(
+            base_url=_MCP_BASE,
+            timeout=httpx.Timeout(connect=5.0, read=_TIMEOUT, write=5.0, pool=2.0),
+        )
     return _CLIENT
 
 
-async def _get(path: str, **params) -> Optional[dict]:
+async def _get(path: str, timeout: Optional[float] = None, **params) -> Optional[dict]:
     try:
         resp = await _client().get(
             path,
             params={k: v for k, v in params.items() if v is not None},
+            timeout=timeout,   # None → use client default
         )
         resp.raise_for_status()
         return resp.json()
@@ -54,17 +71,18 @@ async def _get(path: str, **params) -> Optional[dict]:
 
 async def mcp_news(query: str = "top headlines", country: str = "in") -> Optional[dict]:
     """Fetch news headlines. Returns dict with 'articles' list or None."""
-    return await _get("/news", q=query, country=country)
+    return await _get("/news", timeout=_TIMEOUT_NEWS, q=query, country=country)
 
 
 async def mcp_stocks(symbols: str = "^NSEI,^BSESN,RELIANCE.NS,TCS.NS,INFY.NS") -> Optional[dict]:
     """Fetch Indian stock prices. Returns dict with 'stocks' list or None."""
-    return await _get("/stocks", symbols=symbols)
+    # FIX-STOCKS-2: yfinance cold-starts can take 15s+ — use dedicated longer timeout
+    return await _get("/stocks", timeout=_TIMEOUT_STOCKS, symbols=symbols)
 
 
 async def mcp_weather(city: str, country: str = "IN", days: int = 3) -> Optional[dict]:
     """Fetch weather + 3-day forecast. Returns weather dict or None."""
-    return await _get("/weather", city=city, country=country, days=days)
+    return await _get("/weather", timeout=_TIMEOUT_WEATHER, city=city, country=country, days=days)
 
 
 async def mcp_currency(

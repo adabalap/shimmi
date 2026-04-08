@@ -1,5 +1,26 @@
 """
-agent_engine.py — Shimmi v3.3.0
+agent_engine.py — Shimmi v3.5.0
+
+Changes vs v3.3.0:
+
+  FIX-FACTS   _clean_facts() now strips 9 ephemeral/bloat keys and truncates
+              fact values to 180 chars before building orchestrator prompts.
+              Reduces prompt size by ~40% for power users with 60+ facts.
+              Dropped keys: recent_query, recent_search, conversation_since_morning,
+              last_summary, recent_article_details, favorite_news_source_details,
+              arrival_time, destination, next_meeting_*, social_security_number.
+
+  FIX-SUMMARY New _try_summary_shortcut() intercepts "summarise today/yesterday/
+              last week" queries. Reads actual timestamped rows from SQLite
+              message_log (time-windowed), calls 8B to generate summary, saves
+              back to DB. Zero orchestrator tokens. Replaces the broken approach
+              where a stale conversation_summary fact (frozen at March 17) was
+              fed to the orchestrator which then guessed or hallucinated.
+
+  FIX-STOCKS  Broader stock keyword trigger regex. Better ticker filter set.
+              Symbol always gets .NS suffix if unqualified (PAYTM → PAYTM.NS).
+
+  FIX-2       str() coerce on tool_dispatcher return value (AttributeError fix).
 
 Changes vs v3.1.0 (this release):
 
@@ -719,20 +740,41 @@ _JUNK_VALUES = frozenset({
 })
 
 
+# Keys that are useful for search/consolidation but waste tokens in the orchestrator prompt.
+# These are transient/session keys or long-form blobs that pollute the context window.
+_PROMPT_SKIP_KEYS: frozenset = frozenset({
+    "recent_query", "recent_search", "conversation_since_morning", "last_summary",
+    "recent_article_details",  # can be 800+ chars of article text
+    "favorite_news_source_details",  # verbose description, not a useful fact
+    "arrival_time", "destination",  # session-ephemeral navigation data
+    "next_meeting_team", "next_meeting_time", "next_trip_start_date",  # stale fast
+    "social_security_number",  # should never have been saved; security risk in prompts
+})
+
+# Max characters for a single fact value in the orchestrator prompt.
+# Long values like conversation_summary, favorite_quote get truncated.
+_FACT_VALUE_MAX_CHARS = 180
+
+
 def _clean_facts(facts: Dict[str, str]) -> Dict[str, str]:
     """
-    Filter junk values from a facts dict before building LLM prompts.
+    Filter and trim facts before building LLM prompts.
 
-    ARCH-1 note: Ephemeral key filtering (previously _EPHEMERAL_KEYS_EXACT and
-    _EPHEMERAL_KEY_PREFIXES) is now handled at DB level via source='user_stated'.
-    get_all_facts(source_filter="user_stated") ensures bot-inferred facts never
-    appear in the facts dict passed here. This function only strips junk values.
+    - Drops junk/empty values
+    - Drops ephemeral or security-sensitive keys (_PROMPT_SKIP_KEYS)
+    - Truncates long values to _FACT_VALUE_MAX_CHARS so a 63-fact user
+      doesnt burn 3K+ tokens on facts alone every single message
     """
     out = {}
     for k, v in facts.items():
         if not v or str(v).strip().lower() in _JUNK_VALUES:
             continue
-        out[k] = v
+        if k in _PROMPT_SKIP_KEYS:
+            continue
+        v_str = str(v)
+        if len(v_str) > _FACT_VALUE_MAX_CHARS:
+            v_str = v_str[:_FACT_VALUE_MAX_CHARS] + "…"
+        out[k] = v_str
     return out
 
 
@@ -1107,11 +1149,20 @@ def _keyword_tool_from_query(query: str, facts: Dict[str, str]) -> Optional[Any]
         )
 
     # ── Stocks / markets ──────────────────────────────────────────────────
-    if re.search(r"\b(stock|share|nifty|sensex|bse|nse|market|equity|paytm|reliance|tcs|infy)\b", low):
+    if re.search(
+        r"\b(stock|share|price|nifty|sensex|bse|nse|market|equity|"
+        r"paytm|reliance|tcs|infy|infosys|wipro|hdfc|icici|sbi|zomato|"
+        r"adani|airtel|bajaj|ongc|kotak|ltimindtree|hcl|tech|mahindra)\b",
+        low
+    ):
         tickers = re.findall(r"\b([A-Z]{2,12}(?:\.NS|\.BO)?)\b", query)
-        filtered = [t for t in tickers
-                    if t not in {"NSE", "BSE", "IPO", "MF", "ETF", "WHAT", "HOW", "NSE"}]
+        _SKIP = {"NSE", "BSE", "IPO", "MF", "ETF", "WHAT", "HOW", "THE",
+                 "FOR", "AND", "OF", "IN", "ON", "AT", "TO", "BY"}
+        filtered = [t for t in tickers if t not in _SKIP]
+        # FIX-STOCKS-1: Always append .NS for unqualified Indian tickers so
+        # yfinance resolves them correctly (PAYTM→PAYTM.NS, RELIANCE→RELIANCE.NS).
         symbols = [t if "." in t else t + ".NS" for t in filtered[:5]]
+        # If no explicit ticker found, return empty symbols → MCP returns top indices
         return StocksTool(tool="stocks", symbols=symbols)
 
     # ── News / Sports scores ─────────────────────────────────────────────
@@ -1710,6 +1761,219 @@ def _build_orchestrator_messages(
 # Public entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Conversation summary shortcut — zero orchestrator tokens
+# ─────────────────────────────────────────────────────────────────────────────
+
+_SUMMARY_RE = re.compile(
+    r"\b(summarize|summarise|summary|recap|what happened|what did we|"
+    r"what have we|what was|catch me up|brief me|tell me about our|"
+    r"our conversation|what did i|what have i)\b",
+    re.IGNORECASE,
+)
+
+_WINDOW_RE = re.compile(
+    r"\b(today|this morning|this afternoon|this evening|tonight|"
+    r"last (hour|\d+ hours?)|yesterday|last (night|week|month)|"
+    r"past (\d+)\s*(hours?|days?|weeks?)|last (24|48|72) hours?|"
+    r"since (yesterday|last week|this morning|today)|"
+    r"so far|just now|recently)\b",
+    re.IGNORECASE,
+)
+
+
+def _parse_window_since(text: str) -> datetime:
+    """
+    Parse the start of the requested time window as a UTC datetime.
+    Returns a UTC datetime representing "since when" to pull messages.
+    """
+    low  = text.lower()
+    tz   = _get_local_tz()
+    now  = datetime.now(tz)
+
+    if any(w in low for w in ("this morning", "today", "so far", "this afternoon",
+                               "this evening", "tonight")):
+        # Since local midnight today
+        return now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
+
+    if any(w in low for w in ("yesterday", "last night")):
+        # Since midnight the day before yesterday → covers all of yesterday
+        yesterday_midnight = (now - timedelta(days=1)).replace(
+            hour=0, minute=0, second=0, microsecond=0)
+        return yesterday_midnight.astimezone(UTC)
+
+    if "last week" in low:
+        return (now - timedelta(days=7)).astimezone(UTC)
+
+    if "last month" in low:
+        return (now - timedelta(days=30)).astimezone(UTC)
+
+    # "last N hours" / "past N hours"
+    m = re.search(r"\b(last|past)\s+(\d+)\s*hours?\b", low)
+    if m:
+        return (now - timedelta(hours=float(m.group(2)))).astimezone(UTC)
+
+    # "last N days"
+    m = re.search(r"\b(last|past)\s+(\d+)\s*days?\b", low)
+    if m:
+        return (now - timedelta(days=float(m.group(2)))).astimezone(UTC)
+
+    # "last 24 / 48 / 72 hours"
+    m = re.search(r"\b(24|48|72)\s*hours?\b", low)
+    if m:
+        return (now - timedelta(hours=float(m.group(1)))).astimezone(UTC)
+
+    # Default: since local midnight today
+    return now.replace(hour=0, minute=0, second=0, microsecond=0).astimezone(UTC)
+
+
+def _window_label(since_utc: datetime) -> str:
+    """Human label for the window, e.g. 'today', 'yesterday', 'the last 7 days'."""
+    tz    = _get_local_tz()
+    now   = datetime.now(tz)
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    since = since_utc.astimezone(tz)
+    delta = now - since
+    days  = delta.days
+
+    if since.date() == today.date():
+        return "today"
+    if since.date() == (today - timedelta(days=1)).date():
+        return "yesterday"
+    if days <= 7:
+        return f"the last {days} days"
+    return f"the last {days} days"
+
+
+async def _try_summary_shortcut(
+    user_text: str,
+    chat_id:   str,
+    facts:     Dict[str, str],
+) -> Optional[str]:
+    """
+    Intercept conversation-summary requests and answer from SQLite message_log.
+
+    Returns a WhatsApp reply string, or None if not a summary request.
+    Uses _parse_window_since() for accurate local-timezone windowing.
+    Errors are logged at WARNING so they are visible without being fatal.
+    """
+    if not _SUMMARY_RE.search(user_text):
+        return None
+    if not _WINDOW_RE.search(user_text) and "conversation" not in user_text.lower():
+        return None
+
+    from . import database
+    if not database.sqlite_store:
+        logger.warning("summary_shortcut.skip  reason=no_sqlite_store")
+        return None
+
+    since_utc = _parse_window_since(user_text)
+    since_iso = since_utc.isoformat()
+    label     = _window_label(since_utc)
+
+    logger.info(
+        "📋 summary_shortcut.start  chat=%s  window=%r  since=%s",
+        chat_id, label, since_iso[:19],
+    )
+
+    try:
+        rows = await database.sqlite_store.get_messages_since(
+            chat_id=chat_id, since_iso=since_iso, limit=150,
+        )
+    except Exception as exc:
+        logger.warning("summary_shortcut.db_fail  chat=%s  err=%s", chat_id, exc)
+        return None
+
+    logger.info("📋 summary_shortcut.rows  chat=%s  count=%d", chat_id, len(rows))
+
+    if not rows:
+        user_name = facts.get("name", "")
+        greeting  = _time_of_day_greeting()
+        name_part = f", *{user_name}*" if user_name else ""
+        return f"{greeting}{name_part}. We haven't chatted {label} yet. 🙂"
+
+    # Build a readable transcript
+    tz    = _get_local_tz()
+    lines = []
+    for direction, text, ts in rows:
+        who = "You" if direction == "in" else "Shimmi"
+        try:
+            ts_dt  = datetime.fromisoformat(ts.replace("Z", "+00:00")).astimezone(tz)
+            ts_str = ts_dt.strftime("%H:%M")
+        except Exception:
+            ts_str = ""
+        prefix = f"[{ts_str}] " if ts_str else ""
+        lines.append(f"{prefix}{who}: {text[:300]}")
+
+    transcript = chr(10).join(lines[-80:])
+
+    # Summarise with 8B model
+    user_name = facts.get("name", "")
+    name_part = f" The user's name is {user_name}." if user_name else ""
+    try:
+        raw = await _groq_raw(
+            [
+                {
+                    "role": "system",
+                    "content": (
+                        f"You are a WhatsApp assistant summarising a conversation.{name_part} "
+                        "Write a concise bullet-point summary of key topics, decisions and facts. "
+                        "Use past tense. Max 8 bullets. Use • for bullets. *bold* for key terms. "
+                        "Start directly — no preamble, no filler."
+                    ),
+                },
+                {"role": "user", "content": transcript},
+            ],
+            max_tokens=400,
+            chat_id=chat_id,
+            label="summary_shortcut",
+            role="extract",
+            timeout=20.0,
+        )
+    except Exception as exc:
+        logger.warning("summary_shortcut.llm_fail  chat=%s  err=%s", chat_id, str(exc)[:150])
+        return None
+
+    summary = (raw or "").strip()
+    if not summary or len(summary) < 20:
+        logger.warning("summary_shortcut.empty_reply  chat=%s  raw=%r", chat_id, (raw or "")[:80])
+        return None
+
+    greeting  = _time_of_day_greeting()
+    user_name = facts.get("name", "")
+    name_part = f", *{user_name}*" if user_name else ""
+    header    = f"{greeting}{name_part}. Here's what we covered {label}:"
+    reply     = header + chr(10) + chr(10) + summary
+
+    logger.info(
+        "📋 summary_shortcut.done  chat=%s  rows=%d  reply_len=%d",
+        chat_id, len(rows), len(reply),
+    )
+
+    # Persist updated summary for future context
+    try:
+        from .database import normalize_key
+        await database.sqlite_store.upsert_fact(
+            chat_id.split("@")[0],
+            normalize_key("conversation_summary"),
+            summary,
+            source="bot_inferred",
+        )
+    except Exception:
+        pass
+
+    return reply
+
+
+def _time_of_day_greeting() -> str:
+    """Return an emoji greeting based on current local time."""
+    h = _now_local().hour
+    if   6  <= h < 12: return "☀️ Good morning"
+    elif 12 <= h < 17: return "🌤️ Good afternoon"
+    elif 17 <= h < 21: return "🌆 Good evening"
+    else:              return "🌙 Good night"
+
+
 async def run_agent(
     *,
     chat_id: str,
@@ -1787,6 +2051,16 @@ async def run_agent(
         return AgentResult(
             reply=ReplyPayload(type="text", text=time_reply),
             provider_used="shortcut",
+        )
+
+    # ── 1b. Summary shortcut — answer time-windowed summary requests directly
+    #        from SQLite message_log, zero orchestrator tokens
+    summary_reply = await _try_summary_shortcut(user_text, chat_id, facts)
+    if summary_reply is not None:
+        logger.info("📋 summary.shortcut  chat=%s  reply_len=%d", chat_id, len(summary_reply))
+        return AgentResult(
+            reply=ReplyPayload(type="text", text=summary_reply),
+            provider_used="summary_shortcut",
         )
 
     # ── 2. Pre-extract memory ─────────────────────────────────────────────

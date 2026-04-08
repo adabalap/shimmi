@@ -1,5 +1,11 @@
 """
-main.py — Shimmi v3.3.0
+main.py — Shimmi v3.5.0
+
+Changes vs v3.3.0:
+  FIX-1   "Is typing" indicator now fires at enqueue time (CHAT_TYPING_EVENTS dict).
+          Previously only started inside process_message — missed the queue wait gap.
+  IMPR-1  source_filter="all" so bot_inferred (ambient) facts reach orchestrator.
+  IMPR-2  consolidate_user_facts only scheduled when user has >= 5 facts.
 
 Changes vs v3.2.0:
   FIX-1  "Is typing" now shown immediately at enqueue (was only shown after worker
@@ -413,12 +419,20 @@ async def process_message(
 ) -> None:
     async with Trace(event_id=event_id, chat_id=chat_id, sender_id=sender_id) as trace:
 
-        # FIX-1: Reuse the typing stop-event that was created at enqueue time in the
-        # webhook handler. This closes the gap where no typing indicator appeared while
-        # the message was waiting in the queue before the worker picked it up.
-        # Falls back to a fresh Event when called directly (e.g. from tests).
-        stop_evt       = CHAT_TYPING_EVENTS.pop(chat_id, None) or asyncio.Event()
-        keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
+        # FIX-1 (v3.5): The typing keepalive was already started in the webhook handler
+        # BEFORE q.put(). We just pop the stop-event so we can signal it when done.
+        # We do NOT start a second keepalive here — that was the v3.4 race condition
+        # (two competing tasks both calling stop_typing, killing each other's indicator).
+        # Falls back to a fresh Event + new keepalive only when called directly (tests).
+        existing_stop = CHAT_TYPING_EVENTS.pop(chat_id, None)
+        if existing_stop is not None:
+            stop_evt       = existing_stop
+            keepalive_task = asyncio.get_event_loop().create_future()
+            keepalive_task.cancel()   # dummy — stop_evt.set() is all we need
+        else:
+            # Direct call (tests / future callers without webhook) — start fresh
+            stop_evt       = asyncio.Event()
+            keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
 
         sender_key = canonical_user_key(sender_id) or sender_id or ""
         user_text  = strip_invocation((text or "").strip())
@@ -686,10 +700,10 @@ async def process_message(
             # Note: reply_extract now runs in step 5b (awaited before memory_save).
 
         finally:
-            stop_evt.set()
+            stop_evt.set()   # signals the webhook's typing_keepalive to stop_typing + exit
             try:
-                await keepalive_task
-            except Exception:
+                await asyncio.wait_for(keepalive_task, timeout=3.0)
+            except (Exception, asyncio.CancelledError):
                 pass
 
 
@@ -854,26 +868,29 @@ async def webhook(request: Request):
         CHAT_QUEUES[chat_id]  = q
         CHAT_WORKERS[chat_id] = asyncio.create_task(_chat_worker(chat_id, q))
 
+    # FIX-1 (v3.5): Start typing BEFORE q.put() so the keepalive is always running
+    # before the worker can dequeue and reach process_message. Storing the event
+    # before enqueue eliminates the race condition where process_message.pop()
+    # returned None (event not yet stored) and spawned a competing keepalive task.
+    typing_stop = asyncio.Event()
+    CHAT_TYPING_EVENTS[chat_id] = typing_stop
+    asyncio.create_task(
+        typing_keepalive(chat_id, typing_stop),
+        name=f"typing:{chat_id}",
+    )
+    logger.debug("⌨️  typing.start  chat=%s", chat_id)
+
     try:
         await asyncio.wait_for(
             q.put({"text": text or "", "sender_id": sender_id, "event_id": event_id, "from_me": from_me}),
             timeout=settings.llm_queue_wait_sec,
         )
     except asyncio.TimeoutError:
+        # Cancel the typing indicator we just started
+        typing_stop.set()
         await send_text(chat_id, "I'm busy right now — try again in a moment.")
         logger.warning("⏳ queue.timeout  chat=%s  event=%s", chat_id, event_id)
         return JSONResponse({"status": "ok", "message": "queue timeout"})
-
-    # FIX-1: Start typing immediately at enqueue — not later inside process_message.
-    # Without this the user sees no "is typing" while the message waits in the queue.
-    # We create a stop-event here and store it in CHAT_TYPING_EVENTS; process_message
-    # pops it and reuses it (no duplicate typing start, no gap).
-    typing_stop = asyncio.Event()
-    CHAT_TYPING_EVENTS[chat_id] = typing_stop
-    asyncio.create_task(
-        typing_keepalive(chat_id, typing_stop),
-        name=f"typing_enqueue:{chat_id}",
-    )
 
     logger.info(
         "✅ webhook.enqueued  event=%s  chat=%s  depth=%d",

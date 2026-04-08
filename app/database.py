@@ -1,5 +1,5 @@
 """
-database.py — Shimmi v3.3.0
+database.py — Shimmi v3.4.0
 
 Changes vs v2.7.0:
   ① reminders table + ReminderStore methods
@@ -904,6 +904,29 @@ class SQLiteMemory:
                     )
                     conn.commit()
             await asyncio.to_thread(_do)
+
+    async def get_messages_since(
+        self,
+        chat_id: str,
+        since_iso: str,
+        limit: int = 200,
+    ) -> list:
+        """
+        Return messages from message_log for a chat after a given ISO timestamp.
+        Used for time-windowed conversation summaries.
+        Returns list of (direction, text, ts) tuples, oldest first.
+        """
+        async with self._lock:
+            def _do():
+                with sqlite3.connect(self.path) as conn:
+                    cur = conn.execute(
+                        "SELECT direction, text, ts FROM message_log "
+                        "WHERE chat_id=? AND ts >= ? "
+                        "ORDER BY ts ASC LIMIT ?",
+                        (chat_id, since_iso, limit),
+                    )
+                    return cur.fetchall()
+            return await asyncio.to_thread(_do)
 
     async def get_users_with_key(self, key: str) -> list:
         """

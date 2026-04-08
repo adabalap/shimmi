@@ -1,5 +1,5 @@
 """
-scheduler.py — Shimmi v2.9.0
+scheduler.py — Shimmi v3.4.0
 
 Background reminder scheduler.
 Runs as an asyncio task every 60 seconds.
