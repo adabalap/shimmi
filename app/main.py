@@ -1,5 +1,5 @@
 """
-main.py — Shimmi v3.6.0
+main.py — Shimmi v3.7.0
 
 Changes vs v3.3.0:
   FIX-1   "Is typing" indicator now fires at enqueue time (CHAT_TYPING_EVENTS dict).
@@ -419,20 +419,16 @@ async def process_message(
 ) -> None:
     async with Trace(event_id=event_id, chat_id=chat_id, sender_id=sender_id) as trace:
 
-        # FIX-1 (v3.5): The typing keepalive was already started in the webhook handler
-        # BEFORE q.put(). We just pop the stop-event so we can signal it when done.
-        # We do NOT start a second keepalive here — that was the v3.4 race condition
-        # (two competing tasks both calling stop_typing, killing each other's indicator).
-        # Falls back to a fresh Event + new keepalive only when called directly (tests).
-        existing_stop = CHAT_TYPING_EVENTS.pop(chat_id, None)
-        if existing_stop is not None:
-            stop_evt       = existing_stop
-            keepalive_task = asyncio.get_event_loop().create_future()
-            keepalive_task.cancel()   # dummy — stop_evt.set() is all we need
-        else:
-            # Direct call (tests / future callers without webhook) — start fresh
-            stop_evt       = asyncio.Event()
-            keepalive_task = asyncio.create_task(typing_keepalive(chat_id, stop_evt))
+        # Typing keepalive: started here inside process_message (the proven-working
+        # original approach). The webhook handler also fires one at enqueue time
+        # to cover the queue-wait gap. Both use the SAME stop_evt so they coordinate:
+        # when we set stop_evt, both keepalives stop and call stopTyping.
+        # Two overlapping startTyping calls are harmless — WAHA deduplicates them.
+        stop_evt = CHAT_TYPING_EVENTS.pop(chat_id, None) or asyncio.Event()
+        keepalive_task = asyncio.create_task(
+            typing_keepalive(chat_id, stop_evt),
+            name=f"typing_pm:{chat_id}",
+        )
 
         sender_key = canonical_user_key(sender_id) or sender_id or ""
         user_text  = strip_invocation((text or "").strip())
@@ -700,7 +696,7 @@ async def process_message(
             # Note: reply_extract now runs in step 5b (awaited before memory_save).
 
         finally:
-            stop_evt.set()   # signals the webhook's typing_keepalive to stop_typing + exit
+            stop_evt.set()   # stops both: enqueue keepalive + process_message keepalive
             try:
                 await asyncio.wait_for(keepalive_task, timeout=3.0)
             except (Exception, asyncio.CancelledError):
