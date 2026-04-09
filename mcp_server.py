@@ -249,19 +249,51 @@ async def get_stocks(
             ticker = yf.Ticker(sym)
             info   = ticker.info or {}
 
-            # Prefer currentPrice, fall back to regularMarketPrice, then fast_info
+            # Prefer currentPrice, fall back through known field names
             price = (info.get("currentPrice")
                      or info.get("regularMarketPrice")
-                     or info.get("navPrice"))
+                     or info.get("navPrice")
+                     or info.get("ask")
+                     or info.get("bid"))
             if price is None:
-                fi    = ticker.fast_info
-                price = getattr(fi, "last_price", None)
+                try:
+                    fi    = ticker.fast_info
+                    price = getattr(fi, "last_price", None)
+                except Exception:
+                    pass
+
+            # If NSE (.NS) returned no price, try BSE (.BO) automatically
+            if price is None and sym.endswith(".NS"):
+                bse_sym = sym[:-3] + ".BO"
+                logger.info("stocks.fallback  %s → %s (no price on NSE)", sym, bse_sym)
+                try:
+                    bse_ticker = yf.Ticker(bse_sym)
+                    bse_info   = bse_ticker.info or {}
+                    price = (bse_info.get("currentPrice")
+                             or bse_info.get("regularMarketPrice"))
+                    if price is None:
+                        fi    = bse_ticker.fast_info
+                        price = getattr(fi, "last_price", None)
+                    if price is not None:
+                        # Use BSE data for this ticker
+                        info = bse_info
+                        sym  = bse_sym
+                        logger.info("stocks.fallback_ok  %s  price=%.2f", bse_sym, price)
+                except Exception as bse_err:
+                    logger.debug("stocks.bse_fallback_fail  sym=%s  err=%s", bse_sym, str(bse_err)[:80])
+
+            if price is None:
+                logger.warning("stocks.no_price  sym=%s  info_keys=%s",
+                               sym, list(info.keys())[:10])
 
             prev_close = (info.get("previousClose")
                           or info.get("regularMarketPreviousClose"))
             if prev_close is None:
-                fi         = ticker.fast_info
-                prev_close = getattr(fi, "previous_close", None)
+                try:
+                    fi         = ticker.fast_info
+                    prev_close = getattr(fi, "previous_close", None)
+                except Exception:
+                    pass
 
             currency = info.get("currency") or "INR"
             name     = (info.get("longName") or info.get("shortName")

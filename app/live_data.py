@@ -319,9 +319,12 @@ def _format_stocks_mcp(data: dict, inr_rate: Optional[float] = None) -> Optional
         sym_list = ", ".join(skipped) if skipped else "requested symbols"
         return (
             f"📊 *Stock Data Unavailable*\n"
-            f"Could not fetch price for {sym_list}.\n"
-            f"_(Yahoo Finance may not recognise this ticker or market is closed. "
-            f"Try adding .NS for NSE or .BO for BSE, e.g. PAYTM.NS)_"
+            f"Could not fetch price for: *{sym_list}*\n\n"
+            f"Possible reasons:\n"
+            f"• Market is closed (NSE/BSE: Mon–Fri 9:15AM–3:30PM IST)\n"
+            f"• Ticker not listed on Yahoo Finance\n"
+            f"• Try the full name, e.g. _PAYTM_ or _PAYTM.NS_ or _PAYTM.BO_\n"
+            f"_(Data source: Yahoo Finance · ~15 min delay)_"
         )
     if skipped:
         lines.append(f"_⚠️ No data for: {', '.join(skipped)}_")
