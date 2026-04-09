@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.7.0
+agent_engine.py — Shimmi v3.11.0
 
 Changes vs v3.3.0:
 
@@ -747,22 +747,8 @@ async def _groq_raw(
 # Junk-fact filter
 # ─────────────────────────────────────────────────────────────────────────────
 
-_JUNK_VALUES = frozenset({
-    "unknown", "none", "null", "n/a", "na", "not set", "not specified",
-    "undefined", "empty", "no data", "", "false", "true",
-})
-
-
-# Keys that are useful for search/consolidation but waste tokens in the orchestrator prompt.
-# These are transient/session keys or long-form blobs that pollute the context window.
-_PROMPT_SKIP_KEYS: frozenset = frozenset({
-    "recent_query", "recent_search", "conversation_since_morning", "last_summary",
-    "recent_article_details",  # can be 800+ chars of article text
-    "favorite_news_source_details",  # verbose description, not a useful fact
-    "arrival_time", "destination",  # session-ephemeral navigation data
-    "next_meeting_team", "next_meeting_time", "next_trip_start_date",  # stale fast
-    "social_security_number",  # should never have been saved; security risk in prompts
-})
+# Memory key definitions — imported from single source of truth.
+from .memory_schema import JUNK_VALUES as _JUNK_VALUES, PROMPT_SKIP_KEYS as _PROMPT_SKIP_KEYS
 
 # Max characters for a single fact value in the orchestrator prompt.
 # Long values like conversation_summary, favorite_quote get truncated.
@@ -1140,10 +1126,15 @@ def _keyword_tool_from_query(query: str, facts: Dict[str, str]) -> Optional[Any]
     Lightweight keyword-based tool routing for when the LLM doesn't emit tool_call.
     Covers the most common structured-data query types.
     """
-    from .tools import WeatherTool, NewsTool, StocksTool, CurrencyTool, TimezoneTool
+    from .tools import WeatherTool, NewsTool, StocksTool, CurrencyTool, TimezoneTool, FetchUrlTool
     if not query:
         return None
     low = query.lower()
+
+    # ── URL fetch — highest priority: if message contains a URL, fetch it ─
+    _url_match = re.search(r"https?://[^\s]{8,}", query)
+    if _url_match:
+        return FetchUrlTool(tool="fetch_url", url=_url_match.group(0))
 
     # ── Weather ───────────────────────────────────────────────────────────
     if re.search(r"\b(weather|forecast|temperature|rain|humidity|wind|monsoon)\b", low):
@@ -1735,8 +1726,16 @@ def _build_orchestrator_messages(
     context: List[Any],
     reminders: List[Reminder],
     search_result: Optional[str] = None,
+    sender_name: str = "",
+    is_group: bool = False,
 ) -> List[Dict[str, Any]]:
-    """Build the message list for the orchestrator (first or second turn)."""
+    """Build the message list for the orchestrator (first or second turn).
+
+    sender_name / is_group are injected for group chats so the LLM knows
+    WHICH member of the group is speaking. Without this, in a group with
+    multiple users the LLM would answer "What's my name?" with the primary
+    user's name regardless of who actually asked.
+    """
     facts_str     = _build_facts_str(facts)
     reminders_str = _build_reminders_str(reminders)
     context_str   = _build_context_str(context)
@@ -1762,6 +1761,15 @@ def _build_orchestrator_messages(
     ]
     if search_result:
         user_content_parts.append(f"SEARCH_RESULT:\n{search_result}")
+
+    # Group chat: tell the LLM who is speaking so memory queries are scoped
+    # to the correct person. Facts loaded are for the actual sender, not the
+    # primary account, so "What's my name?" returns their name not the bot owner's.
+    if is_group and sender_name:
+        user_content_parts.append(f"SPEAKER: {sender_name} (group member asking this message)")
+    elif is_group:
+        user_content_parts.append("SPEAKER: a group member (name unknown)")
+
     user_content_parts.append(f"USER: {user_text}")
 
     return [
@@ -2087,7 +2095,16 @@ async def run_agent(
         pass   # non-fatal
 
     # ── 3. Orchestrate ────────────────────────────────────────────────────
-    messages = _build_orchestrator_messages(user_text, facts, context, reminders)
+    # Detect group chats: chat_id ends in @g.us, sender_key is an individual
+    _is_group   = chat_id.endswith("@g.us") if chat_id else False
+    _sender_name = facts.get("name", "") if not _is_group else ""
+    # In group chats, load the sender's own name from their facts if available
+    # (facts are already loaded per-sender by main.py, so this is correct)
+
+    messages = _build_orchestrator_messages(
+        user_text, facts, context, reminders,
+        sender_name=_sender_name, is_group=_is_group,
+    )
     search_result: Optional[str] = None
 
     for iteration in range(1, _MAX_ITERATIONS + 1):
@@ -2095,7 +2112,8 @@ async def run_agent(
 
         if search_result:
             messages = _build_orchestrator_messages(
-                user_text, facts, context, reminders, search_result
+                user_text, facts, context, reminders, search_result,
+                sender_name=_sender_name, is_group=_is_group,
             )
 
         orch = await _orchestrate(messages, chat_id, label=label, trace=trace)

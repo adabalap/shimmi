@@ -1,5 +1,5 @@
 """
-scheduler.py — Shimmi v3.4.0
+scheduler.py — Shimmi v3.11.0
 
 Background reminder scheduler.
 Runs as an asyncio task every 60 seconds.
@@ -179,10 +179,34 @@ async def _fire_due_reminders() -> None:
                 r.id, r.chat_id, r.reminder_text,
             )
         except Exception as exc:
-            logger.error(
-                "scheduler.send_failed  id=%d  chat=%s  err=%s", r.id, r.chat_id, exc,
-            )
-            # Don't mark failed — will retry on next cycle
+            # Retry with exponential backoff (30s → 60s → 120s → mark failed)
+            retry_count = getattr(r, "retry_count", 0)
+            # Pull retry_count from DB row if available — Reminder dataclass
+            # doesn't carry it yet, so we re-query conservatively
+            try:
+                from . import database as _db
+                row_data = await _db.sqlite_store.get_reminder_retry_count(r.id)
+                retry_count = row_data if row_data is not None else 0
+            except Exception:
+                pass
+
+            _MAX_RETRIES = 3
+            if retry_count >= _MAX_RETRIES:
+                await database.sqlite_store.mark_reminder_failed(r.id)
+                logger.warning(
+                    "🔔 reminder.failed_permanent  id=%d  chat=%s  retries=%d  err=%s",
+                    r.id, r.chat_id, retry_count, str(exc)[:120],
+                )
+            else:
+                # Backoff: 30s, 60s, 120s
+                backoff_sec = 30 * (2 ** retry_count)
+                next_retry = (datetime.now(UTC) + timedelta(seconds=backoff_sec)).isoformat()
+                await database.sqlite_store.mark_reminder_retry(r.id, next_retry)
+                logger.warning(
+                    "🔔 reminder.retry_scheduled  id=%d  attempt=%d/%d  "
+                    "next_retry_in=%ds  err=%s",
+                    r.id, retry_count + 1, _MAX_RETRIES, backoff_sec, str(exc)[:120],
+                )
 
 
 async def _refresh_stale_summaries() -> None:

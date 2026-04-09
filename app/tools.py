@@ -121,9 +121,21 @@ class WebSearchTool(BaseModel):
         return str(v or "").strip()
 
 
+class FetchUrlTool(BaseModel):
+    """Fetch and extract plain text from a URL the user shared."""
+    tool: Literal["fetch_url"]
+    url:  str = Field(..., min_length=4, description="Full URL to fetch.")
+
+    @field_validator("url", mode="before")
+    @classmethod
+    def _strip(cls, v: Any) -> str:
+        return str(v or "").strip()
+
+
 # Union type — used as the type annotation for OrchestratorResult.tool_call
 ToolCall = Annotated[
-    Union[WeatherTool, NewsTool, StocksTool, CurrencyTool, TimezoneTool, WebSearchTool],
+    Union[WeatherTool, NewsTool, StocksTool, CurrencyTool, TimezoneTool,
+          WebSearchTool, FetchUrlTool],
     Field(discriminator="tool"),
 ]
 
@@ -176,6 +188,8 @@ class ToolDispatcher:
                 return await self._timezone(tool_call)                # type: ignore[arg-type]
             elif tool_name == "web_search":
                 return await self._web_search(tool_call)              # type: ignore[arg-type]
+            elif tool_name == "fetch_url":
+                return await self._fetch_url(tool_call)               # type: ignore[arg-type]
             else:
                 logger.warning("tools.dispatch — unknown tool=%r", tool_name)
                 return ""
@@ -241,6 +255,64 @@ class ToolDispatcher:
         result = await mcp_timezone(tc.city)
         return result or ""
 
+    async def _fetch_url(self, tc: FetchUrlTool) -> str:
+        """
+        Fetch and extract article content via MCP /fetch endpoint.
+
+        MCP handles: HTTP fetch → trafilatura extraction (F1=0.958) →
+        sumy LexRank compaction (reads whole article) → TTL caching.
+
+        Returns a structured prompt block:
+          ARTICLE_META: title / author / date / word_count
+          ARTICLE_ABSTRACT: 5 key sentences by LexRank (whole-article aware)
+          ARTICLE_FULL: clean text, sentence-boundary capped at ~3000 chars
+        """
+        from .mcp_client import mcp_fetch_url
+
+        url = tc.url
+        if not url.startswith(("http://", "https://")):
+            return f"Could not fetch: invalid URL {url!r}"
+
+        logger.info("tools.fetch_url  url=%r", url[:120])
+        result = await mcp_fetch_url(url)
+
+        if not result:
+            # MCP unavailable or fetch failed — tell the LLM clearly
+            logger.warning("tools.fetch_url.mcp_fail  url=%r", url[:80])
+            return f"Could not fetch {url} — the page may be unavailable or behind a paywall."
+
+        # Build a structured prompt block so the LLM gets both the map
+        # (LexRank abstract) and the territory (full clean text)
+        parts = []
+
+        meta_parts = []
+        if result.get("title"):
+            meta_parts.append(f"title: {result['title']}")
+        if result.get("author"):
+            meta_parts.append(f"author: {result['author']}")
+        if result.get("date"):
+            meta_parts.append(f"published: {result['date']}")
+        if result.get("word_count"):
+            meta_parts.append(f"word_count: {result['word_count']}")
+        if meta_parts:
+            parts.append("ARTICLE_META:\n  " + "\n  ".join(meta_parts))
+
+        if result.get("abstract"):
+            parts.append(f"ARTICLE_ABSTRACT (key sentences, whole-article LexRank):\n{result['abstract']}")
+
+        if result.get("text"):
+            truncation_note = " [truncated]" if result.get("truncated") else ""
+            parts.append(f"ARTICLE_FULL{truncation_note}:\n{result['text']}")
+
+        if not parts:
+            return f"Could not extract readable content from {url}"
+
+        logger.info(
+            "tools.fetch_url.ok  url=%r  words=%d  abstract_chars=%d",
+            url[:80], result.get("word_count", 0), len(result.get("abstract", "")),
+        )
+        return "\n\n".join(parts)
+
     async def _web_search(self, tc: WebSearchTool) -> str:
         # Web search is handled upstream in agent_engine._live_search_fallback()
         # We return a sentinel that signals the caller to use compound-beta-mini.
@@ -303,6 +375,7 @@ def parse_tool_call(raw: Any) -> Optional[ToolCall]:
         "currency":   CurrencyTool,
         "timezone":   TimezoneTool,
         "web_search": WebSearchTool,
+        "fetch_url":  FetchUrlTool,
     }
 
     cls = _TOOL_MAP.get(tool_name)

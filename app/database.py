@@ -1,5 +1,5 @@
 """
-database.py — Shimmi v3.7.0
+database.py — Shimmi v3.11.0
 
 Changes vs v2.7.0:
   ① reminders table + ReminderStore methods
@@ -50,137 +50,15 @@ class DeleteOutcome(str, Enum):
 # Every variant the LLM might hallucinate → single canonical key.
 # normalize_key() applies this AFTER stripping user_ prefix, so entries
 # here should NOT have the user_ prefix (it's already stripped).
-_KEY_ALIASES: Dict[str, str] = {
-    # ── name ──────────────────────────────────────────────────────────────
-    "username": "name", "first_name": "name", "full_name": "name",
-    "user_name": "name", "display_name": "name",
-
-    # ── location ──────────────────────────────────────────────────────────
-    "user_city": "city", "user_location": "city",
-    "location": "city", "hometown": "city", "current_city": "city",
-    "user_country": "country",
-    "zip": "postal_code", "zipcode": "postal_code", "pin": "postal_code",
-    "pincode": "postal_code",
-
-    # ── color (canonical: favorite_color) ─────────────────────────────────
-    "colour": "favorite_color", "favorite_colour": "favorite_color",
-    "favourite_color": "favorite_color", "favourite_colour": "favorite_color",
-    "preferred_color": "favorite_color", "preferred_colour": "favorite_color",
-
-    # ── drink ─────────────────────────────────────────────────────────────
-    "user_favorite_drink": "favorite_drink", "preferred_drink": "favorite_drink",
-    "user_drink": "favorite_drink", "drink": "favorite_drink",
-    "favourite_drink": "favorite_drink", "fav_drink": "favorite_drink",
-
-    # ── food ──────────────────────────────────────────────────────────────
-    "favourite_food": "favorite_food", "fav_food": "favorite_food",
-    "preferred_food": "favorite_food",
-    "favourite_cuisine": "favorite_cuisine", "fav_cuisine": "favorite_cuisine",
-    "preferred_cuisine": "favorite_cuisine",
-
-    # ── interests / hobbies ───────────────────────────────────────────────
-    "user_interests": "interests", "user_interest": "interests",
-    "interest": "interests", "passion": "interests", "passions": "interests",
-    "technical_interests": "interests",
-    "user_hobby": "hobbies", "user_hobbies": "hobbies",
-    "hobby": "hobbies",
-
-    # ── occupation / work ─────────────────────────────────────────────────
-    "user_occupation": "occupation", "user_job": "occupation",
-    "job": "occupation", "profession": "occupation", "role": "occupation",
-    "job_title": "occupation", "current_job_title": "occupation",
-    "work": "occupation",
-    "employer": "company", "current_company": "company",
-    "workplace": "company", "work_place": "company",
-
-    # ── education ─────────────────────────────────────────────────────────
-    "educational_background": "education",
-    "degree_background": "education",
-    "school": "education", "college": "education",
-
-    # ── fitness / health ──────────────────────────────────────────────────
-    "fitness_goal": "fitness_goals", "fitness_target": "fitness_goals",
-    "health_goal": "fitness_goals", "health_goals": "fitness_goals",
-    "marathon_goal": "fitness_goals",
-
-    # ── travel ────────────────────────────────────────────────────────────
-    "travel_plan": "travel_plans", "next_trip": "travel_plans",
-    "upcoming_trip": "travel_plans",
-
-    # ── pets ──────────────────────────────────────────────────────────────
-    "pet": "pets", "pet_name": "pets",
-
-    # ── vehicle ───────────────────────────────────────────────────────────
-    "vehicle": "car",
-
-    # ── books / reading ───────────────────────────────────────────────────
-    "book": "recent_book", "books": "recent_book",
-    "books_read": "recent_book", "current_book": "recent_book",
-    "reading": "recent_book", "last_book": "recent_book",
-
-    # ── lists ─────────────────────────────────────────────────────────────
-    "grocery": "grocery_list", "groceries": "grocery_list",
-    "shopping": "shopping_list",
-    "todo": "todo_list", "todos": "todo_list", "task": "todo_list",
-
-    # ── language ──────────────────────────────────────────────────────────
-    "user_language": "preferred_language", "language": "preferred_language",
-    "lang": "preferred_language",
-
-    # ── age ───────────────────────────────────────────────────────────────
-    "user_age": "age",
-
-    # ── career / goals ────────────────────────────────────────────────────
-    "career_goal": "career_goals", "career_aspiration": "career_goals",
-    "career_aspirations": "career_goals",
-    "goal": "personal_goals", "life_goal": "personal_goals",
-}
-
-_SPECIAL_PREFIXES = ("_reminder", "_cancel_reminder")
-
-# ---------------------------------------------------------------------------
-# Deletion guardrails (P1-GUARD)
-# ---------------------------------------------------------------------------
-
-# Only keys in this set may be deleted by the agent.
-# System keys, context keys, and anything not explicitly listed are blocked.
-_DELETABLE_KEYS: frozenset[str] = frozenset({
-    # Identity
-    "name", "age",
-    # Location
-    "city", "country", "postal_code",
-    # Occupation / personal
-    "occupation",
-    # Preferences
-    "favorite_drink", "favorite_food", "favorite_cuisine",
-    "favorite_color", "favorite_trail",
-    "hobbies", "interests",
-    "dietary_restriction", "allergies",
-    # Vehicles
-    "car", "bike", "vehicle",
-    # Pets
-    "pets",
-    # Lists — allowed but require confirmation (see _CONFIRM_BEFORE_DELETE)
-    "shopping_list", "grocery_list", "todo_list",
-    # Misc personal
-    "motivational_quote", "preferred_language",
-    # reminder_notes is personal but excluded — deleting it wouldn't cancel
-    # the actual reminder rows; handled separately via cancel_reminder()
-})
-
-# Subset of _DELETABLE_KEYS that are destructive enough to require the agent
-# to include a confirm=True flag (set by orchestrator) before deletion fires.
-# Without confirm=True these keys are BLOCKED even if in _DELETABLE_KEYS.
-_CONFIRM_BEFORE_DELETE: frozenset[str] = frozenset({
-    "shopping_list",
-    "grocery_list",
-    "todo_list",
-})
-
-# Keys that are structurally protected — can never be deleted via agent.
-_PROTECTED_KEYS: frozenset[str] = frozenset({
-    "whatsapp_id", "chat_id",   # should never be stored as facts, but guard anyway
-})
+# Key definitions imported from memory_schema — single source of truth.
+# To add/change canonical keys, aliases, or deletion rules: edit memory_schema.py.
+from .memory_schema import (
+    KEY_ALIASES     as _KEY_ALIASES,
+    DELETABLE_KEYS  as _DELETABLE_KEYS,
+    CONFIRM_BEFORE_DELETE as _CONFIRM_BEFORE_DELETE,
+    PROTECTED_KEYS  as _PROTECTED_KEYS,
+    JUNK_VALUES     as _JUNK_VALUES_SCHEMA,
+)
 
 
 def is_key_deletable(key: str, *, confirmed: bool = False) -> tuple[bool, str]:
@@ -317,9 +195,20 @@ class SQLiteMemory:
                     created_at     TEXT NOT NULL,
                     sent_at        TEXT,
                     cancelled      INTEGER NOT NULL DEFAULT 0,
-                    failed         INTEGER NOT NULL DEFAULT 0
+                    failed         INTEGER NOT NULL DEFAULT 0,
+                    retry_count    INTEGER NOT NULL DEFAULT 0,
+                    next_retry_at  TEXT
                 )
             """)
+            # Migrate existing tables that don't have retry columns
+            try:
+                conn.execute("ALTER TABLE reminders ADD COLUMN retry_count INTEGER NOT NULL DEFAULT 0")
+            except Exception:
+                pass  # column already exists
+            try:
+                conn.execute("ALTER TABLE reminders ADD COLUMN next_retry_at TEXT")
+            except Exception:
+                pass  # column already exists
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_reminders_trigger "
                 "ON reminders(trigger_iso) WHERE sent_at IS NULL AND cancelled=0 AND failed=0"
@@ -532,7 +421,7 @@ class SQLiteMemory:
                             "ORDER BY updated_at DESC",
                             (whatsapp_id,),
                         )
-                    _JUNK = frozenset({"unknown", "none", "null", "n/a", "-", ""})
+                    _JUNK = _JUNK_VALUES_SCHEMA | {"-"}
                     out: Dict[str, str] = {}
                     for raw_key, val in cur.fetchall():
                         if (val or "").strip().lower() in _JUNK:
@@ -859,6 +748,17 @@ class SQLiteMemory:
                     ).fetchall()
                     result = []
                     for row in rows:
+                        # Skip if still in retry backoff window
+                        next_retry = row["next_retry_at"] if "next_retry_at" in row.keys() else None
+                        if next_retry:
+                            try:
+                                nr_dt = datetime.fromisoformat(next_retry)
+                                if nr_dt.tzinfo is None:
+                                    nr_dt = nr_dt.replace(tzinfo=UTC)
+                                if nr_dt.astimezone(UTC) > now_utc:
+                                    continue   # backoff not yet expired
+                            except (ValueError, TypeError):
+                                pass
                         try:
                             # Parse ISO with timezone offset (e.g. +05:30)
                             trigger_dt = datetime.fromisoformat(row["trigger_iso"])
@@ -901,6 +801,33 @@ class SQLiteMemory:
                 with sqlite3.connect(self.path) as conn:
                     conn.execute(
                         "UPDATE reminders SET failed=1 WHERE id=?", (reminder_id,)
+                    )
+                    conn.commit()
+            await asyncio.to_thread(_do)
+
+    async def get_reminder_retry_count(self, reminder_id: int) -> int:
+        """Return the current retry_count for a reminder, or 0 if unknown."""
+        async with self._lock:
+            def _do() -> int:
+                with sqlite3.connect(self.path) as conn:
+                    row = conn.execute(
+                        "SELECT retry_count FROM reminders WHERE id=?", (reminder_id,)
+                    ).fetchone()
+                    return int(row[0]) if row else 0
+            return await asyncio.to_thread(_do)
+
+    async def mark_reminder_retry(self, reminder_id: int, next_retry_iso: str) -> None:
+        """
+        Increment retry_count and set next_retry_at for a failed delivery.
+        The reminder stays in the due queue (failed=0) until next_retry_at.
+        """
+        async with self._lock:
+            def _do():
+                with sqlite3.connect(self.path) as conn:
+                    conn.execute(
+                        "UPDATE reminders SET retry_count = retry_count + 1, "
+                        "next_retry_at = ? WHERE id=?",
+                        (next_retry_iso, reminder_id),
                     )
                     conn.commit()
             await asyncio.to_thread(_do)

@@ -1,5 +1,5 @@
 """
-main.py — Shimmi v3.9.0
+main.py — Shimmi v3.11.0
 
 Changes vs v3.8.0:
   FIX-TYPING  Reverted to exact original single-keepalive pattern (process_message only).
@@ -69,6 +69,11 @@ _REMINDER_TASK: Optional[asyncio.Task] = None
 # the same webhook event (common in WhatsApp delivery retries).
 _INBOUND_SEEN:     Dict[str, float] = {}   # event_id → monotonic timestamp
 _INBOUND_SEEN_TTL: float            = 30.0  # seconds to remember event_id
+
+# Cap concurrent ambient background extract calls to prevent a flood of
+# messages (e.g. 30 SMS notifications) from exhausting Groq rate limits
+# on extract calls before any real user message gets to orchestrate.
+_AMBIENT_EXTRACT_SEM = asyncio.Semaphore(3)  # max 3 concurrent extract tasks
 
 
 def _inbound_seen_check(event_id: str) -> bool:
@@ -149,36 +154,30 @@ def _integrity_check() -> None:
 # ---------------------------------------------------------------------------
 
 def _rate_limit_reply(exc: Exception) -> str:
-    """Compose a user-friendly reply when all LLM providers are rate-limited."""
+    """Compose a clean, friendly reply when all LLM providers are rate-limited."""
     msg = str(exc)
-    # Groq: "Please try again in 1h4m54.368s"
+
+    # Parse wait time from Groq: "Please try again in 1h4m54s"
+    wait_str = ""
     m = re.search(
         r"try again in\s+(?:(\d+)h\s*)?(?:(\d+)m\s*)?(?:([\d.]+)s)?",
         msg, re.IGNORECASE,
     )
-    wait_str = ""
     if m:
-        h    = int(m.group(1) or 0)
-        mins = int(m.group(2) or 0)
-        if h:
-            wait_str = f" (about {h}h {mins}m)"
-        elif mins:
-            wait_str = f" (about {mins} min)"
+        h, mins = int(m.group(1) or 0), int(m.group(2) or 0)
+        if h:       wait_str = f" in about {h}h {mins}m"
+        elif mins:  wait_str = f" in about {mins} min"
 
-    # Gemini: "retry after N seconds"
+    # Parse wait time from Gemini: "retryDelay: Ns" or "retry after N seconds"
     if not wait_str:
-        m2 = re.search(r"retry[^\d]*(\d+)\s*second", msg, re.IGNORECASE)
+        m2 = re.search(r"(?:retry[^\d]+|retryDelay[^\d]+)(\d+)", msg, re.IGNORECASE)
         if m2:
             secs = int(m2.group(1))
-            wait_str = f" (about {secs//60} min)" if secs >= 60 else f" ({secs}s)"
+            wait_str = f" in about {secs//60} min" if secs >= 60 else f" in {secs}s"
 
-    is_gemini = "RESOURCE_EXHAUSTED" in msg or "quota" in msg.lower()
-    provider  = "Gemini" if is_gemini else "Groq"
-
-    return (
-        f"⚡ I've hit my {provider} AI quota{wait_str}. "
-        "Please try again later — I'll be back to full speed soon! 🙏"
-    )
+    if wait_str:
+        return f"⚡ I'm at capacity right now — please try again{wait_str}. 🙏"
+    return "⚡ I'm at capacity right now — please try again in a few minutes. 🙏"
 
 
 # ---------------------------------------------------------------------------
@@ -306,8 +305,12 @@ async def _ambient_extract_bg(*, chat_id: str, sender_key: str, text: str) -> No
     All exceptions are suppressed — purely best-effort enrichment.
     This is what makes non-prefix group chat messages contribute to
     long-term memory, not just context.
+
+    Guarded by _AMBIENT_EXTRACT_SEM to prevent message floods (e.g. 30 SMS
+    notifications arriving at once) from exhausting Groq rate limits.
     """
-    try:
+    async with _AMBIENT_EXTRACT_SEM:
+     try:
         from .agent_engine import _extract_memory, _verify_updates
         if not database.sqlite_store:
             return
@@ -340,7 +343,7 @@ async def _ambient_extract_bg(*, chat_id: str, sender_key: str, text: str) -> No
                 "🧠 ambient_memory.saved  sender=%s  created=%d  updated=%d",
                 sender_key, created, updated,
             )
-    except Exception as exc:
+     except Exception as exc:
         logger.debug("ambient_extract_bg.suppressed  sender=%s  err=%s",
                      sender_key, str(exc)[:80])
 
@@ -373,18 +376,39 @@ async def _ambient_store(*, chat_id, sender_key, text, event_id) -> None:
     )
 
     # ── Long-term memory extraction (fire-and-forget) ────────────────────────
-    # Even when the message has no bot prefix and won't trigger a full LLM
-    # response, we still extract personal facts into long-term memory.
-    # Trigger for: first-person signals OR substantive messages (>15 chars)
-    # that may contain facts like "Going to Goa next week", "My dog is sick" etc.
+    # Trigger for: first-person signals OR substantive messages (>15 chars).
+    # FILTER: skip forwarded messages, SMS notifications, OTP messages, and
+    # system notifications — these contain no personal facts about the user
+    # and a flood of them (e.g. 30 SMS notifications at once) will exhaust
+    # the Groq rate limit in seconds on junk extraction calls.
     _low = cleaned.lower()
+
+    # Skip forwarded messages (contain formatting markers)
+    _is_forwarded = any(m in cleaned for m in (
+        "📩 *SMS Notification*", "*From:*", "────────",
+        "Forwarded", "forwarded",
+    ))
+    # Skip OTP / bank / service SMS patterns
+    _is_notification = bool(re.search(
+        r"\b(otp|one.?time.?password|verification code|txn|transaction|"
+        r"debited|credited|a\/c|account|balance|bank|upi|neft|imps|"
+        r"alert|notification|sms)\b",
+        _low,
+    ))
+
     _personal = ("i ", "i'm", "i am", "my ", "me ", "mine", "myself", "i've", "i'd", "i'll",
                  "we ", "we're", "we are", "our ", "going to", "planning to", "will be")
     _has_signal = any(h in _low for h in _personal) or len(cleaned) > 15
-    if sender_key and _has_signal:
+
+    if sender_key and _has_signal and not _is_forwarded and not _is_notification:
         asyncio.create_task(
             _ambient_extract_bg(chat_id=chat_id, sender_key=sender_key, text=cleaned),
             name=f"ambient_extract:{sender_key}",
+        )
+    elif _is_forwarded or _is_notification:
+        logger.debug(
+            "ambient_extract.skip  reason=%s  sender=%s",
+            "forwarded" if _is_forwarded else "notification", sender_key,
         )
 
 
@@ -520,7 +544,12 @@ async def process_message(
                 except Exception as agent_exc:
                     # FIX-7: catch rate-limit / LLM failure and send user-facing message
                     exc_str = str(agent_exc)
-                    if "429" in exc_str or "rate_limit" in exc_str.lower():
+                    is_rate_limit = (
+                        "429" in exc_str
+                        or "rate_limit" in exc_str.lower()
+                        or "RESOURCE_EXHAUSTED" in exc_str
+                    )
+                    if is_rate_limit:
                         friendly = _rate_limit_reply(agent_exc)
                         logger.warning(
                             "⚡ rate_limit.user_reply  chat=%s  err=%s",
@@ -530,7 +559,11 @@ async def process_message(
                             await send_text(chat_id, friendly)
                         except Exception:
                             pass
-                    raise   # re-raise so trace captures fatal_error
+                        # For rate-limit errors: trace already tagged fatal_error above.
+                        # Don't re-raise — avoids a 30-line traceback in the worker log
+                        # for a well-understood, non-actionable quota condition.
+                        return
+                    raise   # re-raise non-rate-limit errors so trace captures fatal_error
 
                 trace.tag(
                     agent_iterations=result.iterations,

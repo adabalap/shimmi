@@ -33,6 +33,7 @@ _TIMEOUT  = float(os.getenv("MCP_TIMEOUT", "12"))
 _TIMEOUT_STOCKS  = float(os.getenv("MCP_TIMEOUT_STOCKS",  "20"))
 _TIMEOUT_NEWS    = float(os.getenv("MCP_TIMEOUT_NEWS",    "10"))
 _TIMEOUT_WEATHER = float(os.getenv("MCP_TIMEOUT_WEATHER", "10"))
+_TIMEOUT_FETCH   = float(os.getenv("MCP_TIMEOUT_FETCH",   "25"))  # articles can be slow
 
 _CLIENT: Optional[httpx.AsyncClient] = None
 
@@ -103,6 +104,17 @@ async def mcp_timezone(city: str) -> Optional[dict]:
     Returns {city, timezone, local_time, utc_offset, formatted} or None.
     """
     return await _get("/timezone", city=city)
+
+
+async def mcp_fetch_url(url: str) -> Optional[dict]:
+    """
+    Fetch and extract article content from a URL via MCP /fetch.
+    MCP handles: HTTP fetch, trafilatura extraction, LexRank compaction, caching.
+
+    Returns structured dict with: url, title, author, date, abstract, text,
+    word_count, truncated. Returns None if the URL cannot be fetched.
+    """
+    return await _get("/fetch", timeout=_TIMEOUT_FETCH, url=url)
 
 
 # ── Utility endpoints ─────────────────────────────────────────────────────────

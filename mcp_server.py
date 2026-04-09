@@ -5,29 +5,21 @@ mcp_server.py — Shimmi MCP Server v2.0.0
 Changes vs v1.0.0:
 
   CACHE-1   TTL response cache for all external-API endpoints.
-            Weather:  10-minute TTL (data changes slowly)
-            Stocks:   3-minute TTL  (15-min delayed anyway, no point hammering)
-            News:     5-minute TTL
-            Currency: 1-hour TTL    (ECB rates update once daily)
-            Timezone: 24-hour TTL   (city → tz mapping is static)
-            Eliminates redundant external calls when multiple users ask about
-            the same city/stock within the TTL window.
+  CACHE-2   Cache key includes query parameters.
+  FORMAT-1  POST /format — deterministic WhatsApp formatting (zero LLM tokens).
+  STOCKS-2  Per-ticker timeout guard in _fetch_sync().
+  HTTP-1    _HTTP client timeout reduced to 12s.
 
-  CACHE-2   Cache key includes query parameters so city=Hyderabad and
-            city=Mumbai never collide.
-
-  FORMAT-1  New POST /format endpoint — deterministic WhatsApp formatting
-            rules implemented in pure Python (zero LLM tokens).
-            Replaces the Groq 8B _format_whatsapp() LLM call for routine
-            markdown → WhatsApp conversion. Saves ~50-100K tokens/day.
-            Rules: ** → *, bullet normalisation, table → bullets,
-            code-fence removal, filler phrase stripping, length cap.
-
-  STOCKS-2  Added per-ticker timeout guard in _fetch_sync() — a single
-            slow/hung ticker no longer stalls the entire stocks call.
-
-  HTTP-1    _HTTP client timeout reduced to 12s (was 30s) — stocks calls
-            were occasionally hanging for 25+ seconds per ticker.
+v3.0 additions:
+  FETCH-1   GET /fetch?url=... — URL content extraction + LexRank compaction.
+            Uses trafilatura (F1=0.958) for clean article extraction and
+            sumy LexRank (TF-IDF, whole-article aware) for compaction.
+            Returns structured JSON: title, author, date, abstract, text.
+            abstract = 5 key sentences selected from WHOLE article by LexRank
+                       (not just first N sentences — truly content-aware).
+            text     = full clean body, sentence-boundary capped at ~3000 chars.
+            TTL: 10 minutes (same as weather).
+            Graceful fallback if trafilatura/sumy not installed.
 
 Endpoints:
   GET  /health
@@ -37,6 +29,7 @@ Endpoints:
   GET  /currency?from=&to=&amount=
   GET  /timezone?city=
   GET  /datetime?tz=
+  GET  /fetch?url=         ← NEW
   POST /format   {"text": "..."}  →  {"text": "...", "changed": bool}
 """
 
@@ -58,7 +51,7 @@ from pydantic import BaseModel
 logger = logging.getLogger("mcp_server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s mcp:%(message)s")
 
-app = FastAPI(title="Shimmi MCP Server", version="2.0.0")
+app = FastAPI(title="Shimmi MCP Server", version="3.0.0")
 
 UTC  = timezone.utc
 _HTTP: Optional[httpx.AsyncClient] = None
@@ -93,6 +86,7 @@ _TTL_STOCKS   = 180    # 3 min
 _TTL_NEWS     = 300    # 5 min
 _TTL_CURRENCY = 3600   # 1 hour
 _TTL_TIMEZONE = 86400  # 24 hours (tz mapping is static)
+_TTL_FETCH    = 600    # 10 min — same as weather; articles don't change fast
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -103,7 +97,7 @@ _TTL_TIMEZONE = 86400  # 24 hours (tz mapping is static)
 async def _startup():
     global _HTTP
     _HTTP = httpx.AsyncClient(timeout=12.0, follow_redirects=True)
-    logger.info("🚀 MCP server v2.0.0 ready on :7000")
+    logger.info("🚀 MCP server v3.0.0 ready on :7000")
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -518,6 +512,198 @@ _FILLER_PHRASES = re.compile(
 
 _TABLE_ROW_RE  = re.compile(r"\|")
 _TABLE_SEP_RE  = re.compile(r"^\s*\|[\s|:-]+\|\s*$")
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /fetch — URL content extraction + LexRank compaction
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _extract_with_trafilatura(html_text: str, url: str) -> dict:
+    """
+    Use trafilatura to extract clean article content from raw HTML.
+    Returns a dict with: title, author, date, text, word_count.
+    trafilatura reads the WHOLE page and discards nav/ads/footers using
+    trained heuristics — F1=0.958 in independent benchmarks.
+    """
+    try:
+        import trafilatura
+        extracted = trafilatura.extract(
+            html_text,
+            url=url,
+            include_comments=False,
+            include_tables=True,
+            no_fallback=False,        # allow fallback extraction if main fails
+            output_format="txt",
+        )
+        metadata = trafilatura.extract_metadata(html_text, default_url=url)
+        return {
+            "title":      getattr(metadata, "title",  None) or "",
+            "author":     getattr(metadata, "author", None) or "",
+            "date":       getattr(metadata, "date",   None) or "",
+            "text":       extracted or "",
+            "word_count": len((extracted or "").split()),
+        }
+    except ImportError:
+        # trafilatura not installed — fall back to simple tag stripping
+        logger.warning("fetch.trafilatura_missing — using regex fallback")
+        return {}
+    except Exception as exc:
+        logger.warning("fetch.trafilatura_error  err=%s", str(exc)[:120])
+        return {}
+
+
+def _compact_with_lexrank(text: str, sentence_count: int = 5) -> str:
+    """
+    Use sumy LexRank to extract the most central sentences from the article.
+    LexRank reads the WHOLE text and uses TF-IDF cosine similarity to build
+    a sentence graph, then ranks by eigenvector centrality.  A sentence from
+    the last paragraph can outscore one from the first paragraph.
+
+    Falls back to first-N-sentences if sumy is not installed.
+    """
+    if not text or len(text.split()) < 30:
+        return text   # too short to summarise
+
+    try:
+        from sumy.parsers.plaintext import PlaintextParser
+        from sumy.nlp.tokenizers import Tokenizer
+        from sumy.summarizers.lex_rank import LexRankSummarizer
+        from sumy.nlp.stemmers import Stemmer
+        from sumy.utils import get_stop_words
+
+        parser     = PlaintextParser.from_string(text, Tokenizer("english"))
+        stemmer    = Stemmer("english")
+        summarizer = LexRankSummarizer(stemmer)
+        summarizer.stop_words = get_stop_words("english")
+
+        sentences = summarizer(parser.document, sentence_count)
+        compact   = " ".join(str(s) for s in sentences)
+        return compact if compact.strip() else text[:800]
+
+    except ImportError:
+        logger.warning("fetch.sumy_missing — using first-sentences fallback")
+        # Fallback: split on sentence-ending punctuation, take first N
+        import re as _re
+        sentences = _re.split(r"(?<=[.!?])\s+", text)
+        return " ".join(sentences[:sentence_count])
+    except Exception as exc:
+        logger.warning("fetch.lexrank_error  err=%s", str(exc)[:120])
+        sentences = text.split(". ")
+        return ". ".join(sentences[:sentence_count])
+
+
+def _cap_at_sentence_boundary(text: str, max_chars: int = 3000) -> str:
+    """
+    Truncate text at a sentence boundary near max_chars.
+    Better than a hard char cap which can cut mid-sentence.
+    """
+    if len(text) <= max_chars:
+        return text
+    # Find the last sentence-ending punctuation before max_chars
+    chunk = text[:max_chars]
+    last_end = max(
+        chunk.rfind(". "),
+        chunk.rfind("! "),
+        chunk.rfind("? "),
+        chunk.rfind(".\n"),
+    )
+    if last_end > max_chars // 2:   # only trim if we kept at least half
+        return chunk[:last_end + 1].rstrip() + "…"
+    return chunk.rstrip() + "…"
+
+
+@app.get("/fetch")
+async def fetch_url(url: str = Query(..., min_length=8)):
+    """
+    Fetch a URL, extract clean article text using trafilatura, and compact
+    using sumy LexRank.  Returns structured JSON ready for LLM consumption.
+
+    GET /fetch?url=https://example.com/article
+
+    Returns:
+    {
+      "url":        "https://...",
+      "title":      "Article title",
+      "author":     "Author name",
+      "date":       "2026-04-01",
+      "abstract":   "5 key sentences selected by LexRank from whole article",
+      "text":       "Full clean article text, capped at sentence boundary ~3000 chars",
+      "word_count": 680,
+      "truncated":  false
+    }
+
+    Errors return HTTP 422 (bad URL) or HTTP 502 (fetch failed).
+    """
+    if not url.startswith(("http://", "https://")):
+        raise HTTPException(status_code=422, detail=f"Invalid URL: {url!r}")
+
+    # Cache check — same URL won't be fetched twice within TTL
+    ck = _cache_key("fetch", url)
+    cached = _cache_get(ck)
+    if cached:
+        logger.debug("fetch.cache_hit  url=%r", url[:80])
+        return cached
+
+    logger.info("fetch.start  url=%r", url[:120])
+
+    # ── 1. Fetch raw HTML ─────────────────────────────────────────────────
+    try:
+        resp = await _HTTP.get(
+            url,
+            timeout=httpx.Timeout(connect=5.0, read=20.0),
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Shimmi/1.0)"},
+            follow_redirects=True,
+        )
+        resp.raise_for_status()
+        html_text = resp.text
+    except httpx.HTTPStatusError as exc:
+        raise HTTPException(status_code=502, detail=f"HTTP {exc.response.status_code} from {url}")
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Could not fetch {url}: {str(exc)[:120]}")
+
+    # ── 2. Extract with trafilatura ───────────────────────────────────────
+    meta = _extract_with_trafilatura(html_text, url)
+
+    if not meta.get("text"):
+        # trafilatura failed or not installed — use simple regex fallback
+        text_raw = re.sub(r"<(script|style|noscript)[^>]*>.*?</\1>", "",
+                          html_text, flags=re.DOTALL | re.IGNORECASE)
+        text_raw = re.sub(r"<[^>]+>", " ", text_raw)
+        text_raw = html.unescape(text_raw)
+        text_raw = re.sub(r"[ \t]+", " ", text_raw)
+        text_raw = re.sub(r"\n{3,}", "\n\n", text_raw).strip()
+        meta = {"title": "", "author": "", "date": "",
+                "text": text_raw, "word_count": len(text_raw.split())}
+
+    full_text = meta.get("text", "")
+    if not full_text:
+        raise HTTPException(status_code=502, detail=f"No readable content found at {url}")
+
+    # ── 3. Compact with LexRank ───────────────────────────────────────────
+    abstract = _compact_with_lexrank(full_text, sentence_count=5)
+
+    # ── 4. Cap full text at sentence boundary ────────────────────────────
+    text_capped   = _cap_at_sentence_boundary(full_text, max_chars=3000)
+    was_truncated = len(full_text) > 3000
+
+    result = {
+        "url":        url,
+        "title":      meta.get("title", ""),
+        "author":     meta.get("author", ""),
+        "date":       meta.get("date", ""),
+        "abstract":   abstract,
+        "text":       text_capped,
+        "word_count": meta.get("word_count", 0),
+        "truncated":  was_truncated,
+    }
+
+    logger.info(
+        "fetch.done  url=%r  words=%d  abstract_chars=%d  truncated=%s",
+        url[:80], result["word_count"], len(abstract), was_truncated,
+    )
+
+    _cache_set(ck, result, _TTL_FETCH)
+    return result
 
 
 def _format_for_whatsapp(text: str) -> str:

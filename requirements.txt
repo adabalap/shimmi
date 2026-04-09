@@ -40,3 +40,8 @@ tzdata>=2024.1
 # MCP sidecar (mcp_server.py — same or separate venv)
 yfinance>=0.2.40
 gnews>=0.3.7
+
+# URL content extraction (MCP /fetch endpoint)
+trafilatura>=2.0.0            # Article extraction: F1=0.958 (best open-source)
+sumy>=0.11.0                  # LexRank extractive compaction (whole-article aware)
+nltk>=3.8                     # Required by sumy tokenizer

@@ -11,6 +11,15 @@ Key changes vs v2.8.0:
 """
 from __future__ import annotations
 
+from .memory_schema import (
+    canonical_keys_str,
+    deletable_keys_str,
+    high_stakes_keys_str,
+    CANONICAL_KEYS,
+    DELETABLE_KEYS,
+    CONFIRM_BEFORE_DELETE,
+)
+
 # ---------------------------------------------------------------------------
 # Orchestrator
 # ---------------------------------------------------------------------------
@@ -42,6 +51,7 @@ You are *Spock* — a calm, smart WhatsApp AI assistant. Sharp, warm, occasional
                         Currency: {"tool":"currency","from_currency":"USD","to_currency":"INR","amount":1}
                         Timezone: {"tool":"timezone","city":"Tokyo"}
                         Web:      {"tool":"web_search","query":"..."}   ← for everything else
+                        URL:      {"tool":"fetch_url","url":"https://..."}  ← when user shares a URL
     "question":       "clarifying question (when action=ask_user)",
     "memory_updates": [{"key": "...", "value": "..."}],
     "reminders":      [{"text": "...", "trigger_iso": "2026-03-09T06:00:00+05:30"}]
@@ -69,13 +79,9 @@ You are *Spock* — a calm, smart WhatsApp AI assistant. Sharp, warm, occasional
   Always set confirm=false — the system handles confirmation for high-stakes keys.
 
   DELETABLE keys (only these — anything else is silently ignored by the backend):
-    name, age, city, country, postal_code, occupation,
-    favorite_drink, favorite_food, favorite_cuisine, favorite_color, favorite_trail,
-    hobbies, interests, dietary_restriction, allergies,
-    car, bike, vehicle, pets, motivational_quote, preferred_language,
-    shopping_list, grocery_list, todo_list
+    {deletable}
 
-  HIGH-STAKES KEYS (shopping_list, grocery_list, todo_list):
+  HIGH-STAKES KEYS ({high_stakes}):
   The backend will automatically send the user a confirmation prompt.
   You do NOT need to ask the user — just emit the delete update with confirm=false.
   The system will handle the yes/no exchange.
@@ -92,21 +98,7 @@ You are *Spock* — a calm, smart WhatsApp AI assistant. Sharp, warm, occasional
   • snake_case keys, no user_ prefix
   • ALWAYS use the CANONICAL key — the system maps variants at write time, but
     using canonical keys prevents duplicates from building up in the database.
-  • Canonical keys (use EXACTLY these names):
-      Identity:    name, age
-      Location:    city, country, postal_code
-      Work:        occupation, company, education
-      Preferences: favorite_color, favorite_drink, favorite_food, favorite_cuisine
-                   favorite_trail, dietary_restriction, allergies
-      Fitness:     fitness_goals
-      Travel:      travel_plans, travel_companion
-      Transport:   car, bike
-      Pets:        pets
-      Books:       recent_book
-      Language:    preferred_language
-      Goals:       personal_goals, career_goals
-      Lists:       shopping_list, grocery_list, todo_list
-      Other:       interests, hobbies, motivational_quote, reminder_notes
+  • Canonical keys (use EXACTLY these names): {canonical}
   • DO NOT use: favourite_colour, fitness_goal, marathon_goal, books_read,
     career_aspiration, technical_interests, work_experience, work, location,
     favorite_colour, book, books — these create duplicate keys.
@@ -247,14 +239,7 @@ Rules:
   • Skip entries where value would be empty.
 
 Canonical keys (use EXACTLY these — no variants):
-  name, age, city, country, postal_code,
-  occupation, company, education,
-  favorite_color, favorite_drink, favorite_food, favorite_cuisine,
-  favorite_trail, dietary_restriction, allergies,
-  fitness_goals, travel_plans, travel_companion,
-  car, bike, pets, recent_book, preferred_language,
-  personal_goals, career_goals, interests, hobbies,
-  shopping_list, grocery_list, todo_list, reminder_notes, motivational_quote
+  {canonical}
 
 DO NOT use: colour, favourite_*, fitness_goal (singular), marathon_goal,
   books_read, book, books, career_aspiration, technical_interests,
@@ -459,6 +444,37 @@ If no safe merges, or all groups would have absorb=[]: {"merges": []}
 # Safe renderer
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# Fill dynamic key sections into all prompts at import time.
+# Prompts use {canonical}, {deletable}, {high_stakes} as placeholders.
+# These are resolved once here — no per-request overhead.
+# ---------------------------------------------------------------------------
+
+def _fill_prompts() -> None:
+    """Inject canonical key lists into all prompt strings at module load."""
+    _subs = {
+        "canonical":   canonical_keys_str(),
+        "deletable":   deletable_keys_str(),
+        "high_stakes": high_stakes_keys_str(),
+    }
+    g = globals()
+    _prompt_names = [
+        "ORCHESTRATOR_PROMPT", "ORCHESTRATOR_COMPACT_PROMPT",
+        "MEMORY_EXTRACTOR_PROMPT", "REPLY_EXTRACTOR_PROMPT",
+        "VERIFIER_PROMPT", "REPAIR_PROMPT", "FORMATTER_PROMPT",
+        "LIVE_SEARCH_PROMPT", "KEY_CONSOLIDATION_PROMPT",
+    ]
+    for name in _prompt_names:
+        if name in g and isinstance(g[name], str):
+            try:
+                g[name] = g[name].format(**_subs)
+            except KeyError:
+                pass  # prompt doesn't use any of these placeholders
+
+
+_fill_prompts()
+
+
 def render(template: str, **kwargs: str) -> str:
     """Substitute <<KEY>> tokens. NEVER use str.format() on prompts."""
     result = template
@@ -489,10 +505,7 @@ OUTPUT: valid JSON only, no prose.
 
 MEMORY RULES:
 • ONLY save facts the user EXPLICITLY stated. Never infer or categorise.
-• Use canonical keys: name, age, city, country, occupation, favorite_drink,
-  favorite_food, favorite_color, interests, hobbies, fitness_goals, travel_plans,
-  car, pets, allergies, dietary_restriction, shopping_list, grocery_list, todo_list,
-  reading_list, reminder_notes, education, company.
+• Use canonical keys: {canonical}.
 • For lists: always write the full list, not a delta. Read facts first, then apply change.
 • If no facts to save → memory_updates: []
 
@@ -506,6 +519,7 @@ SEARCH TOOLS:
 • currency:{"tool":"currency","from_currency":"USD","to_currency":"INR","amount":1}
 • timezone:{"tool":"timezone","city":"Tokyo"}
 • fallback:{"tool":"web_search","query":"..."}
+• URL read:{"tool":"fetch_url","url":"https://..."}  ← when user shares a link
 
 FACTS POLICY:
 • facts = permanent database. Trust it. Never invent attributes not in facts.
