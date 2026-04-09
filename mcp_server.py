@@ -650,7 +650,7 @@ async def fetch_url(url: str = Query(..., min_length=8)):
     try:
         resp = await _HTTP.get(
             url,
-            timeout=httpx.Timeout(connect=8.0, read=25.0),
+            timeout=httpx.Timeout(connect=8.0, read=25.0, write=5.0, pool=2.0),
             headers={
                 "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                               "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
