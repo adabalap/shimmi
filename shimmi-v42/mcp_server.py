@@ -97,7 +97,7 @@ _TTL_FETCH    = 600    # 10 min — same as weather; articles don't change fast
 async def _startup():
     global _HTTP
     _HTTP = httpx.AsyncClient(timeout=12.0, follow_redirects=True)
-    logger.info("🚀 MCP server v3.13.0 ready on :7000")
+    logger.info("🚀 MCP server v3.0.0 ready on :7000")
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -208,11 +208,7 @@ _NSE_DEFAULTS = [
     "HDFCBANK.NS", "ICICIBANK.NS", "WIPRO.NS",
 ]
 
-# Commodity tickers via Yahoo Finance (no extra library needed)
-_GOLD_TICKER   = "GC=F"    # COMEX Gold Futures (USD/troy oz)
-_SILVER_TICKER = "SI=F"    # COMEX Silver Futures
-
-_STOCKS_PER_TICKER_TIMEOUT = 18.0  # .info is slower than fast_info; needs more headroom
+_STOCKS_PER_TICKER_TIMEOUT = 8.0   # seconds per ticker before giving up
 
 
 @app.get("/stocks")
@@ -238,80 +234,29 @@ async def get_stocks(
         raise HTTPException(status_code=400, detail="No symbols provided")
 
     def _fetch_one(sym: str) -> dict:
-        """
-        Fetch a single ticker using ticker.info for rich data.
-        Returns: price, prev_close, change/%, day range, 52W range,
-                 volume, avg_volume, pe_ratio, market_cap, sector, name.
-        All new fields are optional — callers must handle None gracefully.
-        Falls back to fast_info if info is empty (indices like ^NSEI).
-        """
+        """Fetch a single ticker — called via asyncio.wait_for for timeout."""
         try:
-            ticker = yf.Ticker(sym)
-            info   = ticker.info or {}
-
-            # Prefer currentPrice, fall back to regularMarketPrice, then fast_info
-            price = (info.get("currentPrice")
-                     or info.get("regularMarketPrice")
-                     or info.get("navPrice"))
-            if price is None:
-                fi    = ticker.fast_info
-                price = getattr(fi, "last_price", None)
-
-            prev_close = (info.get("previousClose")
-                          or info.get("regularMarketPreviousClose"))
-            if prev_close is None:
-                fi         = ticker.fast_info
-                prev_close = getattr(fi, "previous_close", None)
-
-            currency = info.get("currency") or "INR"
-            name     = (info.get("longName") or info.get("shortName")
-                        or info.get("displayName") or sym)
-
+            info       = yf.Ticker(sym).fast_info
+            price      = getattr(info, "last_price",     None)
+            prev_close = getattr(info, "previous_close", None)
+            currency   = getattr(info, "currency",       "INR")
+            name       = getattr(info, "display_name",   None) or sym
             change = change_pct = None
             if price and prev_close:
                 change     = round(price - prev_close, 2)
                 change_pct = round((change / prev_close) * 100, 2)
-
-            # Rich fields — present for equities, often None for indices
-            def _r(v, decimals=2):
-                try:    return round(float(v), decimals) if v is not None else None
-                except: return None
-
-            day_high   = _r(info.get("dayHigh")   or info.get("regularMarketDayHigh"))
-            day_low    = _r(info.get("dayLow")    or info.get("regularMarketDayLow"))
-            open_price = _r(info.get("open")      or info.get("regularMarketOpen"))
-            wk52_high  = _r(info.get("fiftyTwoWeekHigh"))
-            wk52_low   = _r(info.get("fiftyTwoWeekLow"))
-            volume     = info.get("volume")       or info.get("regularMarketVolume")
-            avg_volume = info.get("averageVolume") or info.get("averageDailyVolume10Day")
-            pe_ratio   = _r(info.get("trailingPE") or info.get("forwardPE"))
-            mkt_cap    = info.get("marketCap")
-            sector     = info.get("sector") or info.get("category") or ""
-            is_gold    = sym in (_GOLD_TICKER, _SILVER_TICKER)
-
             return {
                 "symbol":     sym,
                 "name":       name,
-                "price":      _r(price),
-                "prev_close": _r(prev_close),
-                "open":       open_price,
-                "day_high":   day_high,
-                "day_low":    day_low,
+                "price":      round(price, 2)      if price      else None,
+                "prev_close": round(prev_close, 2) if prev_close else None,
                 "change":     change,
                 "change_pct": change_pct,
-                "week52_high": wk52_high,
-                "week52_low":  wk52_low,
-                "volume":     int(volume)    if volume     else None,
-                "avg_volume": int(avg_volume) if avg_volume else None,
-                "pe_ratio":   pe_ratio,
-                "market_cap": int(mkt_cap)  if mkt_cap    else None,
-                "sector":     sector,
                 "currency":   currency,
-                "is_commodity": is_gold,
                 "as_of":      datetime.now(UTC).isoformat(),
             }
         except Exception as e:
-            return {"symbol": sym, "error": str(e)[:200]}
+            return {"symbol": sym, "error": str(e)[:120]}
 
     async def _fetch_with_timeout(sym: str) -> dict:
         try:

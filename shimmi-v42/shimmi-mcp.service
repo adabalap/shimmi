@@ -1,0 +1,26 @@
+[Unit]
+Description=Shimmi MCP Server (FastAPI + Uvicorn)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+Group=ubuntu
+WorkingDirectory=/opt/shimmi
+EnvironmentFile=-/opt/shimmi/.env
+Environment=PYTHONUNBUFFERED=1
+
+PermissionsStartOnly=true
+ExecStartPre=/usr/bin/bash -lc 'install -o ubuntu -g ubuntu -m 0644 /dev/null /var/log/shimmi-mcp.log'
+
+ExecStart=/usr/bin/bash -lc '/opt/shimmi/.venv/bin/uvicorn mcp_server:app --host 0.0.0.0 --port 7000 --log-level info >> /var/log/shimmi-mcp.log 2>&1'
+
+Restart=always
+RestartSec=5
+LimitNOFILE=4096
+StartLimitBurst=5
+StartLimitIntervalSec=30
+
+[Install]
+WantedBy=multi-user.target

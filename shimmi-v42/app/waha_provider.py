@@ -1,5 +1,5 @@
 """
-waha_provider.py — Shimmi v3.13.0
+waha_provider.py — Shimmi v3.11.0
 
 Improvements:
   - Robust msg_id extraction: tries all known WAHA response shapes before

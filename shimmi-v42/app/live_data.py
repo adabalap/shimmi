@@ -1,5 +1,5 @@
 """
-live_data.py — Shimmi v3.13.0
+live_data.py — Shimmi v3.4.0
 
 Changes vs v3.0.1:
   ARCH-1  All data fetching now routes through mcp_client → mcp_server (port 7000)
@@ -189,133 +189,29 @@ _DEFAULT_SYMBOLS = [
 ]
 
 
-def _fmt_crore(n: Optional[int]) -> str:
-    """Format market cap in readable Indian format (Cr / L Cr)."""
-    if not n:
-        return ""
-    cr = n / 1e7
-    if cr >= 1_00_000:
-        return f"₹{cr/1_00_000:.1f}L Cr"
-    if cr >= 1_000:
-        return f"₹{cr:,.0f} Cr"
-    return f"₹{cr:.0f} Cr"
-
-
-def _fmt_52w_position(price, low, high) -> str:
-    """Return a text label for where price sits in its 52-week range."""
-    if not all([price, low, high]) or high <= low:
-        return ""
-    pct = (price - low) / (high - low) * 100
-    if pct >= 90:   return "🔥 Near 52W high"
-    if pct >= 70:   return "📈 Upper range"
-    if pct >= 40:   return "➡️  Mid range"
-    if pct >= 20:   return "📉 Lower range"
-    return "⚠️  Near 52W low"
-
-
-def _format_stocks_mcp(data: dict, inr_rate: Optional[float] = None) -> Optional[str]:
-    """Format MCP /stocks JSON response → WhatsApp string.
-
-    Uses rich fields (52W range, P/E, volume, sector) when present.
-    Falls back gracefully to basic price + change when fields are absent
-    so the existing fallback yfinance path continues to work unchanged.
-    """
+def _format_stocks_mcp(data: dict) -> Optional[str]:
+    """Format MCP /stocks JSON response → WhatsApp string."""
     stocks = data.get("stocks", [])
     if not stocks:
         return None
-
-    today    = datetime.now(UTC).strftime("%a %d %b %Y")
-    is_gold  = any(s.get("is_commodity") for s in stocks if not s.get("error"))
-    header   = "🥇 *Commodities*" if is_gold else f"📈 *Markets — {today}*"
-    lines    = [header, "_(~15 min delay · Yahoo Finance)_", ""]
-    skipped  = []
-
+    today = datetime.now(UTC).strftime("%a %d %b %Y")
+    lines = [f"📈 *Indian Markets — {today}*", "_(~15 min delay · Yahoo Finance via MCP)_", ""]
+    skipped = []
     for s in stocks:
         if s.get("error"):
             skipped.append(s.get("symbol", "?"))
             continue
-
         price   = s.get("price")
+        chg_pct = s.get("change_pct", 0) or 0
+        cur     = "₹" if s.get("currency", "INR") == "INR" else (s.get("currency", "") + " ")
+        arrow   = "🟢" if chg_pct >= 0 else "🔴"
+        name    = s.get("name", s.get("symbol", ""))
         if price is None:
             skipped.append(s.get("symbol", "?"))
             continue
-
-        chg_pct  = s.get("change_pct") or 0
-        chg_abs  = s.get("change") or 0
-        currency = s.get("currency", "INR")
-        cur_sym  = "₹" if currency == "INR" else ("$" if currency == "USD" else currency + " ")
-        arrow    = "🟢" if chg_pct >= 0 else "🔴"
-        name     = s.get("name") or s.get("symbol", "")
-        sym      = s.get("symbol", "")
-
-        # ── Basic price line ─────────────────────────────────────────────
-        lines.append(f"{arrow} *{name}*  ({sym})")
-        lines.append(f"   💰 {cur_sym}{price:,.2f}  {chg_abs:+,.2f} ({chg_pct:+.2f}%)")
-
-        # ── Day range ───────────────────────────────────────────────────
-        dh, dl = s.get("day_high"), s.get("day_low")
-        if dh and dl:
-            lines.append(f"   📅 Today: {cur_sym}{dl:,.2f} – {cur_sym}{dh:,.2f}")
-
-        # ── 52-week range ───────────────────────────────────────────────
-        wh, wl = s.get("week52_high"), s.get("week52_low")
-        if wh and wl:
-            pos   = _fmt_52w_position(price, wl, wh)
-            lines.append(f"   📊 52W: {cur_sym}{wl:,.2f} ↔ {cur_sym}{wh:,.2f}  {pos}")
-
-        # ── Volume ──────────────────────────────────────────────────────
-        vol, avg_vol = s.get("volume"), s.get("avg_volume")
-        if vol and avg_vol and avg_vol > 0:
-            vol_ratio = vol / avg_vol
-            vol_note  = "⬆️ High" if vol_ratio > 1.5 else ("⬇️ Low" if vol_ratio < 0.5 else "Normal")
-            lines.append(f"   📦 Vol: {vol/1e6:.1f}M  ({vol_note} vs {avg_vol/1e6:.1f}M avg)")
-
-        # ── Fundamentals (equities only) ────────────────────────────────
-        detail_parts = []
-        pe = s.get("pe_ratio")
-        if pe:
-            detail_parts.append(f"P/E {pe:.1f}")
-        mc = s.get("market_cap")
-        if mc:
-            detail_parts.append(_fmt_crore(mc))
-        sec = s.get("sector")
-        if sec:
-            detail_parts.append(sec)
-        if detail_parts:
-            lines.append(f"   🏭 {' · '.join(detail_parts)}")
-
-        # ── Gold/commodity INR auto-conversion ────────────────────────────
-        if s.get("is_commodity") and currency == "USD" and price and inr_rate:
-            per_10g_inr = (price / 31.1035) * 10 * inr_rate
-            lines.append(
-                f"   🇮🇳 ≈ ₹{per_10g_inr:,.0f}/10g  "
-                f"(at ₹{inr_rate:.2f}/USD)"
-            )
-        elif s.get("is_commodity") and currency == "USD":
-            lines.append(f"   🇮🇳 Priced in USD/troy oz")
-
-        # ── Brief market signal ─────────────────────────────────────────
-        signals = []
-        if wh and wl and price:
-            pct_from_high = (wh - price) / wh * 100
-            pct_from_low  = (price - wl) / wl * 100 if wl else 0
-            if pct_from_high <= 3:
-                signals.append("Trading near 52W high")
-            elif pct_from_low <= 3:
-                signals.append("Trading near 52W low ⚠️")
-        if vol and avg_vol and avg_vol > 0:
-            if vol / avg_vol > 2.0:
-                signals.append("Unusually high volume 📢")
-            elif vol / avg_vol < 0.3:
-                signals.append("Very thin volume")
-        if chg_pct and abs(chg_pct) >= 4:
-            signals.append(f"{'Sharp move up' if chg_pct > 0 else 'Sharp sell-off'} today")
-        if signals:
-            lines.append(f"   💡 {' · '.join(signals)}")
-
-        lines.append("")   # blank line between stocks
-
-    if not any(True for s in stocks if not s.get("error") and s.get("price")):
+        lines.append(f"{arrow} *{name}* — {cur}{price:,.2f}  ({chg_pct:+.2f}%)")
+    if len(lines) <= 3:
+        # All symbols had errors or null prices — return an informative message
         sym_list = ", ".join(skipped) if skipped else "requested symbols"
         return (
             f"📊 *Stock Data Unavailable*\n"
@@ -324,8 +220,8 @@ def _format_stocks_mcp(data: dict, inr_rate: Optional[float] = None) -> Optional
             f"Try adding .NS for NSE or .BO for BSE, e.g. PAYTM.NS)_"
         )
     if skipped:
-        lines.append(f"_⚠️ No data for: {', '.join(skipped)}_")
-    return "\n".join(lines).rstrip()
+        lines.append(f"\n_⚠️ No data for: {', '.join(skipped)}_")
+    return "\n".join(lines)
 
 
 async def get_indian_stocks(symbols: Optional[list] = None) -> Optional[str]:
@@ -333,22 +229,11 @@ async def get_indian_stocks(symbols: Optional[list] = None) -> Optional[str]:
 
     # ── Try MCP ──────────────────────────────────────────────────────────────
     try:
-        from .mcp_client import mcp_stocks, mcp_currency
+        from .mcp_client import mcp_stocks
         sym_str = ",".join(symbols) if symbols else ",".join(s for s, _ in _DEFAULT_SYMBOLS[:8])
         data = await mcp_stocks(symbols=sym_str)
         if data and data.get("stocks"):
-            # Auto-fetch USD/INR for gold/commodity display
-            inr_rate = None
-            _COMMODITY_TICKERS = {"GC=F", "SI=F", "CL=F", "NG=F"}
-            has_commodity = symbols and any(s in _COMMODITY_TICKERS for s in symbols)
-            if has_commodity:
-                try:
-                    fx = await mcp_currency("USD", "INR", 1.0)
-                    if fx and fx.get("converted"):
-                        inr_rate = float(fx["converted"])
-                except Exception:
-                    pass
-            result = _format_stocks_mcp(data, inr_rate=inr_rate)
+            result = _format_stocks_mcp(data)
             if result:
                 logger.info("📈 live_data.stocks.mcp  count=%d  symbols=%r",
                             len(data["stocks"]), sym_str)

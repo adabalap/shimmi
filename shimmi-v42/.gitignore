@@ -1,0 +1,15 @@
+data/
+dist/
+build/
+*.log
+.env
+.venv/
+app/__pycache__/
+*.pyc
+.idea/
+.vscode/
+tests/test_results.json
+
+# Never commit env files
+.env
+.env.*

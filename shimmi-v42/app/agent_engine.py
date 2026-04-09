@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.13.0
+agent_engine.py — Shimmi v3.11.0
 
 Changes vs v3.3.0:
 
@@ -1152,33 +1152,6 @@ def _keyword_tool_from_query(query: str, facts: Dict[str, str]) -> Optional[Any]
             country=facts.get("country", "IN")[:2].upper(), days=3,
         )
 
-    # ── Commodities (gold / silver) — check BEFORE generic stocks ───────
-    if re.search(
-        r"\b(gold|silver|precious metal|bullion|commodity|commodities|"
-        r"xau|xag|GC=F|SI=F|gold price|gold rate|silver price|silver rate)\b",
-        low
-    ):
-        # Gold futures (COMEX) → USD price; bot will offer INR conversion
-        if re.search(r"\b(silver|xag|SI=F)\b", low):
-            return StocksTool(tool="stocks", symbols=["SI=F"])
-        return StocksTool(tool="stocks", symbols=["GC=F"])
-
-    # ── Portfolio query — user asks about their own holdings ─────────────
-    if re.search(r"\b(portfolio|my stocks|my holdings|my shares|"
-                 r"how.*my stock|stocks.*doing|holdings.*doing)\b", low):
-        # Load portfolio tickers from user facts if available
-        portfolio_str = (facts or {}).get("portfolio_stocks", "")
-        if portfolio_str:
-            portfolio_tickers = [t.strip() for t in portfolio_str.split(",") if t.strip()]
-            # Normalise: bare symbols → .NS
-            portfolio_tickers = [t if "." in t or t.startswith("^")
-                                  else t + ".NS"
-                                  for t in portfolio_tickers[:10]]
-            if portfolio_tickers:
-                return StocksTool(tool="stocks", symbols=portfolio_tickers)
-        # No portfolio stored → return general market overview
-        return StocksTool(tool="stocks", symbols=[])
-
     # ── Stocks / markets ──────────────────────────────────────────────────
     if re.search(
         r"\b(stock|share|price|nifty|sensex|bse|nse|market|equity|"
@@ -1190,10 +1163,10 @@ def _keyword_tool_from_query(query: str, facts: Dict[str, str]) -> Optional[Any]
         _SKIP = {"NSE", "BSE", "IPO", "MF", "ETF", "WHAT", "HOW", "THE",
                  "FOR", "AND", "OF", "IN", "ON", "AT", "TO", "BY"}
         filtered = [t for t in tickers if t not in _SKIP]
-        # Always append .NS for unqualified Indian tickers
-        symbols = [t if "." in t or t.startswith("^") else t + ".NS"
-                   for t in filtered[:5]]
-        # If no explicit ticker found, return empty → MCP returns top indices
+        # FIX-STOCKS-1: Always append .NS for unqualified Indian tickers so
+        # yfinance resolves them correctly (PAYTM→PAYTM.NS, RELIANCE→RELIANCE.NS).
+        symbols = [t if "." in t else t + ".NS" for t in filtered[:5]]
+        # If no explicit ticker found, return empty symbols → MCP returns top indices
         return StocksTool(tool="stocks", symbols=symbols)
 
     # ── News / Sports scores ─────────────────────────────────────────────

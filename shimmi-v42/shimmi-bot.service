@@ -1,0 +1,40 @@
+
+[Unit]
+Description=AI Bot (FastAPI + Uvicorn) service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+# Run as your regular user for least privilege
+User=ubuntu
+Group=ubuntu
+
+# Make sure the app loads .env / env.txt from the project dir
+WorkingDirectory=/opt/shimmi
+
+# Ensure Python prints immediately (no buffering) to the log
+Environment=PYTHONUNBUFFERED=1
+
+# Allow ExecStartPre to run as root even though User=ubuntu is set
+PermissionsStartOnly=true
+
+# Create and own the log file before the service starts
+ExecStartPre=/usr/bin/bash -lc 'install -o ubuntu -g ubuntu -m 0644 /dev/null /var/log/shimmi-bot.log'
+
+# Start uvicorn from the venv with your command
+ExecStart=/usr/bin/bash -lc '/opt/shimmi/.venv/bin/uvicorn app.main:app --host 0.0.0.0 --port 6000 --log-level info >> /var/log/shimmi-bot.log 2>&1'
+
+# Restart strategy
+Restart=always
+RestartSec=5
+
+# File descriptor limit, can be increased if needed
+LimitNOFILE=4096
+
+# Optional: a small startup delay before restart loops
+StartLimitBurst=5
+StartLimitIntervalSec=30
+
+[Install]
+WantedBy=multi-user.target
+

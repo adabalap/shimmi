@@ -45,8 +45,6 @@ CANONICAL_KEYS: List[str] = [
     "recent_book", "preferred_language",
     # Lists
     "shopping_list", "grocery_list", "todo_list",
-    # Finance
-    "portfolio_stocks",
     # Other personal
     "interests", "hobbies", "motivational_quote", "reminder_notes",
 ]
@@ -133,11 +131,6 @@ KEY_ALIASES: Dict[str, str] = {
     "books_read": "recent_book", "current_book": "recent_book",
     "reading": "recent_book", "last_book": "recent_book",
     "reading_list": "recent_book",
-
-    # ── finance / portfolio ──────────────────────────────────────────────
-    "portfolio": "portfolio_stocks", "my_stocks": "portfolio_stocks",
-    "holdings": "portfolio_stocks", "watchlist": "portfolio_stocks",
-    "stock_portfolio": "portfolio_stocks",
 
     # ── lists ─────────────────────────────────────────────────────────────
     "grocery": "grocery_list", "groceries": "grocery_list",
