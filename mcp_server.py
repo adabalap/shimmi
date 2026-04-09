@@ -650,16 +650,29 @@ async def fetch_url(url: str = Query(..., min_length=8)):
     try:
         resp = await _HTTP.get(
             url,
-            timeout=httpx.Timeout(connect=5.0, read=20.0),
-            headers={"User-Agent": "Mozilla/5.0 (compatible; Shimmi/1.0)"},
+            timeout=httpx.Timeout(connect=8.0, read=25.0),
+            headers={
+                "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                              "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
+            },
             follow_redirects=True,
         )
         resp.raise_for_status()
         html_text = resp.text
     except httpx.HTTPStatusError as exc:
-        raise HTTPException(status_code=502, detail=f"HTTP {exc.response.status_code} from {url}")
+        detail = f"HTTP {exc.response.status_code} from {url}"
+        logger.warning("fetch.http_error  url=%r  status=%d", url[:80], exc.response.status_code)
+        return JSONResponse({"error": detail, "url": url}, status_code=200)
+    except httpx.TimeoutException as exc:
+        detail = f"Timed out fetching {url}"
+        logger.warning("fetch.timeout  url=%r  err=%s", url[:80], str(exc)[:120])
+        return JSONResponse({"error": detail, "url": url}, status_code=200)
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Could not fetch {url}: {str(exc)[:120]}")
+        detail = f"Could not fetch {url}: {str(exc)[:200]}"
+        logger.warning("fetch.connection_error  url=%r  err=%s", url[:80], str(exc)[:200])
+        return JSONResponse({"error": detail, "url": url}, status_code=200)
 
     # ── 2. Extract with trafilatura ───────────────────────────────────────
     meta = _extract_with_trafilatura(html_text, url)
@@ -677,7 +690,8 @@ async def fetch_url(url: str = Query(..., min_length=8)):
 
     full_text = meta.get("text", "")
     if not full_text:
-        raise HTTPException(status_code=502, detail=f"No readable content found at {url}")
+        logger.warning("fetch.no_content  url=%r", url[:80])
+        return JSONResponse({"error": f"No readable content found at {url}", "url": url}, status_code=200)
 
     # ── 3. Compact with LexRank ───────────────────────────────────────────
     abstract = _compact_with_lexrank(full_text, sentence_count=5)

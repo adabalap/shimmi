@@ -277,9 +277,15 @@ class ToolDispatcher:
         result = await mcp_fetch_url(url)
 
         if not result:
-            # MCP unavailable or fetch failed — tell the LLM clearly
-            logger.warning("tools.fetch_url.mcp_fail  url=%r", url[:80])
+            # MCP unreachable (network error calling MCP itself)
+            logger.warning("tools.fetch_url.mcp_unavailable  url=%r", url[:80])
             return f"Could not fetch {url} — the page may be unavailable or behind a paywall."
+
+        if result.get("error"):
+            # MCP reached the endpoint but the fetch failed (DNS, timeout, HTTP error etc.)
+            err_detail = result["error"]
+            logger.warning("tools.fetch_url.fetch_failed  url=%r  err=%s", url[:80], err_detail[:120])
+            return f"Could not read that page — {err_detail}"
 
         # Build a structured prompt block so the LLM gets both the map
         # (LexRank abstract) and the territory (full clean text)
