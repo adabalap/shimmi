@@ -81,11 +81,26 @@ class StocksTool(BaseModel):
     @classmethod
     def _coerce(cls, v: Any) -> List[str]:
         if isinstance(v, str):
-            # Accept comma-separated string from LLM
-            return [s.strip().upper() for s in v.split(",") if s.strip()]
-        if isinstance(v, list):
-            return [str(s).strip().upper() for s in v if str(s).strip()]
-        return []
+            raw = [s.strip().upper() for s in v.split(",") if s.strip()]
+        elif isinstance(v, list):
+            raw = [str(s).strip().upper() for s in v if str(s).strip()]
+        else:
+            return []
+        # Normalise Indian equity tickers: bare symbols → .NS
+        # LLMs often omit the exchange suffix; .NS (NSE) is the correct default.
+        # Commodity/index tickers (GC=F, ^NSEI) and already-qualified ones pass through.
+        _COMMODITY_PASS = {"GC=F", "SI=F", "CL=F", "NG=F", "BZ=F"}
+        normalised = []
+        for sym in raw:
+            if sym in _COMMODITY_PASS:
+                normalised.append(sym)
+            elif sym.startswith("^"):          # index like ^NSEI
+                normalised.append(sym)
+            elif "." in sym:                   # already has exchange suffix
+                normalised.append(sym)
+            else:
+                normalised.append(sym + ".NS") # bare Indian equity → NSE default
+        return normalised
 
 
 class CurrencyTool(BaseModel):
