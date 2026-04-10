@@ -189,6 +189,23 @@ PROTECTED_KEYS: FrozenSet[str] = frozenset({
     "whatsapp_id", "chat_id",
 })
 
+# Keys that the consolidation LLM must NEVER absorb into another key or
+# use as a canonical target. These are user-curated lists with distinct
+# semantics — merging them into e.g. recent_book would destroy their value.
+# Evidence: consolidate.merged canonical=recent_book absorbed=['shopping_list']
+#           → shopping list overwritten with book title. Bug confirmed in logs.
+CONSOLIDATION_PROTECTED: FrozenSet[str] = frozenset({
+    "shopping_list",
+    "grocery_list",
+    "todo_list",
+    "lists",
+    "reminders",
+    "portfolio_stocks",
+    "read_books",          # book list — distinct from recent_book (single title)
+    "social_security_number",  # should never be touched by consolidation
+    "allergies",           # medical — must not be merged with food preferences
+})
+
 # ---------------------------------------------------------------------------
 # Prompt filtering
 # ---------------------------------------------------------------------------
@@ -196,20 +213,59 @@ PROTECTED_KEYS: FrozenSet[str] = frozenset({
 # Keys excluded from the orchestrator prompt window — they waste tokens or
 # are a security risk. Still stored in DB for audit/consolidation.
 PROMPT_SKIP_KEYS: FrozenSet[str] = frozenset({
+    # Ephemeral — expire within the same session, stale on next conversation
     "recent_query",
     "recent_search",
     "conversation_since_morning",
-    "last_summary",
-    "recent_article_details",       # can be 800+ chars of article text
-    "favorite_news_source_details", # verbose description, not a useful fact
     "arrival_time",
-    "destination",                  # session-ephemeral navigation data
+    "destination",
     "next_meeting_team",
     "next_meeting_time",
-    "next_trip_start_date",         # stale fast
-    "social_security_number",       # security risk in prompts
-    "work_experience",              # superseded by occupation
-    "recent_article",               # URL, not a personal fact
+    "next_trip_start_date",
+    # Verbose text blocks — waste 200-800 tokens on every prompt
+    "last_summary",
+    "recent_article_details",
+    "favorite_news_source_details",
+    # Structural noise — duplicate/vague/meaningless
+    "greeting",                     # 'Hi there' — LLM never uses this
+    "lists",                        # duplicate of shopping_list + grocery_list
+    "favorite_video",               # always vague ('awesome video', etc.)
+    "recent_article",               # URL only, not a personal fact
+    "work_experience",              # superseded by occupation + company
+    # Security — never shown in prompts (also blocked from storage entirely)
+    "social_security_number",
+    "bank_account",
+    "credit_card",
+    "password",
+    "pin",
+})
+
+# ---------------------------------------------------------------------------
+# NEVER_STORE_KEYS — hard blocklist at DB write time
+# These keys are REJECTED by upsert_fact regardless of source.
+# Use for anything that should never be persisted: PII, secrets, session noise.
+# ---------------------------------------------------------------------------
+NEVER_STORE_KEYS: FrozenSet[str] = frozenset({
+    # Sensitive PII — must never be stored
+    "social_security_number", "ssn",
+    "bank_account", "bank_account_number",
+    "credit_card", "credit_card_number",
+    "password", "passphrase",
+    "pin", "otp",
+    "passport_number",
+    "aadhaar", "aadhaar_number", "pan", "pan_number",
+    # Session-ephemeral noise — no value in persisting
+    "greeting",
+    "arrival_time",
+    "destination",
+    "next_meeting_team",
+    "next_meeting_time",
+    "next_trip_start_date",
+    "recent_query",
+    "recent_search",
+    "conversation_since_morning",
+    "lists",                        # duplicate of shopping_list / grocery_list
+    "favorite_video",               # always vague
 })
 
 # Junk placeholder values — filtered at DB read time and prompt build time.

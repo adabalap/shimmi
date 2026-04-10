@@ -232,6 +232,13 @@ def _format_stocks_mcp(data: dict, inr_rate: Optional[float] = None) -> Optional
 
     for s in stocks:
         if s.get("error"):
+            if s.get("rate_limited"):
+                # Propagate rate-limit message immediately — no point continuing
+                return (
+                    "⏳ *Yahoo Finance is temporarily rate-limiting this server.*\n"
+                    "Stock prices are unavailable right now.\n"
+                    "_Try again in 1–2 hours — this clears on its own._"
+                )
             skipped.append(s.get("symbol", "?"))
             continue
 

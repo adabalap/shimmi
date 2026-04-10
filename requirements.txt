@@ -38,8 +38,13 @@ python-dotenv>=1.0.0
 tzdata>=2024.1
 
 # MCP sidecar (mcp_server.py — same or separate venv)
-yfinance>=0.2.40
+yfinance>=0.2.54              # Indian stock data via Yahoo Finance
 gnews>=0.3.7
+
+# Browser TLS impersonation — prevents Yahoo Finance rate-limiting the server IP.
+# yfinance passes this session to every HTTP call; Yahoo sees a real Chrome browser.
+# Without this, heavy use causes YFRateLimitError (Too Many Requests).
+curl-cffi>=0.7.0              # pip install curl-cffi
 
 # URL content extraction (MCP /fetch endpoint)
 trafilatura>=2.0.0            # Article extraction: F1=0.958 (best open-source)

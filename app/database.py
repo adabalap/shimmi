@@ -1,5 +1,5 @@
 """
-database.py — Shimmi v3.11.0
+database.py — Shimmi v3.14.2
 
 Changes vs v2.7.0:
   ① reminders table + ReminderStore methods
@@ -452,6 +452,19 @@ class SQLiteMemory:
         value = (value or "").strip()
         if not key or not value:
             return "unchanged"
+
+        # Hard blocklist — reject keys that should never be stored
+        # Checked BEFORE any DB access so sensitive data never touches SQLite.
+        try:
+            from .memory_schema import NEVER_STORE_KEYS as _NEVER_STORE
+            if key in _NEVER_STORE:
+                import logging as _log
+                _log.getLogger("app.database").warning(
+                    "db.upsert_fact.blocked  key=%r  (NEVER_STORE_KEYS)", key
+                )
+                return "unchanged"
+        except ImportError:
+            pass
         valid_sources = {"user_stated", "bot_inferred"}
         safe_source = source if source in valid_sources else "user_stated"
         async with self._lock:

@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.13.0
+agent_engine.py — Shimmi v3.14.2
 
 Changes vs v3.3.0:
 
@@ -748,7 +748,11 @@ async def _groq_raw(
 # ─────────────────────────────────────────────────────────────────────────────
 
 # Memory key definitions — imported from single source of truth.
-from .memory_schema import JUNK_VALUES as _JUNK_VALUES, PROMPT_SKIP_KEYS as _PROMPT_SKIP_KEYS
+from .memory_schema import (
+    JUNK_VALUES as _JUNK_VALUES,
+    PROMPT_SKIP_KEYS as _PROMPT_SKIP_KEYS,
+    CONSOLIDATION_PROTECTED as _CONSOLIDATION_PROTECTED,
+)
 
 # Max characters for a single fact value in the orchestrator prompt.
 # Long values like conversation_summary, favorite_quote get truncated.
@@ -1050,6 +1054,26 @@ def _try_time_shortcut(user_text: str) -> Optional[str]:
 # P1-FEAT-1: Tool dispatch — LLM-decided, replaces keyword regex
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _is_stock_query(query: str) -> bool:
+    """
+    Returns True if the query is clearly asking for a stock price / market data.
+    Used to intercept mis-routed tool choices (e.g. news chosen for stock queries).
+    Intentionally conservative — only stock-specific patterns, not general finance.
+    """
+    if not query:
+        return False
+    low = query.lower()
+    return bool(re.search(
+        r"\b(stock|share|price|equity|nse|bse|nifty|sensex|"
+        r"paytm|reliance|tcs|infy|infosys|wipro|hdfc|icici|sbi|"
+        r"adani|airtel|zomato|bajaj|ongc|kotak|hcl|"
+        r"gold.?price|gold.?rate|silver.?price|silver.?rate|"
+        r"how.*(stock|share|market|doing|performing)|"
+        r"(stock|share|market).*(update|today|now|current|latest))\b",
+        low
+    ))
+
+
 async def _dispatch_tool(
     tool_call_raw: Optional[Dict[str, Any]],
     query: str,
@@ -1090,20 +1114,26 @@ async def _dispatch_tool(
             from .tools import WebSearchTool
             tool_call = WebSearchTool(tool="web_search", query=query or "")
     else:
-        # FIX-TOOL-OVERRIDE: Groq 70B sometimes returns explicit tool_call=web_search
-        # for queries that should go to structured MCP tools (news, stocks, timezone).
-        # Evidence: "latest cricket score" → Groq returned tool_call=web_search →
-        # compound-beta-mini failed 3 times. The keyword router correctly identifies
-        # these queries but is skipped when tool_call is NOT None.
-        # Fix: if the LLM explicitly chose web_search, run the keyword router anyway.
-        # If keywords match a better tool, use that. If not, keep web_search as-is.
-        from .tools import WebSearchTool
-        if isinstance(tool_call, WebSearchTool):
+        # FIX-TOOL-OVERRIDE: Groq 8B fallback frequently mis-routes stock/price
+        # queries to web_search or news instead of stocks. The keyword router
+        # correctly identifies these but is skipped when tool_call is not None.
+        #
+        # Extended override: run keyword router whenever LLM picks web_search OR news,
+        # and replace with stocks if the query pattern matches a stock/price/commodity.
+        # This prevents "how is reliance doing" → news, "TCS share price" → web_search.
+        from .tools import WebSearchTool, NewsTool, StocksTool
+        _should_override = (
+            isinstance(tool_call, WebSearchTool)
+            or (isinstance(tool_call, NewsTool)
+                and _is_stock_query(query))  # news chosen for a stock query
+        )
+        if _should_override:
             better = _keyword_tool_from_query(query, _facts)
             if better is not None:
+                original_tool = tool_call.tool
                 logger.info(
-                    "🔑 tool_dispatch.override  chat=%s  web_search→%s  query=%r",
-                    chat_id, better.tool, query[:60],
+                    "🔑 tool_dispatch.override  chat=%s  %s→%s  query=%r",
+                    chat_id, original_tool, better.tool, query[:60],
                 )
                 tool_call = better
 
@@ -2145,6 +2175,30 @@ async def run_agent(
 
         orch = await _orchestrate(messages, chat_id, label=label, trace=trace)
 
+        # ── Hallucination guard: force search for live-data queries ──────────
+        # Groq 8B (last-resort fallback) sometimes answers action=answer for
+        # stock / gold / price queries, hallucinating prices from training data.
+        # Evidence: "TCS share price" → action=answer, reply="₹1,200.00" (fake).
+        # Fix: if action=answer on iteration 1 AND the query is a stock/price
+        # query, override to action=search so the correct MCP tool is called.
+        # We only apply this on iteration 1 (iteration 2 has real search data).
+        if (orch.action == "answer"
+                and iteration == 1
+                and settings.live_search_enabled
+                and _is_stock_query(user_text)):
+            logger.info(
+                "🛡️  hallucination_guard  iter=%d  overriding action=answer→search  query=%r",
+                iteration, user_text[:80],
+            )
+            # Build a keyword-routed tool_call and inject it into orch
+            kw_tool = _keyword_tool_from_query(user_text, facts or {})
+            if kw_tool is not None:
+                # Patch orch to be a search action with the keyword-routed tool
+                # Use object.__setattr__ since OrchestratorResult is Pydantic
+                object.__setattr__(orch, "action", "search")
+                object.__setattr__(orch, "query", user_text)
+                object.__setattr__(orch, "tool_call", kw_tool.model_dump())
+
         if orch.action == "answer":
             reply_text = orch.text or "Sorry, I couldn't generate a reply."
             # Orchestrator-decided updates are already verified by the orchestrator
@@ -2527,12 +2581,23 @@ async def consolidate_user_facts(whatsapp_id: str) -> None:
             if not canonical or not value:
                 continue
 
+            # Protection: never merge protected keys (shopping lists, SSN, etc.)
+            # These have distinct semantics and must never be absorbed into
+            # another key — a shopping list is not a book title.
+            if canonical in _CONSOLIDATION_PROTECTED:
+                logger.debug(
+                    "consolidate.skip_protected  sender=%s  canonical=%s  (protected key)",
+                    whatsapp_id, canonical,
+                )
+                continue
+
             # Safety: only absorb keys that actually exist in the DB AND differ from
             # canonical. Prevents the LLM from hallucinating keys or deleting a key
             # it incorrectly labeled as a duplicate of something else.
             absorb = [
                 k for k in absorb_raw
                 if k and k != canonical and k in original_keys
+                and k not in _CONSOLIDATION_PROTECTED  # never absorb protected keys
             ]
 
             # Safety: canonical must also exist OR be a known alias of an existing key.
