@@ -48,19 +48,16 @@ from fastapi import FastAPI, HTTPException, Query
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-# curl_cffi: impersonates a real browser's TLS fingerprint so Yahoo Finance
-# does not rate-limit the server. Installed as an optional dep — falls back
-# to a plain requests.Session if not available.
+# curl_cffi is used internally by yfinance >= 0.2.54 for browser TLS
+# impersonation — do NOT pass a session to yf.Ticker(); let yfinance handle
+# its own session management. Passing an external session causes the
+# "'str' object has no attribute 'name'" cookie-handling error.
+_CURL_CFFI_AVAILABLE = False
 try:
-    from curl_cffi import requests as _curl_requests
+    import curl_cffi as _curl_cffi  # noqa: F401 — just checking it's installed
     _CURL_CFFI_AVAILABLE = True
 except ImportError:
-    _CURL_CFFI_AVAILABLE = False
-
-# Module-level yfinance session — created once at startup, reused for every
-# ticker fetch.  Using curl_cffi with impersonate="chrome" prevents Yahoo
-# Finance from blocking the server IP with YFRateLimitError.
-_YF_SESSION = None
+    pass
 
 logger = logging.getLogger("mcp_server")
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s mcp:%(message)s")
@@ -109,39 +106,25 @@ _TTL_FETCH    = 600    # 10 min — same as weather; articles don't change fast
 
 @app.on_event("startup")
 async def _startup():
-    global _HTTP, _YF_SESSION
+    global _HTTP
     _HTTP = httpx.AsyncClient(timeout=12.0, follow_redirects=True)
 
-    # Build the yfinance session with browser TLS impersonation
+    # yfinance >= 0.2.54 manages its own curl_cffi session internally.
+    # Do NOT pass a session to yf.Ticker() — it causes cookie-handling errors.
     if _CURL_CFFI_AVAILABLE:
-        _YF_SESSION = _curl_requests.Session(impersonate="chrome")
-        logger.info("yf.session  curl_cffi chrome impersonation ✅")
+        logger.info("yf.session  curl_cffi available — yfinance handles TLS impersonation ✅")
     else:
-        # Plain requests fallback — works but may hit Yahoo rate limits under load
-        import requests as _requests
-        _YF_SESSION = _requests.Session()
-        _YF_SESSION.headers.update({
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-            )
-        })
         logger.warning(
-            "yf.session  curl_cffi not installed — using plain requests. "
-            "Install curl-cffi for reliable Yahoo Finance access: "
-            "pip install curl-cffi"
+            "yf.session  curl_cffi not installed — Yahoo Finance may rate-limit. "
+            "Fix: pip install curl-cffi  (yfinance uses it automatically)"
         )
-    logger.info("🚀 MCP server v3.14.2 ready on :7000")
+    logger.info("🚀 MCP server v3.14.3 ready on :7000")
 
 @app.on_event("shutdown")
 async def _shutdown():
     if _HTTP:
         await _HTTP.aclose()
-    if _YF_SESSION is not None:
-        try:
-            _YF_SESSION.close()
-        except Exception:
-            pass
+    # Note: yfinance manages its own session internally — nothing to close here
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -154,7 +137,7 @@ async def health():
         "status": "ok",
         "ts": datetime.now(UTC).isoformat(),
         "cache_entries": len(_CACHE),
-        "yf_session": "curl_cffi/chrome" if _CURL_CFFI_AVAILABLE else "requests/basic",
+        "yf_session": "curl_cffi/auto" if _CURL_CFFI_AVAILABLE else "requests/basic (install curl-cffi)",
     }
 
 
@@ -288,11 +271,11 @@ async def get_stocks(
         All new fields are optional — callers must handle None gracefully.
         Falls back to fast_info if info is empty (indices like ^NSEI).
 
-        Uses _YF_SESSION (curl_cffi chrome impersonation) to avoid
-        YFRateLimitError from Yahoo Finance blocking the server IP.
+        yfinance >= 0.2.54 uses curl_cffi internally for TLS impersonation.
+        Do NOT pass a session — yfinance manages it automatically.
         """
         try:
-            ticker = yf.Ticker(sym, session=_YF_SESSION)
+            ticker = yf.Ticker(sym)
             info   = ticker.info or {}
 
             # Prefer currentPrice, fall back through known field names
@@ -313,7 +296,7 @@ async def get_stocks(
                 bse_sym = sym[:-3] + ".BO"
                 logger.info("stocks.fallback  %s → %s (no price on NSE)", sym, bse_sym)
                 try:
-                    bse_ticker = yf.Ticker(bse_sym, session=_YF_SESSION)
+                    bse_ticker = yf.Ticker(bse_sym)
                     bse_info   = bse_ticker.info or {}
                     price = (bse_info.get("currentPrice")
                              or bse_info.get("regularMarketPrice"))
