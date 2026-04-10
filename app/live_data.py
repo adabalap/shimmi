@@ -1,5 +1,5 @@
 """
-live_data.py — Shimmi v3.13.0
+live_data.py — Shimmi v3.15.0
 
 Changes vs v3.0.1:
   ARCH-1  All data fetching now routes through mcp_client → mcp_server (port 7000)
@@ -412,6 +412,154 @@ async def get_indian_stocks(symbols: Optional[list] = None) -> Optional[str]:
     result = "\n".join(lines)
     logger.info("📈 live_data.stocks.direct  count=%d", len(stocks))
     return result
+
+
+
+async def get_portfolio_review(holdings_json: str) -> Optional[str]:
+    """
+    Full portfolio P&L review.
+
+    holdings_json: JSON string from portfolio_holdings fact:
+        [{"symbol": "PAYTM.NS", "qty": 100, "avg_price": 1000}, ...]
+
+    Returns a WhatsApp-formatted portfolio card with:
+      - Current price, day change for each stock
+      - P&L per holding (unrealised gain/loss)
+      - Total portfolio value vs cost basis
+      - Overall return %
+    """
+    import json as _json
+    from .mcp_client import mcp_stocks
+
+    # ── Parse holdings ──────────────────────────────────────────────────────
+    try:
+        holdings = _json.loads(holdings_json)
+        if not isinstance(holdings, list) or not holdings:
+            return None
+    except (_json.JSONDecodeError, TypeError):
+        return None
+
+    # Normalise: ensure each holding has symbol, qty, avg_price
+    valid = []
+    for h in holdings:
+        sym = str(h.get("symbol", "") or "").strip().upper()
+        if not sym:
+            continue
+        # Add .NS if bare symbol
+        if "." not in sym and not sym.startswith("^") and sym not in {"GC=F","SI=F"}:
+            sym += ".NS"
+        try:
+            qty       = float(h.get("qty", 0) or 0)
+            avg_price = float(h.get("avg_price", 0) or 0)
+        except (TypeError, ValueError):
+            qty = avg_price = 0
+        if qty > 0 and avg_price > 0:
+            valid.append({"symbol": sym, "qty": qty, "avg_price": avg_price})
+
+    if not valid:
+        return None
+
+    # ── Fetch current prices from MCP ───────────────────────────────────────
+    symbols_str = ",".join(h["symbol"] for h in valid)
+    data = await mcp_stocks(symbols=symbols_str)
+    if not data or not data.get("stocks"):
+        return None
+
+    # Build a lookup dict from MCP response
+    price_map = {}
+    for s in data["stocks"]:
+        if not s.get("error") and s.get("price") is not None:
+            price_map[s["symbol"]] = s
+
+    # ── Calculate P&L ───────────────────────────────────────────────────────
+    today     = datetime.now(UTC).strftime("%a %d %b %Y")
+    lines     = [f"📊 *Portfolio Review — {today}*", ""]
+
+    total_cost    = 0.0
+    total_current = 0.0
+    any_data      = False
+
+    for h in valid:
+        sym       = h["symbol"]
+        qty       = h["qty"]
+        avg_price = h["avg_price"]
+        cost      = qty * avg_price
+        total_cost += cost
+
+        mcp = price_map.get(sym)
+        if not mcp:
+            lines.append(f"⚪ *{sym}*  —  No data available")
+            lines.append("")
+            continue
+
+        any_data      = True
+        cur_price     = mcp["price"]
+        cur_value     = qty * cur_price
+        total_current += cur_value
+
+        pnl        = cur_value - cost
+        pnl_pct    = (pnl / cost * 100) if cost else 0
+        day_chg    = mcp.get("change_pct") or 0
+        name       = mcp.get("name") or sym
+
+        arrow      = "🟢" if pnl >= 0 else "🔴"
+        day_arrow  = "▲" if day_chg >= 0 else "▼"
+        cur_sym    = "₹" if mcp.get("currency","INR") == "INR" else "$"
+
+        lines.append(f"{arrow} *{name}*  ({sym})")
+        lines.append(
+            f"   💰 {cur_sym}{cur_price:,.2f}  "
+            f"({day_arrow}{abs(day_chg):.2f}% today)"
+        )
+        lines.append(
+            f"   📦 {qty:.0f} shares  ×  avg {cur_sym}{avg_price:,.2f}"
+        )
+
+        # Cost vs current
+        lines.append(
+            f"   💼 Cost: {cur_sym}{cost:,.0f}  →  "
+            f"Now: {cur_sym}{cur_value:,.0f}"
+        )
+
+        # P&L line
+        pnl_sign = "+" if pnl >= 0 else ""
+        lines.append(
+            f"   {'📈' if pnl >= 0 else '📉'} P&L: "
+            f"{pnl_sign}{cur_sym}{pnl:,.0f}  ({pnl_sign}{pnl_pct:.1f}%)"
+        )
+
+        # 52-week context if available
+        wh, wl = mcp.get("week52_high"), mcp.get("week52_low")
+        if wh and wl:
+            pos = _fmt_52w_position(cur_price, wl, wh)
+            lines.append(f"   📊 52W: {cur_sym}{wl:,.0f} ↔ {cur_sym}{wh:,.0f}  {pos}")
+
+        lines.append("")
+
+    if not any_data:
+        return None
+
+    # ── Portfolio summary ───────────────────────────────────────────────────
+    if total_cost > 0 and total_current > 0:
+        total_pnl     = total_current - total_cost
+        total_pnl_pct = (total_pnl / total_cost) * 100
+        total_sign    = "+" if total_pnl >= 0 else ""
+        summary_icon  = "🟢" if total_pnl >= 0 else "🔴"
+
+        lines.append("─" * 30)
+        lines.append(f"*Portfolio Summary*")
+        lines.append(f"   💰 Invested:  ₹{total_cost:,.0f}")
+        lines.append(f"   💎 Current:   ₹{total_current:,.0f}")
+        lines.append(
+            f"   {summary_icon} Total P&L:  "
+            f"{total_sign}₹{total_pnl:,.0f}  ({total_sign}{total_pnl_pct:.1f}%)"
+        )
+
+    logger.info(
+        "📊 portfolio_review  holdings=%d  cost=%.0f  current=%.0f",
+        len(valid), total_cost, total_current,
+    )
+    return "\n".join(lines).rstrip()
 
 
 async def get_stock_by_name(query: str) -> Optional[str]:

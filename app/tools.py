@@ -196,7 +196,7 @@ class ToolDispatcher:
             elif tool_name == "news":
                 return await self._news(tool_call, _facts)           # type: ignore[arg-type]
             elif tool_name == "stocks":
-                return await self._stocks(tool_call)                  # type: ignore[arg-type]
+                return await self._stocks(tool_call, facts=_facts)    # type: ignore[arg-type]
             elif tool_name == "currency":
                 return await self._currency(tool_call)                # type: ignore[arg-type]
             elif tool_name == "timezone":
@@ -245,10 +245,28 @@ class ToolDispatcher:
         result = await get_news(effective_query, country[:2].upper())
         return result or ""
 
-    async def _stocks(self, tc: StocksTool) -> str:
-        from .live_data import get_indian_stocks
+    async def _stocks(self, tc: StocksTool, facts: Optional[Dict[str, str]] = None) -> str:
+        from .live_data import get_indian_stocks, get_portfolio_review
 
         symbols = tc.symbols or []
+
+        # Portfolio P&L review path — triggered by __PORTFOLIO_REVIEW__ sentinel
+        if symbols == ["__PORTFOLIO_REVIEW__"]:
+            _facts = facts or {}
+            holdings_json = _facts.get("portfolio_holdings", "")
+            if holdings_json:
+                logger.info("tools.stocks  portfolio_review  from holdings_json")
+                result = await get_portfolio_review(holdings_json)
+                if result:
+                    return result
+            # Holdings JSON missing or unparseable — fall through to flat list
+            symbols = []
+            portfolio_str = _facts.get("portfolio_stocks", "")
+            if portfolio_str:
+                symbols = [t.strip() if ("." in t.strip() or t.strip().startswith("^"))
+                           else t.strip() + ".NS"
+                           for t in portfolio_str.split(",") if t.strip()]
+
         logger.info("tools.stocks  symbols=%r", symbols)
         result = await get_indian_stocks(symbols)
         return result or ""

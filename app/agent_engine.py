@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.14.3
+agent_engine.py — Shimmi v3.15.0
 
 Changes vs v3.3.0:
 
@@ -1196,16 +1196,25 @@ def _keyword_tool_from_query(query: str, facts: Dict[str, str]) -> Optional[Any]
     # ── Portfolio query — user asks about their own holdings ─────────────
     if re.search(r"\b(portfolio|my stocks|my holdings|my shares|"
                  r"how.*my stock|stocks.*doing|holdings.*doing)\b", low):
-        # Load portfolio tickers from user facts if available
-        portfolio_str = (facts or {}).get("portfolio_stocks", "")
+        _facts = facts or {}
+
+        # Prefer structured holdings (has qty + avg_price → full P&L review)
+        holdings_json = _facts.get("portfolio_holdings", "")
+        if holdings_json:
+            # Signal to _dispatch_tool that we want the P&L review path
+            # Use a special sentinel symbol that live_data recognises
+            return StocksTool(tool="stocks", symbols=["__PORTFOLIO_REVIEW__"])
+
+        # Fall back to flat ticker list (no cost basis, just price check)
+        portfolio_str = _facts.get("portfolio_stocks", "")
         if portfolio_str:
             portfolio_tickers = [t.strip() for t in portfolio_str.split(",") if t.strip()]
-            # Normalise: bare symbols → .NS
             portfolio_tickers = [t if "." in t or t.startswith("^")
                                   else t + ".NS"
                                   for t in portfolio_tickers[:10]]
             if portfolio_tickers:
                 return StocksTool(tool="stocks", symbols=portfolio_tickers)
+
         # No portfolio stored → return general market overview
         return StocksTool(tool="stocks", symbols=[])
 

@@ -46,7 +46,8 @@ CANONICAL_KEYS: List[str] = [
     # Lists
     "shopping_list", "grocery_list", "todo_list",
     # Finance
-    "portfolio_stocks",
+    "portfolio_stocks",        # flat ticker list  e.g. "PAYTM.NS, INFY.NS"
+    "portfolio_holdings",      # JSON: [{"symbol":"PAYTM.NS","qty":100,"avg_price":1000}, ...]
     # Other personal
     "interests", "hobbies", "motivational_quote", "reminder_notes",
 ]
@@ -136,8 +137,10 @@ KEY_ALIASES: Dict[str, str] = {
 
     # ── finance / portfolio ──────────────────────────────────────────────
     "portfolio": "portfolio_stocks", "my_stocks": "portfolio_stocks",
-    "holdings": "portfolio_stocks", "watchlist": "portfolio_stocks",
+    "watchlist": "portfolio_stocks",
     "stock_portfolio": "portfolio_stocks",
+    "holdings": "portfolio_holdings", "my_holdings": "portfolio_holdings",
+    "portfolio_details": "portfolio_holdings",
 
     # ── lists ─────────────────────────────────────────────────────────────
     "grocery": "grocery_list", "groceries": "grocery_list",
@@ -201,6 +204,7 @@ CONSOLIDATION_PROTECTED: FrozenSet[str] = frozenset({
     "lists",
     "reminders",
     "portfolio_stocks",
+    "portfolio_holdings",
     "read_books",          # book list — distinct from recent_book (single title)
     "social_security_number",  # should never be touched by consolidation
     "allergies",           # medical — must not be merged with food preferences
