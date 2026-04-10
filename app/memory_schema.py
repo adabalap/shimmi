@@ -258,6 +258,21 @@ NEVER_STORE_KEYS: FrozenSet[str] = frozenset({
     "pin", "otp",
     "passport_number",
     "aadhaar", "aadhaar_number", "pan", "pan_number",
+    # Per-stock noise keys — portfolio_holdings JSON already has this data
+    # These get created when LLM stores individual stock facts instead of the JSON
+    # Pattern: portfolio_stocks_<name>, portfolio_purchase_price_<name>, 
+    #          stock_<name>_price, stock_<name>_quantity, favorite_stock
+    # We can't block dynamic keys in a frozenset, but we can block the known ones.
+    # The extractor prompt instructs the LLM to use portfolio_holdings instead.
+    "favorite_stock",             # meaningless extracted artifact
+    "stock_paytm_price",          # per-stock noise — in portfolio_holdings
+    "stock_paytm_quantity",
+    "stock_acmesolar_price",
+    "stock_acmesolar_quantity",
+    "portfolio_purchase_price_paytm",
+    "portfolio_purchase_price_acmesolar",
+    "portfolio_stocks_paytm",
+    "portfolio_stocks_acmesolar",
     # Session-ephemeral noise — no value in persisting
     "greeting",
     "arrival_time",

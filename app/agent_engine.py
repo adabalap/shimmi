@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.15.0
+agent_engine.py — Shimmi v3.15.1
 
 Changes vs v3.3.0:
 
@@ -1056,13 +1056,27 @@ def _try_time_shortcut(user_text: str) -> Optional[str]:
 
 def _is_stock_query(query: str) -> bool:
     """
-    Returns True if the query is clearly asking for a stock price / market data.
-    Used to intercept mis-routed tool choices (e.g. news chosen for stock queries).
-    Intentionally conservative — only stock-specific patterns, not general finance.
+    Returns True if the query is clearly asking for a stock PRICE / market data.
+    Returns False for portfolio edit/correction messages — those need memory writes.
+    Used to intercept mis-routed tool choices and prevent hallucination on price queries.
     """
     if not query:
         return False
     low = query.lower()
+
+    # Explicit portfolio edit patterns — these are MEMORY UPDATES, not price queries.
+    # The hallucination guard must NOT fire on these or the correction gets lost.
+    _EDIT_PATTERNS = (
+        r"\b(update|correct|change|fix|edit|modify|revise)\b.*"
+        r"\b(portfolio|purchase.?price|avg.?price|average.?price|bought.?at|shares?)\b",
+        r"\b(purchase.?price|avg.?price|bought.?at)\b.*\b(was|is|should.?be|correct)\b",
+        r"\b(correction|mistake|error|wrong)\b.*\b(price|portfolio|stock|shares?)\b",
+        r"\b(add|remove|delete)\b.*\b(portfolio|holdings?|stocks?)\b",
+    )
+    for pat in _EDIT_PATTERNS:
+        if re.search(pat, low):
+            return False   # portfolio edit — don't force search
+
     return bool(re.search(
         r"\b(stock|share|price|equity|nse|bse|nifty|sensex|"
         r"paytm|reliance|tcs|infy|infosys|wipro|hdfc|icici|sbi|"
@@ -1227,7 +1241,10 @@ def _keyword_tool_from_query(query: str, facts: Dict[str, str]) -> Optional[Any]
     ):
         tickers = re.findall(r"\b([A-Z]{2,12}(?:\.NS|\.BO)?)\b", query)
         _SKIP = {"NSE", "BSE", "IPO", "MF", "ETF", "WHAT", "HOW", "THE",
-                 "FOR", "AND", "OF", "IN", "ON", "AT", "TO", "BY"}
+                 "FOR", "AND", "OF", "IN", "ON", "AT", "TO", "BY",
+                 # Currency/unit abbreviations — not tickers
+                 "RS", "INR", "USD", "EUR", "GBP", "PER", "EACH",
+                 "MY", "IS", "IT", "AS", "OR", "IF", "UP", "NO"}
         filtered = [t for t in tickers if t not in _SKIP]
         # Always append .NS for unqualified Indian tickers
         symbols = [t if "." in t or t.startswith("^") else t + ".NS"

@@ -1,5 +1,5 @@
 """
-live_data.py — Shimmi v3.15.0
+live_data.py — Shimmi v3.15.1
 
 Changes vs v3.0.1:
   ARCH-1  All data fetching now routes through mcp_client → mcp_server (port 7000)

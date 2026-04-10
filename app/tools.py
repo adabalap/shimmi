@@ -89,7 +89,8 @@ class StocksTool(BaseModel):
         # Normalise Indian equity tickers: bare symbols → .NS
         # LLMs often omit the exchange suffix; .NS (NSE) is the correct default.
         # Commodity/index tickers (GC=F, ^NSEI) and already-qualified ones pass through.
-        _COMMODITY_PASS = {"GC=F", "SI=F", "CL=F", "NG=F", "BZ=F"}
+        _COMMODITY_PASS = {"GC=F", "SI=F", "CL=F", "NG=F", "BZ=F",
+                            "__PORTFOLIO_REVIEW__"}  # internal sentinel, never a real ticker
         normalised = []
         for sym in raw:
             if sym in _COMMODITY_PASS:
@@ -247,19 +248,47 @@ class ToolDispatcher:
 
     async def _stocks(self, tc: StocksTool, facts: Optional[Dict[str, str]] = None) -> str:
         from .live_data import get_indian_stocks, get_portfolio_review
+        import json as _json
 
         symbols = tc.symbols or []
+        _facts  = facts or {}
 
-        # Portfolio P&L review path — triggered by __PORTFOLIO_REVIEW__ sentinel
-        if symbols == ["__PORTFOLIO_REVIEW__"]:
-            _facts = facts or {}
-            holdings_json = _facts.get("portfolio_holdings", "")
-            if holdings_json:
-                logger.info("tools.stocks  portfolio_review  from holdings_json")
-                result = await get_portfolio_review(holdings_json)
-                if result:
-                    return result
-            # Holdings JSON missing or unparseable — fall through to flat list
+        # ── Portfolio P&L review detection ────────────────────────────────
+        # Trigger full P&L review when:
+        #   (a) sentinel __PORTFOLIO_REVIEW__ explicitly set by keyword router, OR
+        #   (b) LLM passed the user's own portfolio tickers AND holdings_json exists
+        #       (LLM bypassed keyword router but user is asking about their portfolio)
+        holdings_json = _facts.get("portfolio_holdings", "")
+
+        is_sentinel = (symbols == ["__PORTFOLIO_REVIEW__"])
+
+        is_portfolio_query = False
+        if holdings_json and not is_sentinel and symbols:
+            # Check: are ALL requested symbols present in the stored portfolio?
+            try:
+                stored = {h["symbol"].upper().replace(".NS","").replace(".BO","")
+                          for h in _json.loads(holdings_json)}
+                requested = {s.upper().replace(".NS","").replace(".BO","")
+                             for s in symbols}
+                # If every requested ticker is in their portfolio → portfolio query
+                is_portfolio_query = bool(requested) and requested.issubset(stored)
+            except Exception:
+                pass
+
+        if (is_sentinel or is_portfolio_query) and holdings_json:
+            logger.info(
+                "tools.stocks  portfolio_review  sentinel=%s  query_match=%s",
+                is_sentinel, is_portfolio_query,
+            )
+            result = await get_portfolio_review(holdings_json)
+            if result:
+                return result
+            # get_portfolio_review failed → fall through to plain price fetch
+            symbols = [h["symbol"] for h in _json.loads(holdings_json)
+                       if h.get("symbol")] if holdings_json else symbols
+
+        elif is_sentinel:
+            # Sentinel set but no holdings_json → use flat list
             symbols = []
             portfolio_str = _facts.get("portfolio_stocks", "")
             if portfolio_str:
