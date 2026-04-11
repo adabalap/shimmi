@@ -126,3 +126,35 @@ SELECT '--- Remaining facts ---' AS step;
 SELECT fact_key, substr(fact_value, 1, 60) AS value_preview, source
 FROM user_memory
 ORDER BY fact_key;
+
+-- ---------------------------------------------------------------------------
+-- STEP 8: Fix consolidated portfolio corruption (post v3.15.1 DB residue)
+-- Consolidation merged per-stock keys into meaningless single keys.
+-- portfolio_purchase_price = '2150' (PAYTM price, ACMESOLAR's 289 was overwritten)
+-- portfolio_quantity = '89' (combined shares, meaningless)
+-- Delete these wrong merged keys. portfolio_holdings JSON is the correct source.
+-- ---------------------------------------------------------------------------
+SELECT '--- Step 8: Fix portfolio consolidation corruption ---' AS step;
+
+DELETE FROM user_memory WHERE fact_key IN (
+    'portfolio_purchase_price',
+    'portfolio_quantity',
+    'portfolio_status',
+    'portfolio_review',
+    'portfolio_summary',
+    'stock_paytm_price',
+    'stock_paytm_quantity',
+    'stock_acmesolar_price',
+    'stock_acmesolar_quantity',
+    'portfolio_stocks_paytm',
+    'portfolio_stocks_acmesolar',
+    'portfolio_purchase_price_paytm',
+    'portfolio_purchase_price_acmesolar',
+    'favorite_stock'
+);
+SELECT changes() AS portfolio_noise_rows_deleted;
+
+-- Show current portfolio_holdings to verify it's intact
+SELECT '--- Current portfolio_holdings ---' AS step;
+SELECT fact_key, fact_value FROM user_memory
+WHERE fact_key = 'portfolio_holdings';

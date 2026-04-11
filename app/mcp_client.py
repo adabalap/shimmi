@@ -1,5 +1,5 @@
 """
-mcp_client.py — Shimmi v3.15.3
+mcp_client.py — Shimmi v3.15.4
 
 Changes vs v3.2.0:
   FIX-STOCKS  Per-endpoint timeouts: stocks=20s, news=10s, weather=10s (was 8s flat).

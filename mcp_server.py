@@ -118,7 +118,7 @@ async def _startup():
             "yf.session  curl_cffi not installed — Yahoo Finance may rate-limit. "
             "Fix: pip install curl-cffi  (yfinance uses it automatically)"
         )
-    logger.info("🚀 MCP server v3.15.3 ready on :7000")
+    logger.info("🚀 MCP server v3.15.4 ready on :7000")
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -407,199 +407,107 @@ async def get_stocks(
 # /news/briefing — structured multi-category news briefing
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Category definitions — (label, emoji, query, country)
-# Queries are tuned for relevance: specific enough to avoid fluff,
-# broad enough to catch the day's major stories.
-_BRIEFING_CATEGORIES = [
-    ("Global",        "🌍", "world major news geopolitics economy",  "us"),
-    ("India",         "🇮🇳", "India government economy major news",   "in"),
-    ("Tech",          "💻", "technology artificial intelligence science", "us"),
-    ("India Sports",  "🏏", "India cricket IPL football sports",     "in"),
-    ("Local",         "📍", "Hyderabad local news today",            "in"),
+# Google News RSS topic URLs — unlimited, no API key, editorially curated.
+# These are the ACTUAL top stories Google surfaces, not keyword search results.
+# Format: (label, emoji, rss_url)
+_BRIEFING_RSS = [
+    ("Global",       "🌍",
+     "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-IN&gl=IN&ceid=IN:en"),
+    ("India",        "🇮🇳",
+     "https://news.google.com/rss/headlines/section/topic/NATION?hl=en-IN&gl=IN&ceid=IN:en"),
+    ("Tech",         "💻",
+     "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-IN&gl=IN&ceid=IN:en"),
+    ("India Sports", "🏏",
+     "https://news.google.com/rss/headlines/section/topic/SPORTS?hl=en-IN&gl=IN&ceid=IN:en"),
 ]
-
-_TTL_BRIEFING = 1800   # 30 min — briefing is more stable than individual queries
-
-# Source quality tiers — higher = preferred when filtering
-# Tier 1: major international/national wire services and newspapers
-# Tier 2: good regional/specialist outlets
-# Unranked sources get tier 3 (lowest priority)
-_SOURCE_TIER: dict = {
-    # Tier 1 — highest quality, always prefer
-    "reuters":           1, "associated press":   1, "ap":                1,
-    "bbc":               1, "bbc news":            1, "the guardian":       1,
-    "financial times":   1, "the hindu":           1, "hindustan times":    1,
-    "times of india":    1, "economic times":      1, "ndtv":              1,
-    "mint":              1, "business standard":   1, "the wire":           1,
-    "scroll.in":         1, "the print":           1,
-    # Tier 2 — reliable specialist / regional
-    "techcrunch":        2, "the verge":           2, "wired":             2,
-    "ars technica":      2, "mit technology review": 2,
-    "cricinfo":          2, "espn cricinfo":       2, "bcci":              2,
-    "deccan chronicle":  2, "the news minute":     2, "hans india":        2,
-    "bloomberg":         2, "cnbc":                2, "ft":                2,
-    # Everything else defaults to tier 3
-}
-
-def _source_tier(source: str) -> int:
-    """Return quality tier for a news source name (lower = better)."""
-    return _SOURCE_TIER.get(source.lower().strip(), 3)
+# Local is city-specific — uses RSS search query
+_BRIEFING_LOCAL_RSS = "https://news.google.com/rss/search?q={city}+news&hl=en-IN&gl=IN&ceid=IN:en"
 
 
-_FLUFF_PATTERNS = re.compile(
-    r"\b(horoscope|zodiac|listicle|ranking|best.*buy|top \d+ ways|"
-    r"you won.?t believe|shocking|viral|celebrity|bollywood gossip|"
-    r"box office|bigg boss|salman|shahrukh|deepika|kareena|"
-    r"\bads?\b|sponsored|promoted|advertisement)\b",
-    re.IGNORECASE,
-)
+def _parse_rss(xml_text: str) -> list[dict]:
+    """Parse Google News RSS XML → list of {title, source, pub_iso} dicts."""
+    import xml.etree.ElementTree as ET
+    try:
+        root = ET.fromstring(xml_text)
+    except ET.ParseError:
+        return []
+    items = []
+    for item in root.findall(".//item"):
+        raw_title = (item.findtext("title") or "").strip()
+        pub_date  = (item.findtext("pubDate") or "").strip()
 
-def _is_quality_article(title: str, description: str, source: str, pub_iso: str) -> bool:
+        # Google News title format: "Headline - Source Name"
+        # Split on the LAST " - " to separate headline from source
+        if " - " in raw_title:
+            *headline_parts, source = raw_title.rsplit(" - ", 1)
+            title = " - ".join(headline_parts).strip()
+        else:
+            title  = raw_title
+            source = ""
+
+        # Parse pub date to ISO for freshness check
+        pub_iso = ""
+        if pub_date:
+            try:
+                from email.utils import parsedate_to_datetime
+                pub_iso = parsedate_to_datetime(pub_date).isoformat()
+            except Exception:
+                pass
+
+        if title and len(title) > 15:
+            items.append({"title": title, "source": source, "pub_iso": pub_iso})
+    return items
+
+
+async def _fetch_rss_category(label: str, emoji: str, rss_url: str) -> dict:
     """
-    Returns True if article passes quality filters:
-      1. Not a fluff/entertainment piece
-      2. Title is substantive (>25 chars, not a question-bait)
-      3. Published within the last 12 hours (freshness)
+    Fetch one RSS category from Google News.
+    Applies quality filters: fluff removal, freshness, source tier sorting.
+    Returns top 3 articles as {title, source, brief=""}.
     """
-    if not title or len(title) < 20:
-        return False
-    # Fluff filter
-    combined = f"{title} {description}"
-    if _FLUFF_PATTERNS.search(combined):
-        return False
-    # Freshness — if we have a publish time, reject anything >12h old
-    if pub_iso:
-        try:
-            from datetime import timezone as _tz
-            pub_dt = datetime.fromisoformat(pub_iso.replace("Z", "+00:00"))
-            age_hours = (datetime.now(_tz.utc) - pub_dt).total_seconds() / 3600
-            if age_hours > 12:
-                return False
-        except Exception:
-            pass  # can't parse date → don't filter
-    return True
+    try:
+        resp = await _HTTP.get(
+            rss_url,
+            timeout=httpx.Timeout(connect=5.0, read=8.0, write=3.0, pool=2.0),
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Shimmi/1.0)"},
+            follow_redirects=True,
+        )
+        items = _parse_rss(resp.text)
+
+        # Filter: quality + freshness
+        filtered = [
+            a for a in items
+            if _is_quality_article(a["title"], "", a["source"], a["pub_iso"])
+        ]
+
+        # Sort by source tier
+        filtered.sort(key=lambda x: (_source_tier(x["source"]),
+                                     items.index(x) if x in items else 99))
+
+        # Take top 3, strip internal fields
+        articles = [{"title": a["title"][:120], "brief": "", "source": a["source"]}
+                    for a in filtered[:3]]
+
+        logger.info("briefing.rss  label=%r  fetched=%d  kept=%d",
+                    label, len(items), len(articles))
+        return {"category": label, "emoji": emoji, "articles": articles}
+
+    except Exception as exc:
+        logger.warning("briefing.rss_fail  label=%r  err=%s", label, str(exc)[:80])
+        return {"category": label, "emoji": emoji, "articles": []}
 
 
-@app.get("/news/briefing")
-async def get_news_briefing(
-    city: str = Query("Hyderabad", description="User's city for local news"),
-):
-    """
-    Structured multi-category news briefing.
-    Runs 5 parallel GNews queries (Global, India, Tech, India Sports, Local).
-    Returns a structured dict with sections, each containing 2-3 clean headlines.
-    No article URLs in output — headlines only with source attribution.
+    # Build RSS URL list — 4 fixed topic categories + 1 local RSS search
+    rss_tasks = [(label, emoji, url) for label, emoji, url in _BRIEFING_RSS]
 
-    GET /news/briefing?city=Hyderabad
+    # Local category uses city-specific search RSS
+    local_url = _BRIEFING_LOCAL_RSS.format(city=city.replace(" ", "+"))
+    rss_tasks.append(("Local", "📍", local_url))
 
-    Returns:
-    {
-      "sections": [
-        {"category": "Global", "emoji": "🌍",
-         "articles": [{"title": "...", "source": "..."}, ...]},
-        ...
-      ],
-      "generated_at": "2026-04-11T07:00:00"
-    }
-    """
-    # Customise local category query with user's city
-    categories = list(_BRIEFING_CATEGORIES)
-    if city and city.lower() not in ("hyderabad", ""):
-        categories[-1] = ("Local", "📍", f"{city} local news today", "in")
-
-    ck = _cache_key("briefing", city.lower())
-    cached = _cache_get(ck)
-    if cached:
-        logger.debug("briefing.cache_hit  city=%r", city)
-        return cached
-
-    async def _fetch_category(label: str, emoji: str, query: str, country: str) -> dict:
-        """
-        Fetch up to 6 articles for one category, filter to best 3.
-
-        Quality pipeline:
-          1. Fetch max=6 from GNews (more candidates to choose from)
-          2. Strip source suffix from titles
-          3. Apply fluff filter (gossip, listicles, celebrity)
-          4. Apply freshness filter (< 12 hours old)
-          5. Sort by source tier (Reuters/BBC/ET before unknowns)
-          6. Return top 3 with title + source + trimmed description (lede)
-        """
-        try:
-            if not GNEWS_KEY:
-                return {"category": label, "emoji": emoji, "articles": []}
-            resp = await _HTTP.get(
-                "https://gnews.io/api/v4/search",
-                params={
-                    "q":       query,
-                    "lang":    "en",
-                    "country": country,
-                    "max":     6,          # fetch 6 to have room to filter
-                    "apikey":  GNEWS_KEY,
-                },
-                timeout=httpx.Timeout(connect=5.0, read=8.0, write=3.0, pool=2.0),
-            )
-            data = resp.json()
-            candidates = []
-            for a in data.get("articles", []):
-                raw_title   = (a.get("title") or "").strip()
-                description = (a.get("description") or "").strip()
-                source      = (a.get("source") or {}).get("name", "") or ""
-                pub_iso     = a.get("publishedAt", "")
-
-                # Strip "- SourceName" suffix from title (common in GNews)
-                title = re.sub(r"\s*[-|]\s*[A-Za-z0-9 &\.]{2,40}$", "", raw_title).strip()
-                if not title:
-                    title = raw_title
-
-                # Quality gate
-                if not _is_quality_article(title, description, source, pub_iso):
-                    continue
-
-                # Trim description to 120 chars at sentence boundary
-                brief = ""
-                if description:
-                    desc = description[:150]
-                    # Cut at sentence end if possible
-                    for end in (".", "!", "?"):
-                        idx = desc.rfind(end)
-                        if 40 < idx < 140:
-                            desc = desc[:idx + 1]
-                            break
-                    brief = desc.strip()
-                    if len(description) > len(brief) + 5:
-                        brief = brief.rstrip(".") + "…" if not brief.endswith((".", "!", "?")) else brief
-
-                candidates.append({
-                    "title":       title[:120],
-                    "brief":       brief,
-                    "source":      source,
-                    "source_tier": _source_tier(source),
-                    "pub_iso":     pub_iso,
-                })
-
-            # Sort: tier 1 sources first, then by position (GNews relevance order)
-            candidates.sort(key=lambda x: (x["source_tier"],
-                                           candidates.index(x)))
-
-            # Take top 3, remove internal ranking fields
-            articles = [
-                {"title": c["title"], "brief": c["brief"], "source": c["source"]}
-                for c in candidates[:3]
-            ]
-
-            logger.info("briefing.category  label=%r  fetched=%d  kept=%d",
-                        label, len(data.get("articles", [])), len(articles))
-            return {"category": label, "emoji": emoji, "articles": articles}
-
-        except Exception as exc:
-            logger.warning("briefing.category_fail  label=%r  err=%s", label, str(exc)[:80])
-            return {"category": label, "emoji": emoji, "articles": []}
-
-    # Run all 5 categories in parallel — total time = slowest single query (~1-2s)
+    # Run all 5 in parallel — Google News RSS, unlimited, no API key needed
     sections = await asyncio.gather(*[
-        _fetch_category(label, emoji, query, country)
-        for label, emoji, query, country in categories
+        _fetch_rss_category(label, emoji, url)
+        for label, emoji, url in rss_tasks
     ])
 
     result = {

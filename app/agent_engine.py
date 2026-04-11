@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.15.3
+agent_engine.py — Shimmi v3.15.4
 
 Changes vs v3.3.0:
 
@@ -2193,6 +2193,15 @@ async def run_agent(
     for iteration in range(1, _MAX_ITERATIONS + 1):
         label = f"orchestrate_{iteration}"
 
+        _NO_MEM_TAG = "[SHIMMI_INTERNAL:NO_MEMORY_EXTRACT]"
+
+        # Strip internal tag from search_result before it reaches the LLM
+        if search_result and _NO_MEM_TAG in search_result:
+            search_result = search_result.replace(_NO_MEM_TAG, "").rstrip()
+            # Suppress pre-extracted memory updates — news content is not user data
+            pre_updates = []
+            logger.info("🔇 memory.suppressed  reason=news_result  iter=%d", iteration)
+
         if search_result:
             messages = _build_orchestrator_messages(
                 user_text, facts, context, reminders, search_result,
@@ -2288,6 +2297,14 @@ async def run_agent(
             search_result = await _dispatch_tool(orch.tool_call, query, chat_id, facts=facts)
             logger.info("🔍 search.done  iter=%d  query=%r  result_len=%d",
                         iteration, query, len(search_result or ""))
+
+            # TAG news results so the memory extractor skips them.
+            # News content (headlines, article snippets) is NOT personal user data
+            # and must never be saved as facts. Without this, Groq 8B extracts
+            # stock prices from financial headlines as user portfolio facts.
+            _tool_name = (orch.tool_call or {}).get("tool", "") if isinstance(orch.tool_call, dict)                 else getattr(orch.tool_call, "tool", "")
+            if _tool_name == "news":
+                search_result = (search_result or "") + "\n\n[SHIMMI_INTERNAL:NO_MEMORY_EXTRACT]"
             if trace:
                 trace.tag(
                     **{f"live_search_{iteration}": {
