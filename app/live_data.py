@@ -1,5 +1,5 @@
 """
-live_data.py — Shimmi v3.15.4
+live_data.py — Shimmi v3.15.6
 
 Changes vs v3.0.1:
   ARCH-1  All data fetching now routes through mcp_client → mcp_server (port 7000)
@@ -672,6 +672,7 @@ async def _rewrite_news_query(raw_query: str) -> str:
             label="news_query_rewrite",
             role="extract",
             timeout=5.0,
+            json_mode=False,   # returns plain text search term, not JSON
         )
         rewritten = result.strip().strip('"\'`').strip()
         if rewritten and len(rewritten) < 80 and rewritten.lower() != raw_query.lower():
@@ -684,86 +685,245 @@ async def _rewrite_news_query(raw_query: str) -> str:
 
 
 
+async def _generate_story_insight(title: str, source: str) -> dict:
+    """
+    Use Gemini to generate editorial insight for the 'One Story' section.
+    Returns dict with why, now, next, who, takeaway.
+    Falls back to empty strings if Gemini is unavailable/quota-limited.
+    """
+    try:
+        from .agent_engine import _groq_raw
+        prompt = (
+            f"News headline: \"{title}\" (Source: {source})\n\n"
+            "Write a concise WhatsApp-friendly editorial insight with EXACTLY these 4 fields:\n"
+            "WHY: One sentence — why this story matters right now (not what happened).\n"
+            "NOW: One sentence — the immediate context or trigger.\n"
+            "NEXT: One sentence — what to watch for / what happens next.\n"
+            "TAKEAWAY: One short sentence — the net implication for a professional reader.\n\n"
+            "Rules: Each answer is ONE sentence max. No bullet points. No markdown. "
+            "Be direct and intelligent — assume an above-average reader. "
+            "Output only the 4 labelled lines, nothing else."
+        )
+        raw = await _groq_raw(
+            [
+                {
+                    "role": "system",
+                    "content": "You are a senior news analyst writing a morning briefing for busy professionals.",
+                },
+                {"role": "user", "content": prompt},
+            ],
+            max_tokens=200,
+            chat_id="briefing_insight",
+            label="story_insight",
+            role="orchestrate",   # use Gemini (primary orchestrator) for quality
+            json_mode=False,
+            timeout=12.0,
+        )
+        # Parse the 4 labelled lines
+        result = {"why": "", "now": "", "next": "", "takeaway": ""}
+        for line in (raw or "").splitlines():
+            line = line.strip()
+            for key in ("WHY", "NOW", "NEXT", "TAKEAWAY"):
+                if line.upper().startswith(key + ":"):
+                    result[key.lower()] = line[len(key)+1:].strip()
+                    break
+        if any(result.values()):
+            logger.info("📰 story_insight.done  title=%r", title[:60])
+            return result
+    except Exception as exc:
+        logger.debug("story_insight.skip  err=%s", str(exc)[:80])
+    return {"why": "", "now": "", "next": "", "takeaway": ""}
+
+
 async def get_news_briefing(city: str = "Hyderabad") -> Optional[str]:
     """
-    Fetch and format a structured multi-category news briefing.
-    5 sections: Global, India, Tech, India Sports, Local.
+    World-class WhatsApp morning briefing — jobs-based structure.
 
-    Each article shows:
-      • Headline  (source)
-        Brief lede / description from the journalist (1-2 sentences)
-
-    Quality guarantees (applied in MCP):
-      - Fetches 6 per category, filters to top 3 by source tier
-      - Fluff/celebrity/gossip articles removed
-      - Only articles published in last 12 hours
-      - Higher-tier sources (Reuters, BBC, ET) ranked first
+    8 sections, each with a distinct purpose:
+      🧭 Executive Snapshot   — what's the context/mood today (10-sec read)
+      🔄 What Changed Overnight — new facts from last 8 hours
+      🎯 One Story to Understand — deep editorial on the day's key story
+      🇮🇳 India Lens           — global stories filtered for India relevance
+      💹 Markets Quick         — Nifty/Sensex/Rupee signals
+      🤖 Tech & AI Radar       — what's shifting in tech
+      ⏰ What to Watch Today   — forward-looking, actionable
+      📍 Local                 — city-specific headlines
     """
-    from .mcp_client import mcp_news_briefing
+    from .mcp_client import mcp_news_briefing, mcp_stocks, mcp_weather
 
     data = await mcp_news_briefing(city=city)
-    if not data or not data.get("sections"):
+    if not data:
         return None
 
-    sections = data["sections"]
-    total = sum(len(s.get("articles", [])) for s in sections)
-    if total < 3:
+    snapshot    = data.get("snapshot", [])
+    changed     = data.get("changed", [])
+    story_raw   = data.get("story")
+    india_lens  = data.get("india_lens", [])
+    tech_radar  = data.get("tech_radar", [])
+    watch_today = data.get("watch_today", [])
+    local       = data.get("local", [])
+    sports      = data.get("sports", [])
+
+    total = sum(len(x) for x in [snapshot, changed, india_lens, tech_radar]
+                if isinstance(x, list))
+    if total < 4:
         logger.info("📰 news_briefing.thin  total=%d  falling back", total)
         return None
 
-    today = datetime.now(UTC).strftime("%a %d %b")
-    lines = [f"📰 *News Briefing — {today}*", ""]
+    # ── Parallel: fetch story insight + markets + weather ──────────────────
+    story_insight = {}
+    markets_text  = ""
+    weather_text  = ""
 
-    # Cross-section deduplication — same story shouldn't appear in two sections
-    seen_titles: set = set()
+    async def _get_insight():
+        nonlocal story_insight
+        if story_raw and story_raw.get("title"):
+            story_insight = await _generate_story_insight(
+                story_raw["title"], story_raw.get("source", "")
+            )
 
-    def _title_key(title: str) -> str:
-        """Normalise title for dedup: lowercase, strip punctuation, first 6 words."""
-        import re as _re
-        words = _re.sub(r"[^a-z0-9\s]", "", title.lower()).split()
-        return " ".join(words[:4])  # 4-word key deduplicates same topic across sections
+    async def _get_markets():
+        nonlocal markets_text
+        try:
+            mdata = await mcp_stocks(symbols="^NSEI,^BSESN,USDINR=X")
+            if mdata and mdata.get("stocks"):
+                parts = []
+                labels = {"^NSEI": "Nifty", "^BSESN": "Sensex", "USDINR=X": "₹/USD"}
+                for s in mdata["stocks"]:
+                    sym   = s.get("symbol", "")
+                    price = s.get("price")
+                    chg   = s.get("change_pct")
+                    if price and sym in labels:
+                        arrow = "▲" if (chg or 0) >= 0 else "▼"
+                        parts.append(
+                            f"{labels[sym]} {arrow}{abs(chg or 0):.1f}%"
+                        )
+                markets_text = "  •  ".join(parts)
+        except Exception as exc:
+            logger.debug("briefing.markets_skip  err=%s", exc)
 
-    for sec in sections:
-        articles = sec.get("articles", [])
-        if not articles:
-            continue
+    async def _get_weather():
+        nonlocal weather_text
+        try:
+            wdata = await mcp_weather(city=city, country="IN", days=1)
+            if wdata and wdata.get("current"):
+                cur  = wdata["current"]
+                temp = cur.get("temp_c")
+                desc = cur.get("condition", "")
+                if temp is not None:
+                    weather_text = f"{temp:.0f}°C, {desc}" if desc else f"{temp:.0f}°C"
+        except Exception as exc:
+            logger.debug("briefing.weather_skip  err=%s", exc)
 
-        emoji    = sec.get("emoji", "📰")
-        category = sec.get("category", "News")
+    await asyncio.gather(_get_insight(), _get_markets(), _get_weather())
 
-        # Deduplicate within this section against previously seen titles
-        unique = []
-        for a in articles:
-            tk = _title_key(a.get("title", ""))
-            if tk and tk not in seen_titles:
-                seen_titles.add(tk)
-                unique.append(a)
+    # ── Format ─────────────────────────────────────────────────────────────
+    now_ist = datetime.now(UTC)
+    # Determine greeting by IST hour (UTC+5:30)
+    ist_hour = (now_ist.hour + 5) % 24 + (1 if now_ist.minute >= 30 else 0)
+    if ist_hour < 12:
+        greeting = "Good morning ☀️"
+    elif ist_hour < 17:
+        greeting = "Good afternoon 🌤️"
+    else:
+        greeting = "Good evening 🌆"
 
-        if not unique:
-            continue
+    date_str = now_ist.strftime("%a, %d %b")
+    lines = [
+        f"*{greeting} Here's your briefing for {date_str}*",
+        "",
+    ]
 
-        lines.append(f"{emoji} *{category}*")
-        for a in unique:
-            title  = (a.get("title") or "").strip()
-            brief  = (a.get("brief") or "").strip()
-            source = (a.get("source") or "").strip()
-            if not title:
-                continue
-            src_tag = f"  _({source})_" if source else ""
-            lines.append(f"• *{title[:100]}*{src_tag}")
-            if brief:
-                lines.append(f"  _{brief[:130]}_")
-        lines.append("")   # blank line between sections
+    # ── 🧭 Executive Snapshot ──────────────────────────────────────────────
+    if snapshot:
+        lines.append("🧭 *Executive Snapshot*")
+        for a in snapshot:
+            src = f"  _({a['source']})_" if a.get("source") else ""
+            lines.append(f"• {a['title'][:100]}{src}")
+        lines.append("")
 
-    # Trim trailing blank lines
+    # ── 🔄 What Changed Overnight ─────────────────────────────────────────
+    if changed:
+        lines.append("🔄 *What Changed Overnight*")
+        for a in changed:
+            src = f"  _({a['source']})_" if a.get("source") else ""
+            lines.append(f"• {a['title'][:100]}{src}")
+        lines.append("")
+
+    # ── 🎯 One Story to Understand Today ──────────────────────────────────
+    if story_raw and story_raw.get("title"):
+        lines.append("🎯 *One Story to Understand Today*")
+        src = f"  _({story_raw['source']})_" if story_raw.get("source") else ""
+        lines.append(f"*{story_raw['title'][:110]}*{src}")
+        if story_insight.get("why"):
+            lines.append(f"*Why it matters:* {story_insight['why']}")
+        if story_insight.get("now"):
+            lines.append(f"*Right now:* {story_insight['now']}")
+        if story_insight.get("next"):
+            lines.append(f"*What's next:* {story_insight['next']}")
+        if story_insight.get("takeaway"):
+            lines.append(f"👉 {story_insight['takeaway']}")
+        lines.append("")
+
+    # ── 🇮🇳 India Lens ─────────────────────────────────────────────────────
+    if india_lens:
+        lines.append("🇮🇳 *India Lens*")
+        for a in india_lens:
+            src = f"  _({a['source']})_" if a.get("source") else ""
+            lines.append(f"• {a['title'][:100]}{src}")
+        lines.append("")
+
+    # ── 💹 Markets Quick ───────────────────────────────────────────────────
+    lines.append("💹 *Markets Quick*")
+    if markets_text:
+        lines.append(f"• {markets_text}")
+    else:
+        lines.append("• Markets data unavailable")
+    if weather_text:
+        lines.append(f"• {city}: {weather_text}")
+    lines.append("")
+
+    # ── 🤖 Tech & AI Radar ─────────────────────────────────────────────────
+    if tech_radar:
+        lines.append("🤖 *Tech & AI Radar*")
+        for a in tech_radar:
+            src = f"  _({a['source']})_" if a.get("source") else ""
+            lines.append(f"• {a['title'][:100]}{src}")
+        lines.append("")
+
+    # ── ⏰ What to Watch Today ─────────────────────────────────────────────
+    if watch_today:
+        lines.append("⏰ *What to Watch Today*")
+        for a in watch_today:
+            src = f"  _({a['source']})_" if a.get("source") else ""
+            lines.append(f"• {a['title'][:100]}{src}")
+        lines.append("")
+
+    # ── 🏏 Sports ──────────────────────────────────────────────────────────
+    if sports:
+        lines.append("🏏 *Sports*")
+        for a in sports:
+            src = f"  _({a['source']})_" if a.get("source") else ""
+            lines.append(f"• {a['title'][:100]}{src}")
+        lines.append("")
+
+    # ── 📍 Local ───────────────────────────────────────────────────────────
+    if local:
+        lines.append(f"📍 *{city}*")
+        for a in local:
+            src = f"  _({a['source']})_" if a.get("source") else ""
+            lines.append(f"• {a['title'][:100]}{src}")
+        lines.append("")
+
+    # Trim trailing blank
     while lines and lines[-1] == "":
         lines.pop()
 
-    if len(lines) <= 2:  # only header
-        return None
+    result = "\n".join(lines)
+    logger.info("📰 live_data.news_briefing.done  sections=8  city=%r  chars=%d",
+                city, len(result))
+    return result
 
-    logger.info("📰 live_data.news_briefing  sections=%d  articles=%d", len(sections), total)
-    return "\n".join(lines)
 
 
 async def get_news(query: str = "India top news", country: str = "IN") -> Optional[str]:

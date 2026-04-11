@@ -1,5 +1,5 @@
 """
-main.py — Shimmi v3.15.4
+main.py — Shimmi v3.15.6
 
 Changes vs v3.8.0:
   FIX-TYPING  Reverted to exact original single-keepalive pattern (process_message only).
@@ -478,11 +478,26 @@ async def process_message(
                     facts=", ".join(f"{k}={v!r}" for k, v in list(facts.items())[:15]) or "∅",
                 )
                 if facts:
+                    # Compact INFO line: count + handful of most useful keys
+                    _KEY_PRIORITY = ("name","city","country","portfolio_holdings",
+                                     "portfolio_stocks","allergies","occupation")
+                    _preview_parts = []
+                    for _k in _KEY_PRIORITY:
+                        if _k in facts:
+                            _v = str(facts[_k])[:40]
+                            _preview_parts.append(f"{_k}={_v!r}")
                     logger.info(
                         "📋 facts.loaded  sender=%s  count=%d  %s",
                         sender_key, len(facts),
-                        "  ".join(f"{k}={v!r}" for k, v in facts.items()),
+                        "  ".join(_preview_parts) or "(no key facts)",
                     )
+                    # Full dump at DEBUG only — avoids 3000-char INFO lines
+                    if logger.isEnabledFor(logging.DEBUG):
+                        logger.debug(
+                            "facts.full  sender=%s  %s",
+                            sender_key,
+                            "  ".join(f"{k}={v!r}" for k, v in facts.items()),
+                        )
                     # LLM-driven dedup: fire-and-forget — merges semantic
                     # duplicates (favourite_colour / favorite_color etc.)
                     # without a hand-written alias map.

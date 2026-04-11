@@ -1,16 +1,17 @@
 """
-trace.py — Structured per-message trace with rich step logging.
+trace.py — Structured per-message trace.
 
-Every message creates a Trace.  Each processing phase appends a TraceStep.
-At the end we emit:
-  1. A structured JSON log line  (machine-readable, grep/jq friendly)
-  2. A human-readable waterfall  (instantly scannable in journalctl / tail)
+Every message creates a Trace. Each processing phase calls trace.step().
+At the end we emit two log lines to app.trace:
 
-The waterfall makes it easy to see at a glance:
-  - Which phases ran and in what order
-  - How long each took
-  - What data flowed through (facts, memory, context counts, reply preview)
-  - Whether anything failed
+  1. TRACE_JSON {...}  — full structured JSON, one line, machine-readable
+     grep + jq friendly: grep TRACE_JSON shimmi-bot.log | tail -1 | jq .
+
+  2. TRACE OK/ERROR ... — one-line summary for tail -f monitoring
+
+The old box waterfall (╔══ MSG TRACE ══╗) was removed — it was identical
+to the JSON output but took 800+ characters and made logs unreadable in
+tail mode.
 """
 from __future__ import annotations
 
@@ -84,14 +85,18 @@ class Trace:
     # ─────────────────────────────────────────────────────────────────────
     def _finalise(self) -> None:
         total_ms = round((time.perf_counter() - self._started) * 1000, 1)
+        failed   = any(s.error for s in self._steps) or "fatal_error" in self._global_tags
 
-        # ── 1. structured JSON ────────────────────────────────────────────
+        # Single structured JSON line — machine-readable, grep/jq friendly.
+        # The box waterfall was removed: it duplicated this data verbosely.
+        # To read: grep TRACE_JSON shimmi-bot.log | tail -1 | jq .
         record = {
             "trace": {
                 "event_id":  self.event_id,
                 "chat_id":   self.chat_id,
                 "sender_id": self.sender_id,
                 "total_ms":  total_ms,
+                "ok":        not failed,
                 **self._global_tags,
             },
             "steps": [
@@ -106,41 +111,23 @@ class Trace:
         }
         logger.info("TRACE_JSON %s", json.dumps(record, ensure_ascii=False, default=str))
 
-        # ── 2. human-readable waterfall ───────────────────────────────────
-        failed = any(s.error for s in self._steps) or "fatal_error" in self._global_tags
-        outcome_icon = "✗ ERROR" if failed else "✓ OK"
-
-        lines = [
-            "",
-            f"╔══ MSG TRACE ══════════════════════════════════════════════",
-            f"║  event    {self.event_id}",
-            f"║  chat     {self.chat_id}",
-            f"║  sender   {self.sender_id}",
-            f"║  outcome  {outcome_icon}  ({total_ms} ms total)",
-            f"╠══ STEPS ══════════════════════════════════════════════════",
-        ]
-
-        for s in self._steps:
-            icon = "✗" if s.error else "✓"
-            tag_parts = []
-            for k, v in s.tags.items():
-                v_str = str(v)
-                # Truncate long values in the waterfall only
-                if len(v_str) > 120:
-                    v_str = v_str[:117] + "…"
-                tag_parts.append(f"{k}={v_str}")
-            tag_str = "  ".join(tag_parts)
-            err_str = f"\n║    ↳ ERROR: {s.error}" if s.error else ""
-            lines.append(
-                f"║  {icon} {s.name:<26} {s.duration_ms:>8.1f}ms"
-                + (f"   {tag_str}" if tag_str else "")
-                + err_str
-            )
-
-        if self._global_tags:
-            lines.append(f"╠══ GLOBALS ═════════════════════════════════════════════")
-            for k, v in self._global_tags.items():
-                lines.append(f"║  {k}={v}")
-
-        lines.append(f"╚═══════════════════════════════════════════════════════════")
-        logger.info("\n".join(lines))
+        # One-line summary — visible in tail -f without scrolling
+        outcome = "ERROR" if failed else "OK"
+        total_steps = len(self._steps)
+        error_steps = [s.name for s in self._steps if s.error]
+        summary_extras = ""
+        if error_steps:
+            summary_extras = f"  errors=[{','.join(error_steps)}]"
+        # Pull key globals for the summary line
+        for key in ("reply_preview", "agent_iterations", "memory_updates", "total_ms"):
+            pass  # already in record above
+        logger.info(
+            "TRACE  %s  %s  %.0fms  iter=%s  mem=%s  reply=%s chars%s",
+            outcome,
+            self.event_id[:16],
+            total_ms,
+            self._global_tags.get("agent_iterations", "?"),
+            self._global_tags.get("memory_updates", "?"),
+            self._global_tags.get("reply_len", "?"),
+            summary_extras,
+        )

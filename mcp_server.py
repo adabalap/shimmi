@@ -118,7 +118,7 @@ async def _startup():
             "yf.session  curl_cffi not installed — Yahoo Finance may rate-limit. "
             "Fix: pip install curl-cffi  (yfinance uses it automatically)"
         )
-    logger.info("🚀 MCP server v3.15.4 ready on :7000")
+    logger.info("🚀 MCP server v3.15.6 ready on :7000")
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -407,26 +407,24 @@ async def get_stocks(
 # /news/briefing — structured multi-category news briefing
 # ─────────────────────────────────────────────────────────────────────────────
 
-# Google News RSS topic URLs — unlimited, no API key, editorially curated.
-# These are the ACTUAL top stories Google surfaces, not keyword search results.
-# Format: (label, emoji, rss_url)
-_BRIEFING_RSS = [
-    ("Global",       "🌍",
-     "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-IN&gl=IN&ceid=IN:en"),
-    ("India",        "🇮🇳",
-     "https://news.google.com/rss/headlines/section/topic/NATION?hl=en-IN&gl=IN&ceid=IN:en"),
-    ("Tech",         "💻",
-     "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-IN&gl=IN&ceid=IN:en"),
-    ("India Sports", "🏏",
-     "https://news.google.com/rss/headlines/section/topic/SPORTS?hl=en-IN&gl=IN&ceid=IN:en"),
-]
-# Local is city-specific — uses RSS search query
-_BRIEFING_LOCAL_RSS = "https://news.google.com/rss/search?q={city}+news&hl=en-IN&gl=IN&ceid=IN:en"
+# ─────────────────────────────────────────────────────────────────────────────
+# RSS feeds for /news/briefing — Google News, unlimited, editorially ranked
+# ─────────────────────────────────────────────────────────────────────────────
+
+_RSS_WORLD    = "https://news.google.com/rss/headlines/section/topic/WORLD?hl=en-IN&gl=IN&ceid=IN:en"
+_RSS_NATION   = "https://news.google.com/rss/headlines/section/topic/NATION?hl=en-IN&gl=IN&ceid=IN:en"
+_RSS_TECH     = "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?hl=en-IN&gl=IN&ceid=IN:en"
+_RSS_SPORTS   = "https://news.google.com/rss/headlines/section/topic/SPORTS?hl=en-IN&gl=IN&ceid=IN:en"
+_RSS_BUSINESS = "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-IN&gl=IN&ceid=IN:en"
+_RSS_LOCAL    = "https://news.google.com/rss/search?q={city}+news&hl=en-IN&gl=IN&ceid=IN:en"
+
+_TTL_BRIEFING = 1800  # 30 min cache
 
 
-def _parse_rss(xml_text: str) -> list[dict]:
-    """Parse Google News RSS XML → list of {title, source, pub_iso} dicts."""
+def _parse_rss(xml_text: str) -> list:
+    """Parse Google News RSS XML → list of {title, source, pub_iso, pub_ts} dicts."""
     import xml.etree.ElementTree as ET
+    from email.utils import parsedate_to_datetime
     try:
         root = ET.fromstring(xml_text)
     except ET.ParseError:
@@ -435,94 +433,220 @@ def _parse_rss(xml_text: str) -> list[dict]:
     for item in root.findall(".//item"):
         raw_title = (item.findtext("title") or "").strip()
         pub_date  = (item.findtext("pubDate") or "").strip()
-
-        # Google News title format: "Headline - Source Name"
-        # Split on the LAST " - " to separate headline from source
         if " - " in raw_title:
-            *headline_parts, source = raw_title.rsplit(" - ", 1)
-            title = " - ".join(headline_parts).strip()
+            *parts, source = raw_title.rsplit(" - ", 1)
+            title = " - ".join(parts).strip()
         else:
-            title  = raw_title
-            source = ""
-
-        # Parse pub date to ISO for freshness check
-        pub_iso = ""
+            title = raw_title; source = ""
+        pub_iso = ""; pub_ts = 0.0
         if pub_date:
             try:
-                from email.utils import parsedate_to_datetime
-                pub_iso = parsedate_to_datetime(pub_date).isoformat()
+                dt = parsedate_to_datetime(pub_date)
+                pub_iso = dt.isoformat()
+                pub_ts  = dt.timestamp()
             except Exception:
                 pass
-
         if title and len(title) > 15:
-            items.append({"title": title, "source": source, "pub_iso": pub_iso})
+            items.append({"title": title, "source": source,
+                          "pub_iso": pub_iso, "pub_ts": pub_ts})
     return items
 
 
-async def _fetch_rss_category(label: str, emoji: str, rss_url: str) -> dict:
-    """
-    Fetch one RSS category from Google News.
-    Applies quality filters: fluff removal, freshness, source tier sorting.
-    Returns top 3 articles as {title, source, brief=""}.
-    """
+async def _fetch_rss(url: str) -> list:
+    """Fetch one RSS feed → list of articles. Returns [] on failure."""
     try:
         resp = await _HTTP.get(
-            rss_url,
+            url,
             timeout=httpx.Timeout(connect=5.0, read=8.0, write=3.0, pool=2.0),
             headers={"User-Agent": "Mozilla/5.0 (compatible; Shimmi/1.0)"},
             follow_redirects=True,
         )
-        items = _parse_rss(resp.text)
-
-        # Filter: quality + freshness
-        filtered = [
-            a for a in items
-            if _is_quality_article(a["title"], "", a["source"], a["pub_iso"])
-        ]
-
-        # Sort by source tier
-        filtered.sort(key=lambda x: (_source_tier(x["source"]),
-                                     items.index(x) if x in items else 99))
-
-        # Take top 3, strip internal fields
-        articles = [{"title": a["title"][:120], "brief": "", "source": a["source"]}
-                    for a in filtered[:3]]
-
-        logger.info("briefing.rss  label=%r  fetched=%d  kept=%d",
-                    label, len(items), len(articles))
-        return {"category": label, "emoji": emoji, "articles": articles}
-
+        return _parse_rss(resp.text)
     except Exception as exc:
-        logger.warning("briefing.rss_fail  label=%r  err=%s", label, str(exc)[:80])
-        return {"category": label, "emoji": emoji, "articles": []}
+        logger.warning("briefing.rss_fail  url=%r  err=%s", url[:60], str(exc)[:80])
+        return []
 
 
-    # Build RSS URL list — 4 fixed topic categories + 1 local RSS search
-    rss_tasks = [(label, emoji, url) for label, emoji, url in _BRIEFING_RSS]
+def _filter_quality(articles: list, max_age_hours: float = 12.0) -> list:
+    """Apply quality + freshness filter. Returns passing articles in original order."""
+    now_ts = datetime.now(UTC).timestamp()
+    out = []
+    for a in articles:
+        if not _is_quality_article(a["title"], "", a["source"], a["pub_iso"]):
+            continue
+        if a["pub_ts"] and (now_ts - a["pub_ts"]) > max_age_hours * 3600:
+            continue
+        out.append(a)
+    return out
 
-    # Local category uses city-specific search RSS
-    local_url = _BRIEFING_LOCAL_RSS.format(city=city.replace(" ", "+"))
-    rss_tasks.append(("Local", "📍", local_url))
 
-    # Run all 5 in parallel — Google News RSS, unlimited, no API key needed
-    sections = await asyncio.gather(*[
-        _fetch_rss_category(label, emoji, url)
-        for label, emoji, url in rss_tasks
-    ])
+def _sort_by_tier(articles: list) -> list:
+    """Sort articles: tier-1 sources first, then by original feed position."""
+    indexed = [(i, a) for i, a in enumerate(articles)]
+    indexed.sort(key=lambda x: (_source_tier(x[1]["source"]), x[0]))
+    return [a for _, a in indexed]
+
+
+def _dedup(articles: list, seen: set) -> list:
+    """Remove articles whose 4-word title key is already in seen. Updates seen."""
+    out = []
+    for a in articles:
+        words = re.sub(r"[^a-z0-9\s]", "", a["title"].lower()).split()
+        key   = " ".join(words[:4])
+        if key and key not in seen:
+            seen.add(key)
+            out.append(a)
+    return out
+
+
+def _forward_looking(articles: list) -> list:
+    """Filter articles that mention upcoming events — for 'What to Watch' section."""
+    signals = re.compile(
+        r"\b(today|tonight|this week|tomorrow|later|upcoming|scheduled|expected|"
+        r"will release|set to|due to|to be|watch|ahead of|before|awaited|"
+        r"earnings|results|verdict|hearing|vote|summit|deadline)\b",
+        re.IGNORECASE,
+    )
+    return [a for a in articles if signals.search(a["title"])]
+
+
+@app.get("/news/briefing")
+async def get_news_briefing(
+    city: str = Query("Hyderabad", description="User city for local section"),
+):
+    """
+    World-class WhatsApp morning briefing — jobs-based, not category-based.
+
+    Returns a structured dict with 8 sections, each with a distinct purpose:
+      snapshot      — 3 bullets: what's the mood/context today
+      changed       — 3 bullets: specific events that moved overnight (< 8h)
+      story         — the ONE story to understand today (title + why/now/next/who)
+      india_lens    — how global stories affect India specifically
+      markets       — Nifty/Sensex signals + currency (pulled from /stocks)
+      tech_radar    — tech/AI trends (framed as shifts, not events)
+      watch_today   — forward-looking: what to track today
+      local         — city-specific news
+
+    All sections are optional — missing data → section omitted gracefully.
+    """
+    ck = _cache_key("smart_briefing", city.lower())
+    cached = _cache_get(ck)
+    if cached:
+        logger.debug("briefing.cache_hit  city=%r", city)
+        return cached
+
+    # ── Fetch all feeds in parallel ────────────────────────────────────────
+    local_url = _RSS_LOCAL.format(city=city.replace(" ", "+"))
+    world_raw, nation_raw, tech_raw, sports_raw, business_raw, local_raw = \
+        await asyncio.gather(
+            _fetch_rss(_RSS_WORLD),
+            _fetch_rss(_RSS_NATION),
+            _fetch_rss(_RSS_TECH),
+            _fetch_rss(_RSS_SPORTS),
+            _fetch_rss(_RSS_BUSINESS),
+            _fetch_rss(local_url),
+        )
+
+    # ── Quality filter each feed ────────────────────────────────────────────
+    world    = _sort_by_tier(_filter_quality(world_raw,    max_age_hours=12))
+    nation   = _sort_by_tier(_filter_quality(nation_raw,   max_age_hours=12))
+    tech     = _sort_by_tier(_filter_quality(tech_raw,     max_age_hours=24))  # tech moves slower
+    sports   = _sort_by_tier(_filter_quality(sports_raw,   max_age_hours=8))
+    business = _sort_by_tier(_filter_quality(business_raw, max_age_hours=12))
+    local    = _sort_by_tier(_filter_quality(local_raw,    max_age_hours=12))
+
+    # Global dedup set — no story appears in two sections
+    seen: set = set()
+
+    # ── Section: Executive Snapshot ────────────────────────────────────────
+    # Top 3 most significant stories from world + nation combined
+    # Gives the user "the mood today" in 10 seconds
+    snapshot_pool = _dedup(world[:6] + nation[:4], seen)
+    snapshot = [{"title": a["title"], "source": a["source"]}
+                for a in snapshot_pool[:3]]
+
+    # ── Section: What Changed Overnight ────────────────────────────────────
+    # Stories published in last 8 hours — things that are actually NEW
+    now_ts = datetime.now(UTC).timestamp()
+    overnight_pool = [a for a in (world_raw + nation_raw + business_raw)
+                      if a.get("pub_ts") and (now_ts - a["pub_ts"]) < 8 * 3600]
+    overnight_pool = _sort_by_tier(_filter_quality(overnight_pool, max_age_hours=8))
+    changed = [{"title": a["title"], "source": a["source"]}
+               for a in _dedup(overnight_pool, seen)[:3]]
+
+    # ── Section: One Story to Understand Today ─────────────────────────────
+    # The single most significant story — with why/now/next context
+    # Pick best candidate: prefer tier-1 source, high recency, not already used
+    story_pool = _dedup(world[:5] + nation[:3] + business[:3], seen)
+    story_article = story_pool[0] if story_pool else None
+    story = None
+    if story_article:
+        seen_key = " ".join(
+            re.sub(r"[^a-z0-9\s]", "", story_article["title"].lower()).split()[:4]
+        )
+        seen.add(seen_key)
+        story = {
+            "title":  story_article["title"],
+            "source": story_article["source"],
+            # why/now/next/who will be generated by Gemini in live_data.py
+            # MCP just returns the raw article — insight generation happens in bot
+        }
+
+    # ── Section: India Lens ─────────────────────────────────────────────────
+    # How the day's stories connect to India — nation news + India-relevant globals
+    india_global = [a for a in world if any(kw in a["title"].lower()
+                    for kw in ("india", "rupee", "rbi", "modi", "delhi", "mumbai",
+                               "it sector", "outsourc", "gcc", "infosys", "wipro",
+                               "tata", "reliance", "nifty", "sensex", "nse", "bse"))]
+    india_pool = _dedup(nation[:5] + india_global[:3], seen)
+    india_lens = [{"title": a["title"], "source": a["source"]}
+                  for a in india_pool[:3]]
+
+    # ── Section: Tech & AI Radar ───────────────────────────────────────────
+    # Tech news framed as trends — what's shifting, not just what happened
+    tech_pool = _dedup(tech[:5], seen)
+    tech_radar = [{"title": a["title"], "source": a["source"]}
+                  for a in tech_pool[:3]]
+
+    # ── Section: What to Watch Today ───────────────────────────────────────
+    # Forward-looking items across all feeds
+    all_articles = world_raw + nation_raw + business_raw + tech_raw
+    watch_pool   = _forward_looking(_sort_by_tier(_filter_quality(all_articles, 24)))
+    watch_today  = [{"title": a["title"], "source": a["source"]}
+                    for a in _dedup(watch_pool, seen)[:3]]
+
+    # ── Section: Local ─────────────────────────────────────────────────────
+    local_pool = _dedup(local[:4], seen)
+    local_items = [{"title": a["title"], "source": a["source"]}
+                   for a in local_pool[:2]]
+
+    # ── Section: Sports (India only) ───────────────────────────────────────
+    sports_pool = _dedup(sports[:4], seen)
+    sports_items = [{"title": a["title"], "source": a["source"]}
+                    for a in sports_pool[:2]]
 
     result = {
-        "sections":     list(sections),
+        "snapshot":    snapshot,
+        "changed":     changed,
+        "story":       story,        # raw article — insight generated in live_data.py
+        "india_lens":  india_lens,
+        "tech_radar":  tech_radar,
+        "watch_today": watch_today,
+        "local":       local_items,
+        "sports":      sports_items,
+        "city":        city,
         "generated_at": datetime.now(UTC).isoformat(),
-        "city":         city,
     }
 
-    # Only cache if we got meaningful content
-    total_articles = sum(len(s["articles"]) for s in sections)
-    if total_articles >= 5:
+    total = sum(len(v) for v in [snapshot, changed, india_lens, tech_radar,
+                                  watch_today, local_items, sports_items]
+                if isinstance(v, list))
+    if total >= 5:
         _cache_set(ck, result, _TTL_BRIEFING)
-        logger.info("briefing.done  city=%r  total_articles=%d", city, total_articles)
+        logger.info("briefing.done  city=%r  sections=%d  total_items=%d",
+                    city, 7, total)
     else:
-        logger.warning("briefing.thin  city=%r  total_articles=%d  (not cached)", city, total_articles)
+        logger.warning("briefing.thin  city=%r  total=%d", city, total)
 
     return result
 
