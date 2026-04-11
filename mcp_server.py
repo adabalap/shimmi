@@ -118,7 +118,7 @@ async def _startup():
             "yf.session  curl_cffi not installed — Yahoo Finance may rate-limit. "
             "Fix: pip install curl-cffi  (yfinance uses it automatically)"
         )
-    logger.info("🚀 MCP server v3.15.1 ready on :7000")
+    logger.info("🚀 MCP server v3.15.3 ready on :7000")
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -401,6 +401,222 @@ async def get_stocks(
     }
     _cache_set(ck, payload, _TTL_STOCKS)
     return payload
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /news/briefing — structured multi-category news briefing
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Category definitions — (label, emoji, query, country)
+# Queries are tuned for relevance: specific enough to avoid fluff,
+# broad enough to catch the day's major stories.
+_BRIEFING_CATEGORIES = [
+    ("Global",        "🌍", "world major news geopolitics economy",  "us"),
+    ("India",         "🇮🇳", "India government economy major news",   "in"),
+    ("Tech",          "💻", "technology artificial intelligence science", "us"),
+    ("India Sports",  "🏏", "India cricket IPL football sports",     "in"),
+    ("Local",         "📍", "Hyderabad local news today",            "in"),
+]
+
+_TTL_BRIEFING = 1800   # 30 min — briefing is more stable than individual queries
+
+# Source quality tiers — higher = preferred when filtering
+# Tier 1: major international/national wire services and newspapers
+# Tier 2: good regional/specialist outlets
+# Unranked sources get tier 3 (lowest priority)
+_SOURCE_TIER: dict = {
+    # Tier 1 — highest quality, always prefer
+    "reuters":           1, "associated press":   1, "ap":                1,
+    "bbc":               1, "bbc news":            1, "the guardian":       1,
+    "financial times":   1, "the hindu":           1, "hindustan times":    1,
+    "times of india":    1, "economic times":      1, "ndtv":              1,
+    "mint":              1, "business standard":   1, "the wire":           1,
+    "scroll.in":         1, "the print":           1,
+    # Tier 2 — reliable specialist / regional
+    "techcrunch":        2, "the verge":           2, "wired":             2,
+    "ars technica":      2, "mit technology review": 2,
+    "cricinfo":          2, "espn cricinfo":       2, "bcci":              2,
+    "deccan chronicle":  2, "the news minute":     2, "hans india":        2,
+    "bloomberg":         2, "cnbc":                2, "ft":                2,
+    # Everything else defaults to tier 3
+}
+
+def _source_tier(source: str) -> int:
+    """Return quality tier for a news source name (lower = better)."""
+    return _SOURCE_TIER.get(source.lower().strip(), 3)
+
+
+_FLUFF_PATTERNS = re.compile(
+    r"\b(horoscope|zodiac|listicle|ranking|best.*buy|top \d+ ways|"
+    r"you won.?t believe|shocking|viral|celebrity|bollywood gossip|"
+    r"box office|bigg boss|salman|shahrukh|deepika|kareena|"
+    r"\bads?\b|sponsored|promoted|advertisement)\b",
+    re.IGNORECASE,
+)
+
+def _is_quality_article(title: str, description: str, source: str, pub_iso: str) -> bool:
+    """
+    Returns True if article passes quality filters:
+      1. Not a fluff/entertainment piece
+      2. Title is substantive (>25 chars, not a question-bait)
+      3. Published within the last 12 hours (freshness)
+    """
+    if not title or len(title) < 20:
+        return False
+    # Fluff filter
+    combined = f"{title} {description}"
+    if _FLUFF_PATTERNS.search(combined):
+        return False
+    # Freshness — if we have a publish time, reject anything >12h old
+    if pub_iso:
+        try:
+            from datetime import timezone as _tz
+            pub_dt = datetime.fromisoformat(pub_iso.replace("Z", "+00:00"))
+            age_hours = (datetime.now(_tz.utc) - pub_dt).total_seconds() / 3600
+            if age_hours > 12:
+                return False
+        except Exception:
+            pass  # can't parse date → don't filter
+    return True
+
+
+@app.get("/news/briefing")
+async def get_news_briefing(
+    city: str = Query("Hyderabad", description="User's city for local news"),
+):
+    """
+    Structured multi-category news briefing.
+    Runs 5 parallel GNews queries (Global, India, Tech, India Sports, Local).
+    Returns a structured dict with sections, each containing 2-3 clean headlines.
+    No article URLs in output — headlines only with source attribution.
+
+    GET /news/briefing?city=Hyderabad
+
+    Returns:
+    {
+      "sections": [
+        {"category": "Global", "emoji": "🌍",
+         "articles": [{"title": "...", "source": "..."}, ...]},
+        ...
+      ],
+      "generated_at": "2026-04-11T07:00:00"
+    }
+    """
+    # Customise local category query with user's city
+    categories = list(_BRIEFING_CATEGORIES)
+    if city and city.lower() not in ("hyderabad", ""):
+        categories[-1] = ("Local", "📍", f"{city} local news today", "in")
+
+    ck = _cache_key("briefing", city.lower())
+    cached = _cache_get(ck)
+    if cached:
+        logger.debug("briefing.cache_hit  city=%r", city)
+        return cached
+
+    async def _fetch_category(label: str, emoji: str, query: str, country: str) -> dict:
+        """
+        Fetch up to 6 articles for one category, filter to best 3.
+
+        Quality pipeline:
+          1. Fetch max=6 from GNews (more candidates to choose from)
+          2. Strip source suffix from titles
+          3. Apply fluff filter (gossip, listicles, celebrity)
+          4. Apply freshness filter (< 12 hours old)
+          5. Sort by source tier (Reuters/BBC/ET before unknowns)
+          6. Return top 3 with title + source + trimmed description (lede)
+        """
+        try:
+            if not GNEWS_KEY:
+                return {"category": label, "emoji": emoji, "articles": []}
+            resp = await _HTTP.get(
+                "https://gnews.io/api/v4/search",
+                params={
+                    "q":       query,
+                    "lang":    "en",
+                    "country": country,
+                    "max":     6,          # fetch 6 to have room to filter
+                    "apikey":  GNEWS_KEY,
+                },
+                timeout=httpx.Timeout(connect=5.0, read=8.0, write=3.0, pool=2.0),
+            )
+            data = resp.json()
+            candidates = []
+            for a in data.get("articles", []):
+                raw_title   = (a.get("title") or "").strip()
+                description = (a.get("description") or "").strip()
+                source      = (a.get("source") or {}).get("name", "") or ""
+                pub_iso     = a.get("publishedAt", "")
+
+                # Strip "- SourceName" suffix from title (common in GNews)
+                title = re.sub(r"\s*[-|]\s*[A-Za-z0-9 &\.]{2,40}$", "", raw_title).strip()
+                if not title:
+                    title = raw_title
+
+                # Quality gate
+                if not _is_quality_article(title, description, source, pub_iso):
+                    continue
+
+                # Trim description to 120 chars at sentence boundary
+                brief = ""
+                if description:
+                    desc = description[:150]
+                    # Cut at sentence end if possible
+                    for end in (".", "!", "?"):
+                        idx = desc.rfind(end)
+                        if 40 < idx < 140:
+                            desc = desc[:idx + 1]
+                            break
+                    brief = desc.strip()
+                    if len(description) > len(brief) + 5:
+                        brief = brief.rstrip(".") + "…" if not brief.endswith((".", "!", "?")) else brief
+
+                candidates.append({
+                    "title":       title[:120],
+                    "brief":       brief,
+                    "source":      source,
+                    "source_tier": _source_tier(source),
+                    "pub_iso":     pub_iso,
+                })
+
+            # Sort: tier 1 sources first, then by position (GNews relevance order)
+            candidates.sort(key=lambda x: (x["source_tier"],
+                                           candidates.index(x)))
+
+            # Take top 3, remove internal ranking fields
+            articles = [
+                {"title": c["title"], "brief": c["brief"], "source": c["source"]}
+                for c in candidates[:3]
+            ]
+
+            logger.info("briefing.category  label=%r  fetched=%d  kept=%d",
+                        label, len(data.get("articles", [])), len(articles))
+            return {"category": label, "emoji": emoji, "articles": articles}
+
+        except Exception as exc:
+            logger.warning("briefing.category_fail  label=%r  err=%s", label, str(exc)[:80])
+            return {"category": label, "emoji": emoji, "articles": []}
+
+    # Run all 5 categories in parallel — total time = slowest single query (~1-2s)
+    sections = await asyncio.gather(*[
+        _fetch_category(label, emoji, query, country)
+        for label, emoji, query, country in categories
+    ])
+
+    result = {
+        "sections":     list(sections),
+        "generated_at": datetime.now(UTC).isoformat(),
+        "city":         city,
+    }
+
+    # Only cache if we got meaningful content
+    total_articles = sum(len(s["articles"]) for s in sections)
+    if total_articles >= 5:
+        _cache_set(ck, result, _TTL_BRIEFING)
+        logger.info("briefing.done  city=%r  total_articles=%d", city, total_articles)
+    else:
+        logger.warning("briefing.thin  city=%r  total_articles=%d  (not cached)", city, total_articles)
+
+    return result
 
 
 # ─────────────────────────────────────────────────────────────────────────────

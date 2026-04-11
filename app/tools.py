@@ -233,15 +233,45 @@ class ToolDispatcher:
         return result or ""
 
     async def _news(self, tc: NewsTool, facts: Dict[str, str]) -> str:
-        from .live_data import get_news, _normalize_news_query
+        from .live_data import get_news, get_news_briefing, _normalize_news_query
 
         country = tc.country or facts.get("country") or "IN"
-        # Normalize meta-phrase queries (e.g. "morning news round up" → "India news today")
-        # BEFORE sending to live_data so the normalization fires even when the query
-        # arrives via tool_call JSON rather than through the live_data.get_news path.
-        effective_query = _normalize_news_query(tc.query or "India top news")
-        if effective_query != tc.query:
-            logger.info("tools.news.query_normalised  %r → %r", tc.query, effective_query)
+        query   = tc.query or "India top news"
+
+        # ── Briefing trigger: user wants structured multi-section news ────────
+        # Detect briefing intent: "top news", "news briefing", "news update",
+        # "global + india", "news today" with no specific topic keyword.
+        _BRIEFING_SIGNALS = re.compile(
+            r"\b(briefing|top news|news today|morning news|news update|"
+            r"global.*india|india.*global|all.*news|full.*news|"
+            r"what.*news|latest.*news|give.*news)\b",
+            re.IGNORECASE,
+        )
+        _SPECIFIC_TOPIC = re.compile(
+            r"\b(cricket|ipl|sports|tech|technology|business|market|stock|"
+            r"politics|election|weather|local|hyderabad|mumbai)\b",
+            re.IGNORECASE,
+        )
+        is_briefing = (
+            _BRIEFING_SIGNALS.search(query)
+            and not _SPECIFIC_TOPIC.search(query)
+        )
+
+        if is_briefing:
+            city = facts.get("city", "Hyderabad")
+            # Don't use polluted city values from SMS flood
+            if "SOCIETY" in city.upper() or "SCHOOL" in city.upper() or len(city) > 30:
+                city = "Hyderabad"
+            logger.info("tools.news  briefing_mode  city=%r", city)
+            result = await get_news_briefing(city=city)
+            if result:
+                return result
+            # Briefing failed → fall through to single query
+
+        # ── Single topic query ────────────────────────────────────────────────
+        effective_query = _normalize_news_query(query)
+        if effective_query != query:
+            logger.info("tools.news.query_normalised  %r → %r", query, effective_query)
         logger.info("tools.news  query=%r  country=%r", effective_query, country)
         result = await get_news(effective_query, country[:2].upper())
         return result or ""

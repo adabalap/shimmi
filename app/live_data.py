@@ -1,5 +1,5 @@
 """
-live_data.py — Shimmi v3.15.1
+live_data.py — Shimmi v3.15.3
 
 Changes vs v3.0.1:
   ARCH-1  All data fetching now routes through mcp_client → mcp_server (port 7000)
@@ -681,6 +681,89 @@ async def _rewrite_news_query(raw_query: str) -> str:
         logger.debug("news.rewrite_skip  err=%s", e)
 
     return raw_query
+
+
+
+async def get_news_briefing(city: str = "Hyderabad") -> Optional[str]:
+    """
+    Fetch and format a structured multi-category news briefing.
+    5 sections: Global, India, Tech, India Sports, Local.
+
+    Each article shows:
+      • Headline  (source)
+        Brief lede / description from the journalist (1-2 sentences)
+
+    Quality guarantees (applied in MCP):
+      - Fetches 6 per category, filters to top 3 by source tier
+      - Fluff/celebrity/gossip articles removed
+      - Only articles published in last 12 hours
+      - Higher-tier sources (Reuters, BBC, ET) ranked first
+    """
+    from .mcp_client import mcp_news_briefing
+
+    data = await mcp_news_briefing(city=city)
+    if not data or not data.get("sections"):
+        return None
+
+    sections = data["sections"]
+    total = sum(len(s.get("articles", [])) for s in sections)
+    if total < 3:
+        logger.info("📰 news_briefing.thin  total=%d  falling back", total)
+        return None
+
+    today = datetime.now(UTC).strftime("%a %d %b")
+    lines = [f"📰 *News Briefing — {today}*", ""]
+
+    # Cross-section deduplication — same story shouldn't appear in two sections
+    seen_titles: set = set()
+
+    def _title_key(title: str) -> str:
+        """Normalise title for dedup: lowercase, strip punctuation, first 6 words."""
+        import re as _re
+        words = _re.sub(r"[^a-z0-9\s]", "", title.lower()).split()
+        return " ".join(words[:4])  # 4-word key deduplicates same topic across sections
+
+    for sec in sections:
+        articles = sec.get("articles", [])
+        if not articles:
+            continue
+
+        emoji    = sec.get("emoji", "📰")
+        category = sec.get("category", "News")
+
+        # Deduplicate within this section against previously seen titles
+        unique = []
+        for a in articles:
+            tk = _title_key(a.get("title", ""))
+            if tk and tk not in seen_titles:
+                seen_titles.add(tk)
+                unique.append(a)
+
+        if not unique:
+            continue
+
+        lines.append(f"{emoji} *{category}*")
+        for a in unique:
+            title  = (a.get("title") or "").strip()
+            brief  = (a.get("brief") or "").strip()
+            source = (a.get("source") or "").strip()
+            if not title:
+                continue
+            src_tag = f"  _({source})_" if source else ""
+            lines.append(f"• *{title[:100]}*{src_tag}")
+            if brief:
+                lines.append(f"  _{brief[:130]}_")
+        lines.append("")   # blank line between sections
+
+    # Trim trailing blank lines
+    while lines and lines[-1] == "":
+        lines.pop()
+
+    if len(lines) <= 2:  # only header
+        return None
+
+    logger.info("📰 live_data.news_briefing  sections=%d  articles=%d", len(sections), total)
+    return "\n".join(lines)
 
 
 async def get_news(query: str = "India top news", country: str = "IN") -> Optional[str]:

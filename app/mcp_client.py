@@ -1,5 +1,5 @@
 """
-mcp_client.py — Shimmi v3.4.0
+mcp_client.py — Shimmi v3.15.3
 
 Changes vs v3.2.0:
   FIX-STOCKS  Per-endpoint timeouts: stocks=20s, news=10s, weather=10s (was 8s flat).
@@ -73,6 +73,16 @@ async def _get(path: str, timeout: Optional[float] = None, **params) -> Optional
 async def mcp_news(query: str = "top headlines", country: str = "in") -> Optional[dict]:
     """Fetch news headlines. Returns dict with 'articles' list or None."""
     return await _get("/news", timeout=_TIMEOUT_NEWS, q=query, country=country)
+
+
+async def mcp_news_briefing(city: str = "Hyderabad") -> Optional[dict]:
+    """
+    Fetch structured multi-category news briefing (5 sections in parallel).
+    Returns dict with 'sections' list, each section having category/emoji/articles.
+    Uses /news/briefing endpoint — 30-min TTL cache on MCP side.
+    """
+    timeout = float(os.getenv("MCP_TIMEOUT_BRIEFING", "12"))
+    return await _get("/news/briefing", timeout=timeout, city=city)
 
 
 async def mcp_stocks(symbols: str = "^NSEI,^BSESN,RELIANCE.NS,TCS.NS,INFY.NS") -> Optional[dict]:
