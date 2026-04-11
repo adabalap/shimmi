@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.15.9
+agent_engine.py — Shimmi v3.16.0
 
 Changes vs v3.3.0:
 
@@ -354,8 +354,9 @@ def _fix_reminder_tz(trigger_iso: str) -> str:
 # Multi-provider LLM clients + circuit breakers + token budget
 # ─────────────────────────────────────────────────────────────────────────────
 
-GROQ_CLIENT: Optional[AsyncGroq] = None
-GEMINI_CLIENT: Optional[AsyncOpenAI] = None   # OpenAI-compat wrapper for Gemini
+GROQ_CLIENT:    Optional[AsyncGroq]    = None
+GEMINI_CLIENT:  Optional[AsyncOpenAI]  = None   # OpenAI-compat wrapper for Gemini
+MISTRAL_CLIENT: Optional[AsyncOpenAI]  = None   # OpenAI-compat wrapper for Mistral
 
 # Per-model circuit breakers: model → monotonic timestamp when circuit reopens
 MODEL_CIRCUIT: Dict[str, float] = {}
@@ -466,76 +467,139 @@ def _is_gemini_model(model: str) -> bool:
     return model.startswith("gemini")
 
 
+def _provider_timeout(provider: str) -> float:
+    """Return the configured timeout for a provider."""
+    if provider == "gemini":
+        return settings.gemini_timeout
+    if provider == "mistral":
+        return settings.mistral_timeout
+    return settings.groq_timeout
+
+
+def _is_mistral_model(model: str) -> bool:
+    return "mistral" in model.lower() or "ministral" in model.lower()
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Provider registry — plug-and-play LLM backend system
+# ─────────────────────────────────────────────────────────────────────────────
+#
+# To add a new provider:
+#   1. Add its API key + model settings to config.py
+#   2. Add a client global above (e.g. NEWPROVIDER_CLIENT)
+#   3. Add a row to _PROVIDER_REGISTRY below
+#   4. Add it to the candidate lists in _pick_provider_and_model
+#   5. Handle it in _call_llm's dispatch block
+#   6. Initialise the client in init_llm()
+#   That's it. No other files need changing.
+#
+# Registry schema per provider:
+#   "provider_key": {
+#       "name":         human-readable label for logs
+#       "enabled_fn":   callable → bool (checks API key configured)
+#       "budget_key":   key in _TOKEN_BUDGET (or None)
+#       "daily_limit":  token limit for budget tracking (or 0)
+#   }
+_PROVIDER_REGISTRY: Dict[str, Dict] = {
+    "gemini": {
+        "name":        "Gemini",
+        "enabled_fn":  lambda: settings.gemini_enabled,
+        "budget_key":  None,   # Gemini RPD is request-based, not token-based
+        "daily_limit": 0,
+    },
+    "mistral": {
+        "name":        "Mistral",
+        "enabled_fn":  lambda: settings.mistral_enabled,
+        "budget_key":  None,   # 1B tokens/month — effectively unlimited
+        "daily_limit": 0,
+    },
+    "groq_70b": {
+        "name":        "Groq-70B",
+        "enabled_fn":  lambda: bool(settings.groq_api_key),
+        "budget_key":  "groq_70b",
+        "daily_limit": 100_000,
+    },
+    "groq_8b": {
+        "name":        "Groq-8B",
+        "enabled_fn":  lambda: bool(settings.groq_api_key),
+        "budget_key":  None,
+        "daily_limit": 0,
+    },
+}
+
+
 def _pick_provider_and_model(chat_id: str, role: str) -> Tuple[str, str]:
     """
     Route to the best available provider+model for the given role.
+    Uses the provider registry — adding a new provider requires no changes here.
 
-    Priority chain for orchestration:
-      1. Gemini 2.0 Flash       (primary — 1.5M tokens/day free)
-      2. Groq llama-3.3-70b     (fallback — 100K/day free)
-      3. Groq llama-3.1-8b      (last resort for orchestration)
+    Orchestration priority (highest quality first, most quota last):
+      1. Gemini 2.0 Flash       (primary — best prompt compliance)
+      2. Mistral Large          (fallback — 1B tokens/month, comparable quality)
+      3. Groq 70B               (second fallback — 100K tokens/day)
+      4. Groq 8B                (last resort — fast but weaker reasoning)
 
-    Priority chain for extraction/format/verify:
-      1. Groq llama-3.1-8b      (primary — 500K/day free, very fast)
-      2. Gemini 2.0 Flash Lite  (fallback)
-      3. Groq llama-3.3-70b     (last resort)
+    Extraction priority (speed + reliability for JSON extraction):
+      1. Groq 8B                (primary — fastest, ~0.6s)
+      2. Mistral Small          (fallback — generous quota)
+      3. Gemini Flash Lite      (second fallback)
+      4. Groq 70B               (last resort)
     """
     is_orchestrate = (role == "orchestrate")
 
     if is_orchestrate:
         candidates = [
             ("gemini",   settings.gemini_orchestrator_model),
+            ("mistral",  settings.mistral_orchestrator_model),
             ("groq_70b", settings.orchestrator_model),
             ("groq_8b",  settings.extraction_model),
         ]
     else:
         candidates = [
             ("groq_8b",  settings.extraction_model),
+            ("mistral",  settings.mistral_extraction_model),
             ("gemini",   settings.gemini_extraction_model),
             ("groq_70b", settings.orchestrator_model),
         ]
 
-    gemini_skipped = False
     for provider, model in candidates:
-        # Skip Gemini if no key configured
-        if provider == "gemini" and not settings.gemini_enabled:
+        reg = _PROVIDER_REGISTRY.get(provider, {})
+
+        # Skip if provider not configured
+        if not reg.get("enabled_fn", lambda: False)():
             continue
-        # Check model-level circuit
+        # Skip if model circuit tripped
         if not _model_open(model):
-            if provider == "gemini":
-                gemini_skipped = True
             continue
-        # Check provider-level circuit
+        # Skip if provider circuit tripped
         if not _provider_open(provider):
-            if provider == "gemini" and not gemini_skipped:
-                gemini_skipped = True
-                reopen_in = max(0, PROVIDER_CIRCUIT.get("gemini", 0) - time.monotonic())
-                logger.debug(
-                    "⏭️  gemini.rate_limited  routing=groq  reopen_in=%.0fs",
-                    reopen_in,
-                )
+            reopen_in = max(0, PROVIDER_CIRCUIT.get(provider, 0) - time.monotonic())
+            logger.debug("⏭️  %s.rate_limited  reopen_in=%.0fs", provider, reopen_in)
             continue
-        # Check token budget (only Groq 70B has a meaningful hard limit)
-        if provider == "groq_70b":
-            frac = _budget_fraction("groq_70b", settings.groq_70b_daily_limit)
+        # Skip if token budget exhausted
+        budget_key = reg.get("budget_key")
+        if budget_key:
+            frac = _budget_fraction(budget_key, reg["daily_limit"])
             if frac >= settings.token_budget_block_pct:
-                logger.warning(
-                    "💰 budget.block  provider=groq_70b  usage=%.1f%%  skipping",
-                    frac * 100,
-                )
+                logger.warning("💰 budget.block  provider=%s  usage=%.1f%%  skipping",
+                               provider, frac * 100)
                 continue
 
         logger.debug("🎯 provider.selected  role=%s  provider=%s  model=%s",
                      role, provider, model)
         return provider, model
 
-    # All options exhausted — return first candidate, will likely fail with 429
-    fallback = candidates[0]
+    # All options exhausted — return first enabled candidate, will likely 429
+    first_enabled = next(
+        ((p, m) for p, m in candidates
+         if _PROVIDER_REGISTRY.get(p, {}).get("enabled_fn", lambda: False)()),
+        candidates[0],
+    )
     logger.error(
         "🚨 provider.all_exhausted  role=%s  returning_anyway  provider=%s  model=%s",
-        role, fallback[0], fallback[1],
+        role, first_enabled[0], first_enabled[1],
     )
-    return fallback
+    return first_enabled
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -573,6 +637,23 @@ async def _call_llm(
                 raise RuntimeError("Gemini client not initialised")
             resp = await asyncio.wait_for(
                 GEMINI_CLIENT.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=max_tokens,
+                    temperature=0.3,
+                    response_format=fmt,
+                ),
+                timeout=timeout,
+            )
+        elif provider == "mistral":
+            if MISTRAL_CLIENT is None:
+                raise RuntimeError("Mistral client not initialised")
+            # Mistral uses OpenAI-compat API — same interface as Gemini client.
+            # Note: Mistral json_object mode requires "json" in the prompt,
+            # same constraint as Groq. The orchestrator prompt already contains
+            # "json" so this is safe.
+            resp = await asyncio.wait_for(
+                MISTRAL_CLIENT.chat.completions.create(
                     model=model,
                     messages=messages,
                     max_tokens=max_tokens,
@@ -664,9 +745,7 @@ async def _groq_raw(
     where the prompt contains no "json" mention — Groq 400s otherwise.
     """
     provider, model = _pick_provider_and_model(chat_id, role)
-    effective_timeout = timeout or (
-        settings.gemini_timeout if provider == "gemini" else settings.groq_timeout
-    )
+    effective_timeout = timeout or _provider_timeout(provider)
     try:
         return await _call_llm(
             messages,
@@ -684,12 +763,15 @@ async def _groq_raw(
             raise
 
         # Get fallback
+        # Use full registry-ordered candidate list for fallback
         fallback_candidates = (
-            [("gemini",   settings.gemini_orchestrator_model),
+            [("gemini",  settings.gemini_orchestrator_model),
+             ("mistral", settings.mistral_orchestrator_model),
              ("groq_70b", settings.orchestrator_model),
              ("groq_8b",  settings.extraction_model)]
             if role == "orchestrate"
             else [("groq_8b",  settings.extraction_model),
+                  ("mistral",  settings.mistral_extraction_model),
                   ("gemini",   settings.gemini_extraction_model),
                   ("groq_70b", settings.orchestrator_model)]
         )
@@ -697,7 +779,8 @@ async def _groq_raw(
         for fb_provider, fb_model in fallback_candidates:
             if fb_provider == provider and fb_model == model:
                 continue  # skip the one that just failed
-            if fb_provider == "gemini" and not settings.gemini_enabled:
+            reg = _PROVIDER_REGISTRY.get(fb_provider, {})
+            if not reg.get("enabled_fn", lambda: False)():
                 continue
             if not _model_open(fb_model):
                 continue
@@ -705,10 +788,7 @@ async def _groq_raw(
                 continue
             logger.info("🔄 provider.fallback  role=%s  from=%s/%s  to=%s/%s",
                         role, provider, model, fb_provider, fb_model)
-            fb_timeout = timeout or (
-                settings.gemini_timeout if fb_provider == "gemini"
-                else settings.groq_timeout
-            )
+            fb_timeout = timeout or _provider_timeout(fb_provider)
             try:
                 return await _call_llm(
                     messages,
@@ -2511,39 +2591,52 @@ async def extract_reply_memory(
 
 async def init_llm() -> None:
     """
-    Initialise Groq and (optionally) Gemini clients.
+    Initialise all configured LLM provider clients.
     Called once at application startup.
+    
+    Providers are optional except Groq (required as last-resort fallback).
+    Add new providers here following the registry pattern in _PROVIDER_REGISTRY.
     """
-    global GROQ_CLIENT, GEMINI_CLIENT
+    global GROQ_CLIENT, GEMINI_CLIENT, MISTRAL_CLIENT
 
     if not settings.groq_api_key:
-        raise RuntimeError("GROQ_API_KEY is not set")
+        raise RuntimeError("GROQ_API_KEY is not set — required as fallback")
 
+    # ── Groq (always initialised — last-resort fallback) ──────────────────
     GROQ_CLIENT = AsyncGroq(api_key=settings.groq_api_key)
 
+    # ── Gemini (primary orchestrator if key set) ───────────────────────────
     if settings.gemini_enabled:
         GEMINI_CLIENT = AsyncOpenAI(
             api_key=settings.gemini_api_key,
             base_url="https://generativelanguage.googleapis.com/v1beta/openai/",
         )
-        logger.info(
-            "🧠 llm.init — Groq + Gemini ready  "
-            "groq_pool=%s  gemini_pool=%s  "
-            "orchestrator=Gemini(%s) → Groq(%s)  extraction=Groq(%s)",
-            settings.groq_model_pool,
-            settings.gemini_model_pool,
-            settings.gemini_orchestrator_model,
-            settings.orchestrator_model,
-            settings.extraction_model,
+
+    # ── Mistral (fallback orchestrator if key set) ─────────────────────────
+    if settings.mistral_enabled:
+        MISTRAL_CLIENT = AsyncOpenAI(
+            api_key=settings.mistral_api_key,
+            base_url="https://api.mistral.ai/v1/",
         )
-    else:
-        logger.info(
-            "🧠 llm.init — Groq only (no GEMINI_API_KEY)  "
-            "model_pool=%s  orchestrator=%s  extraction=%s",
-            settings.groq_model_pool,
-            settings.orchestrator_model,
-            settings.extraction_model,
-        )
+
+    # ── Build provider chain for startup log ──────────────────────────────
+    orch_chain = []
+    if settings.gemini_enabled:
+        orch_chain.append(f"Gemini({settings.gemini_orchestrator_model})")
+    if settings.mistral_enabled:
+        orch_chain.append(f"Mistral({settings.mistral_orchestrator_model})")
+    orch_chain.append(f"Groq70B({settings.orchestrator_model})")
+    orch_chain.append(f"Groq8B({settings.extraction_model})")
+
+    logger.info(
+        "🧠 llm.init  orchestrator_chain=%s  extraction=%s  "
+        "gemini=%s  mistral=%s  groq=%s",
+        " → ".join(orch_chain),
+        settings.extraction_model,
+        "✅" if settings.gemini_enabled  else "❌ (no key)",
+        "✅" if settings.mistral_enabled else "❌ (no key)",
+        "✅",
+    )
 
 
 
@@ -2747,15 +2840,16 @@ VALID_GEMINI_PREFIXES = ("gemini-",)
 
 
 async def close_llm() -> None:
-    global GROQ_CLIENT, GEMINI_CLIENT
-    for client in (GROQ_CLIENT, GEMINI_CLIENT):
+    global GROQ_CLIENT, GEMINI_CLIENT, MISTRAL_CLIENT
+    for client in (GROQ_CLIENT, GEMINI_CLIENT, MISTRAL_CLIENT):
         if client:
             try:
                 await client.close()
             except Exception:
                 pass
-    GROQ_CLIENT   = None
-    GEMINI_CLIENT = None
+    GROQ_CLIENT    = None
+    GEMINI_CLIENT  = None
+    MISTRAL_CLIENT = None
 
 
 def _is_reminder_duplicate(

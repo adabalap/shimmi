@@ -1,5 +1,5 @@
 """
-config.py — Shimmi v3.0.3
+config.py — Shimmi v3.16.0
 
 Changes vs v3.0.2:
   - Added GEMINI_API_KEY + Gemini model routing (primary orchestrator)
@@ -81,6 +81,15 @@ class Settings:
     gemini_extraction_model: str      = os.getenv("GEMINI_EXTRACTION_MODEL",   "gemini-2.0-flash-lite")
     gemini_timeout: float             = _float(os.getenv("GEMINI_TIMEOUT", "30"), 30.0)
 
+    # ── Mistral AI (fallback orchestrator) ────────────────────────────────
+    # Free tier: 1 req/sec, 1B tokens/month — effectively unlimited for a personal bot.
+    # Get your key at https://console.mistral.ai/
+    # Models: mistral-large-latest, mistral-small-latest, ministral-8b-latest
+    mistral_api_key: str              = os.getenv("MISTRAL_API_KEY", "")
+    mistral_orchestrator_model: str   = os.getenv("MISTRAL_ORCHESTRATOR_MODEL", "mistral-large-latest")
+    mistral_extraction_model: str     = os.getenv("MISTRAL_EXTRACTION_MODEL",   "mistral-small-latest")
+    mistral_timeout: float            = _float(os.getenv("MISTRAL_TIMEOUT", "30"), 30.0)
+
     # ── Token budget awareness ─────────────────────────────────────────────
     token_budget_warn_pct: float  = _float(os.getenv("TOKEN_BUDGET_WARN_PCT",  "0.75"), 0.75)
     token_budget_block_pct: float = _float(os.getenv("TOKEN_BUDGET_BLOCK_PCT", "0.92"), 0.92)
@@ -141,6 +150,10 @@ class Settings:
     @property
     def gemini_enabled(self) -> bool:
         return bool(self.gemini_api_key)
+
+    @property
+    def mistral_enabled(self) -> bool:
+        return bool(self.mistral_api_key)
 
     @property
     def sqlite_path(self) -> Path:
