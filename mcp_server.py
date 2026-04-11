@@ -118,7 +118,7 @@ async def _startup():
             "yf.session  curl_cffi not installed — Yahoo Finance may rate-limit. "
             "Fix: pip install curl-cffi  (yfinance uses it automatically)"
         )
-    logger.info("🚀 MCP server v3.15.6 ready on :7000")
+    logger.info("🚀 MCP server v3.15.7 ready on :7000")
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -465,6 +465,54 @@ async def _fetch_rss(url: str) -> list:
     except Exception as exc:
         logger.warning("briefing.rss_fail  url=%r  err=%s", url[:60], str(exc)[:80])
         return []
+
+
+# ── Quality-filter helpers (used by /news/briefing) ─────────────────────────
+
+# Source quality tiers — lower number = higher quality
+_SOURCE_TIER: dict = {
+    "reuters": 1, "associated press": 1, "ap": 1,
+    "bbc": 1, "bbc news": 1, "the guardian": 1,
+    "financial times": 1, "the hindu": 1, "hindustan times": 1,
+    "times of india": 1, "economic times": 1, "ndtv": 1,
+    "mint": 1, "business standard": 1, "the wire": 1,
+    "scroll.in": 1, "the print": 1,
+    "techcrunch": 2, "the verge": 2, "wired": 2,
+    "ars technica": 2, "mit technology review": 2,
+    "cricinfo": 2, "espn cricinfo": 2, "bcci": 2,
+    "deccan chronicle": 2, "the news minute": 2, "hans india": 2,
+    "bloomberg": 2, "cnbc": 2,
+}
+
+def _source_tier(source: str) -> int:
+    return _SOURCE_TIER.get((source or "").lower().strip(), 3)
+
+
+_FLUFF_PATTERNS = re.compile(
+    r"\b(horoscope|zodiac|listicle|top \d+ ways|you won.?t believe|"
+    r"shocking|viral|bollywood gossip|box office|bigg boss|"
+    r"salman|shahrukh|deepika|kareena|sponsored|promoted|"
+    r"mumbai buzz|city that never|advertisement)\b",
+    re.IGNORECASE,
+)
+
+
+def _is_quality_article(title: str, description: str, source: str, pub_iso: str) -> bool:
+    """Returns True if article passes quality + freshness filters."""
+    if not title or len(title) < 20:
+        return False
+    if _FLUFF_PATTERNS.search(f"{title} {description}"):
+        return False
+    if pub_iso:
+        try:
+            from datetime import timezone as _tz
+            pub_dt   = datetime.fromisoformat(pub_iso.replace("Z", "+00:00"))
+            age_hours = (datetime.now(_tz.utc) - pub_dt).total_seconds() / 3600
+            if age_hours > 24:        # outer guard — endpoint passes tighter limit
+                return False
+        except Exception:
+            pass
+    return True
 
 
 def _filter_quality(articles: list, max_age_hours: float = 12.0) -> list:

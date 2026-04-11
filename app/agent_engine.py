@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.15.6
+agent_engine.py — Shimmi v3.15.7
 
 Changes vs v3.3.0:
 
