@@ -118,7 +118,7 @@ async def _startup():
             "yf.session  curl_cffi not installed — Yahoo Finance may rate-limit. "
             "Fix: pip install curl-cffi  (yfinance uses it automatically)"
         )
-    logger.info("🚀 MCP server v3.15.8 ready on :7000")
+    logger.info("🚀 MCP server v3.15.9 ready on :7000")
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -492,7 +492,42 @@ _FLUFF_PATTERNS = re.compile(
     r"\b(horoscope|zodiac|listicle|top \d+ ways|you won.?t believe|"
     r"shocking|viral|bollywood gossip|box office|bigg boss|"
     r"salman|shahrukh|deepika|kareena|sponsored|promoted|"
-    r"mumbai buzz|city that never|advertisement)\b",
+    r"mumbai buzz|city that never|advertisement|"
+    # Stock tips & financial service journalism — not news events
+    r"stocks? to buy|stocks? to sell|recommends? (three|two|five|top)|"
+    r"rate today|live price|check.*price|per gram|fd rates?|"
+    r"fixed deposit.*rate|interest rate.*offer|small finance bank|"
+    # Phone hardware gossip — not AI/tech trends
+    r"leak shows|design confirmed|colors? confirmed|memory options? confirmed|"
+    r"global debut.*design|gsmarena|slimmer design|slim.*flip)\b",
+    re.IGNORECASE,
+)
+
+# Anti-patterns specifically for the One Story section — stricter than general fluff
+_ONE_STORY_ANTI = re.compile(
+    r"\b(recommends?|stocks? to buy|rate today|live price|check price|"
+    r"per gram|fd rates?|fixed deposit|interest rates?|best.*bank|"
+    r"top \d+ (banks?|stocks?|ways?|small)|small finance bank|"
+    r"leak|design confirmed|gsmarena|newsbytes|price today|"
+    r"how to|tips? (to|for)|guide to|explained|all you need)\b",
+    re.IGNORECASE,
+)
+
+# Anti-patterns for "What Changed Overnight" — only events, not price checks
+_OVERNIGHT_ANTI = re.compile(
+    r"\b(rate today|live price|check.*price|per gram|fd rate|"
+    r"fixed deposit|interest rate.*offer|what is.*rate|"
+    r"latest.*rates?|top \d+ (banks?|rates?))\b",
+    re.IGNORECASE,
+)
+
+# Anti-patterns for Tech & AI Radar — exclude consumer hardware gossip
+_TECH_ANTI = re.compile(
+    r"\b(galaxy|iphone|pixel.*leak|flip.*design|find x\d|"
+    r"leak shows|design confirmed|colors? confirmed|global debut.*design|"
+    r"gsmarena|slimmer|thinner|ultra.*launch|pro.*launch|"
+    r"loyalist|at 50|brand.?s (evolution|journey|story)|"
+    r"spec(s| sheet)|price (cut|drop|hike)|unboxing)\b",
     re.IGNORECASE,
 )
 
@@ -548,11 +583,25 @@ def _dedup(articles: list, seen: set) -> list:
 
 
 def _forward_looking(articles: list) -> list:
-    """Filter articles that mention upcoming events — for 'What to Watch' section."""
+    """
+    Filter articles that mention genuinely upcoming/scheduled events.
+    Strict — requires explicit future-tense or scheduling signals.
+    Avoids false positives from words like 'before', 'demands', 'largest'.
+    """
     signals = re.compile(
-        r"\b(today|tonight|this week|tomorrow|later|upcoming|scheduled|expected|"
-        r"will release|set to|due to|to be|watch|ahead of|before|awaited|"
-        r"earnings|results|verdict|hearing|vote|summit|deadline)\b",
+        r"\b("
+        r"tonight|today at|today:|scheduled (for|to)|expected to|"
+        r"will (release|open|begin|start|announce|decide|vote|report|hold)|"
+        r"set to (release|open|begin|announce|report)|"
+        r"due (today|tonight|this week|tomorrow)|results? due|"
+        r"earnings (today|tonight|after|before market)|"
+        r"ahead of (the )?(results?|vote|hearing|summit|meeting|election)|"
+        r"to (watch|track) (today|this week)|"
+        r"verdict (expected|due|today)|"
+        r"hearing (scheduled|set|today|tomorrow)|"
+        r"election (today|results? today)|"
+        r"deadline (today|tonight|this week)"
+        r")\b",
         re.IGNORECASE,
     )
     return [a for a in articles if signals.search(a["title"])]
@@ -619,14 +668,22 @@ async def get_news_briefing(
     overnight_pool = [a for a in (world_raw + nation_raw + business_raw)
                       if a.get("pub_ts") and (now_ts - a["pub_ts"]) < 8 * 3600]
     overnight_pool = _sort_by_tier(_filter_quality(overnight_pool, max_age_hours=8))
-    changed = [{"title": a["title"], "source": a["source"]}
-               for a in _dedup(overnight_pool, seen)[:3]]
+    changed = [
+        {"title": a["title"], "source": a["source"]}
+        for a in _dedup(overnight_pool, seen)
+        if not _OVERNIGHT_ANTI.search(a["title"])      # no rate checks, price updates
+    ][:3]
 
     # ── Section: One Story to Understand Today ─────────────────────────────
     # The single most significant story — with why/now/next context
     # Pick best candidate: prefer tier-1 source, high recency, not already used
-    story_pool = _dedup(world[:5] + nation[:3] + business[:3], seen)
-    story_article = story_pool[0] if story_pool else None
+    # One Story: require tier-1 or tier-2 source, never a stock tip or price check
+    story_candidates = [
+        a for a in _dedup(world[:6] + nation[:4] + business[:3], seen)
+        if _source_tier(a["source"]) <= 2              # only trusted sources
+        and not _ONE_STORY_ANTI.search(a["title"])     # no tips/prices/phone gossip
+    ]
+    story_article = story_candidates[0] if story_candidates else None
     story = None
     if story_article:
         seen_key = " ".join(
@@ -652,7 +709,10 @@ async def get_news_briefing(
 
     # ── Section: Tech & AI Radar ───────────────────────────────────────────
     # Tech news framed as trends — what's shifting, not just what happened
-    tech_pool = _dedup(tech[:5], seen)
+    tech_pool = [
+        a for a in _dedup(tech[:8], seen)
+        if not _TECH_ANTI.search(a["title"])           # no phone leaks/hardware gossip
+    ]
     tech_radar = [{"title": a["title"], "source": a["source"]}
                   for a in tech_pool[:3]]
 
