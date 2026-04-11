@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.15.7
+agent_engine.py — Shimmi v3.15.8
 
 Changes vs v3.3.0:
 
@@ -2201,6 +2201,28 @@ async def run_agent(
             # Suppress pre-extracted memory updates — news content is not user data
             pre_updates = []
             logger.info("🔇 memory.suppressed  reason=news_result  iter=%d", iteration)
+
+        # ── Briefing early-exit ───────────────────────────────────────────
+        # The news briefing is a complete, self-contained reply. Passing it
+        # through a second LLM call causes truncation (Groq 8B returns only
+        # the first line from a 2,800-char input) and wastes 30+ seconds.
+        # Evidence: reply_len=56 with briefing chars=2811 (v3.15.7 logs).
+        # Fix: detect the sentinel, strip it, return the briefing directly.
+        from .tools import _BRIEFING_SENTINEL
+        if search_result and search_result.startswith(_BRIEFING_SENTINEL):
+            briefing_text = search_result[len(_BRIEFING_SENTINEL):]
+            logger.info(
+                "📰 briefing.early_exit  iter=%d  chars=%d  skipping_llm",
+                iteration, len(briefing_text),
+            )
+            if trace:
+                trace.tag(briefing_chars=len(briefing_text), early_exit="briefing")
+            return AgentResult(
+                reply=ReplyPayload(type="text", text=briefing_text),
+                memory_updates=[],
+                reminders=[],
+                iterations=iteration,
+            )
 
         if search_result:
             messages = _build_orchestrator_messages(

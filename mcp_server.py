@@ -118,7 +118,7 @@ async def _startup():
             "yf.session  curl_cffi not installed — Yahoo Finance may rate-limit. "
             "Fix: pip install curl-cffi  (yfinance uses it automatically)"
         )
-    logger.info("🚀 MCP server v3.15.7 ready on :7000")
+    logger.info("🚀 MCP server v3.15.8 ready on :7000")
 
 @app.on_event("shutdown")
 async def _shutdown():

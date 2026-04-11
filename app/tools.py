@@ -265,7 +265,10 @@ class ToolDispatcher:
             logger.info("tools.news  briefing_mode  city=%r", city)
             result = await get_news_briefing(city=city)
             if result:
-                return result
+                # Tag as briefing so agent_engine returns it directly without
+                # a second LLM pass. The briefing is the final answer — no
+                # summarisation needed. Strips the tag before sending to user.
+                return _BRIEFING_SENTINEL + result
             # Briefing failed → fall through to single query
 
         # ── Single topic query ────────────────────────────────────────────────
@@ -420,7 +423,8 @@ class ToolDispatcher:
 
 
 # Sentinel prefix — agent_engine inspects this to route to compound-beta-mini
-_WEB_SEARCH_SENTINEL = "__web_search__:"
+_WEB_SEARCH_SENTINEL  = "__web_search__:"
+_BRIEFING_SENTINEL    = "__briefing_result__:"   # signals agent to return directly
 
 
 # ─────────────────────────────────────────────────────────────────────────────
