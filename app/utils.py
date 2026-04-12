@@ -148,8 +148,12 @@ def compile_prefix_re() -> None:
         _PREFIX_ANY_RE = re.compile(r"a^")
         _PREFIX_TOKEN_RE = re.compile(r"a^")
         return
-    _PREFIX_ANY_RE = re.compile(r"(?i)@?(?:%s)\b" % alt)
-    _PREFIX_TOKEN_RE = re.compile(r"(?i)(?:^|[\s,;:–—-]+)@?(?:%s)\b[\s,;:!?\.]*" % alt)
+    # Use (?:\W|$) instead of \b for word boundary.
+    # Python re's \b is ASCII-only — it fails for non-Latin scripts
+    # (Telugu, Hindi, Arabic etc.) because those chars are not \w in ASCII mode.
+    # (?:\W|$) correctly matches "end of token" for any Unicode script.
+    _PREFIX_ANY_RE   = re.compile(r"(?i)@?(?:%s)(?:\W|$)" % alt)
+    _PREFIX_TOKEN_RE = re.compile(r"(?i)(?:^|[\s,;:–—-]+)@?(?:%s)(?:[\s,;:!?\.]|$)" % alt)
 
 
 def has_prefix(text: Optional[str]) -> bool:

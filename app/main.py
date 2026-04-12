@@ -1,5 +1,5 @@
 """
-main.py — Shimmi v3.16.0
+main.py — Shimmi v3.16.1
 
 Changes vs v3.8.0:
   FIX-TYPING  Reverted to exact original single-keepalive pattern (process_message only).

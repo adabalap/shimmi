@@ -1,5 +1,5 @@
 """
-config.py — Shimmi v3.16.0
+config.py — Shimmi v3.16.1
 
 Changes vs v3.0.2:
   - Added GEMINI_API_KEY + Gemini model routing (primary orchestrator)

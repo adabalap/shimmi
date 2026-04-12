@@ -50,6 +50,8 @@ CANONICAL_KEYS: List[str] = [
     "portfolio_holdings",      # JSON: [{"symbol":"PAYTM.NS","qty":100,"avg_price":1000}, ...]
     # Other personal
     "interests", "hobbies", "motivational_quote", "reminder_notes",
+    # Bot interaction
+    "bot_nickname",      # what the user calls Shimmi (e.g. "Chitti", "Buddy")
 ]
 
 # Keys the LLM extractor should also recognise (narrower set for extraction prompt)
@@ -146,6 +148,8 @@ KEY_ALIASES: Dict[str, str] = {
     "grocery": "grocery_list", "groceries": "grocery_list",
     "shopping": "shopping_list",
     "todo": "todo_list", "todos": "todo_list", "task": "todo_list",
+    "bot_name": "bot_nickname", "nickname": "bot_nickname",
+    "call_me": "bot_nickname", "shimmi_name": "bot_nickname",
 
     # ── language ──────────────────────────────────────────────────────────
     "user_language": "preferred_language", "language": "preferred_language",
