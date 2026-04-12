@@ -136,7 +136,7 @@ async def _startup():
             "yf.session  curl_cffi not installed — Yahoo Finance may rate-limit. "
             "Fix: pip install curl-cffi  (yfinance uses it automatically)"
         )
-    logger.info("🚀 MCP server v3.16.4 ready on :7000")
+    logger.info("🚀 MCP server v3.17.0 ready on :7000")
 
 @app.on_event("shutdown")
 async def _shutdown():
@@ -435,6 +435,18 @@ _RSS_TECH     = "https://news.google.com/rss/headlines/section/topic/TECHNOLOGY?
 _RSS_SPORTS   = "https://news.google.com/rss/headlines/section/topic/SPORTS?hl=en-IN&gl=IN&ceid=IN:en"
 _RSS_BUSINESS = "https://news.google.com/rss/headlines/section/topic/BUSINESS?hl=en-IN&gl=IN&ceid=IN:en"
 _RSS_LOCAL    = "https://news.google.com/rss/search?q={city}+news&hl=en-IN&gl=IN&ceid=IN:en"
+# Dedicated AI/LLM news feed — Google News search for AI happenings
+_RSS_AI       = "https://news.google.com/rss/search?q=artificial+intelligence+LLM+OpenAI+Gemini+Claude&hl=en-IN&gl=IN&ceid=IN:en"
+
+# AI-signal keywords for filtering the tech feed
+_AI_KEYWORDS = re.compile(
+    r"\b(openai|gemini|claude|mistral|gpt-|llm|large language|"
+    r"ai model|ai agent|artificial intelligence|machine learning|"
+    r"deep learning|generative ai|chatgpt|copilot|anthropic|"
+    r"google deepmind|meta ai|nvidia ai|hugging face|"
+    r"ai regulation|ai safety|ai governance)\b",
+    re.IGNORECASE,
+)
 
 _TTL_BRIEFING = 1800  # 30 min cache
 
@@ -464,9 +476,18 @@ def _parse_rss(xml_text: str) -> list:
                 pub_ts  = dt.timestamp()
             except Exception:
                 pass
+        # Extract article URL — Google News uses <link> with a redirect URL
+        # that MCP /fetch follows to reach the actual article page
+        link = (item.findtext("link") or "").strip()
+        # fallback: some feeds put URL in <guid> when isPermaLink="true"
+        if not link:
+            guid = item.find("guid")
+            if guid is not None and guid.get("isPermaLink", "").lower() == "true":
+                link = (guid.text or "").strip()
+
         if title and len(title) > 15:
             items.append({"title": title, "source": source,
-                          "pub_iso": pub_iso, "pub_ts": pub_ts})
+                          "pub_iso": pub_iso, "pub_ts": pub_ts, "link": link})
     return items
 
 
@@ -600,6 +621,38 @@ def _dedup(articles: list, seen: set) -> list:
     return out
 
 
+async def _fetch_article_abstract(url: str, timeout: float = 5.0) -> str:
+    """
+    Fetch article URL and return a 2-3 sentence abstract using MCP /fetch.
+    Returns empty string on any failure — always optional/graceful.
+    Google News links are redirects that MCP /fetch follows automatically.
+    """
+    if not url or not url.startswith("http"):
+        return ""
+    try:
+        resp = await _HTTP.get(
+            f"{os.getenv('MCP_SERVER_URL', 'http://localhost:7000')}/fetch",
+            params={"url": url},
+            timeout=httpx.Timeout(connect=3.0, read=timeout, write=2.0, pool=2.0),
+            headers={"User-Agent": "Mozilla/5.0 (compatible; Shimmi/1.0)"},
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        if data.get("error"):
+            return ""
+        # Return ARTICLE_ABSTRACT (LexRank 5-sentence) if available,
+        # else first 300 chars of full text
+        abstract = (data.get("abstract") or "").strip()
+        if abstract and len(abstract) > 50:
+            # Cap to 3 sentences max for WhatsApp brevity
+            sentences = [s.strip() for s in abstract.split(". ") if s.strip()]
+            return ". ".join(sentences[:3]) + ("." if sentences else "")
+        text = (data.get("text") or "").strip()
+        return text[:300] if text else ""
+    except Exception:
+        return ""
+
+
 def _forward_looking(articles: list) -> list:
     """
     Filter articles that mention genuinely upcoming/scheduled events.
@@ -650,9 +703,9 @@ async def get_news_briefing(
         logger.debug("briefing.cache_hit  city=%r", city)
         return cached
 
-    # ── Fetch all feeds in parallel ────────────────────────────────────────
+    # ── Fetch all feeds in parallel (7 feeds including dedicated AI feed) ─────
     local_url = _RSS_LOCAL.format(city=city.replace(" ", "+"))
-    world_raw, nation_raw, tech_raw, sports_raw, business_raw, local_raw = \
+    world_raw, nation_raw, tech_raw, sports_raw, business_raw, local_raw, ai_raw = \
         await asyncio.gather(
             _fetch_rss(_RSS_WORLD),
             _fetch_rss(_RSS_NATION),
@@ -660,15 +713,28 @@ async def get_news_briefing(
             _fetch_rss(_RSS_SPORTS),
             _fetch_rss(_RSS_BUSINESS),
             _fetch_rss(local_url),
+            _fetch_rss(_RSS_AI),
         )
 
     # ── Quality filter each feed ────────────────────────────────────────────
     world    = _sort_by_tier(_filter_quality(world_raw,    max_age_hours=12))
     nation   = _sort_by_tier(_filter_quality(nation_raw,   max_age_hours=12))
-    tech     = _sort_by_tier(_filter_quality(tech_raw,     max_age_hours=24))  # tech moves slower
+    tech     = _sort_by_tier(_filter_quality(tech_raw,     max_age_hours=24))
     sports   = _sort_by_tier(_filter_quality(sports_raw,   max_age_hours=8))
     business = _sort_by_tier(_filter_quality(business_raw, max_age_hours=12))
     local    = _sort_by_tier(_filter_quality(local_raw,    max_age_hours=12))
+    # AI feed: filter to articles that actually mention AI/LLM by keyword
+    ai_filtered = [
+        a for a in _sort_by_tier(_filter_quality(ai_raw, max_age_hours=24))
+        if _AI_KEYWORDS.search(a["title"])
+    ]
+    # Also pull AI stories from the tech feed as fallback
+    ai_from_tech = [
+        a for a in tech
+        if _AI_KEYWORDS.search(a["title"])
+    ]
+    # Merge: AI feed first, then tech feed AI stories, dedup later
+    ai_pool_raw = ai_filtered + ai_from_tech
 
     # Global dedup set — no story appears in two sections
     seen: set = set()
@@ -693,13 +759,11 @@ async def get_news_briefing(
     ][:3]
 
     # ── Section: One Story to Understand Today ─────────────────────────────
-    # The single most significant story — with why/now/next context
-    # Pick best candidate: prefer tier-1 source, high recency, not already used
-    # One Story: require tier-1 or tier-2 source, never a stock tip or price check
+    # Best candidate: tier-1/2 source, not a tip/price/gossip article
     story_candidates = [
         a for a in _dedup(world[:6] + nation[:4] + business[:3], seen)
-        if _source_tier(a["source"]) <= 2              # only trusted sources
-        and not _ONE_STORY_ANTI.search(a["title"])     # no tips/prices/phone gossip
+        if _source_tier(a["source"]) <= 2
+        and not _ONE_STORY_ANTI.search(a["title"])
     ]
     story_article = story_candidates[0] if story_candidates else None
     story = None
@@ -708,15 +772,46 @@ async def get_news_briefing(
             re.sub(r"[^a-z0-9\s]", "", story_article["title"].lower()).split()[:4]
         )
         seen.add(seen_key)
+        # Fetch article abstract to ground the Gemini editorial in real content
+        story_abstract = await _fetch_article_abstract(
+            story_article.get("link", ""), timeout=5.0
+        )
         story = {
-            "title":  story_article["title"],
-            "source": story_article["source"],
-            # why/now/next/who will be generated by Gemini in live_data.py
-            # MCP just returns the raw article — insight generation happens in bot
+            "title":    story_article["title"],
+            "source":   story_article["source"],
+            "abstract": story_abstract,   # real article content → richer Gemini insight
         }
+        logger.info(
+            "briefing.story_fetch  title=%r  abstract_len=%d",
+            story_article["title"][:60], len(story_abstract),
+        )
+
+    # ── Section: AI & the World ────────────────────────────────────────────
+    # Dedicated AI/LLM section — model releases, regulation, industry shifts
+    # Grounded in real article body (fetched), not just headline
+    ai_deduped = _dedup(ai_pool_raw[:8], seen)
+    ai_story_article = ai_deduped[0] if ai_deduped else None
+    ai_story = None
+    if ai_story_article:
+        ai_abstract = await _fetch_article_abstract(
+            ai_story_article.get("link", ""), timeout=5.0
+        )
+        ai_story = {
+            "title":    ai_story_article["title"],
+            "source":   ai_story_article["source"],
+            "abstract": ai_abstract,
+        }
+        logger.info(
+            "briefing.ai_story_fetch  title=%r  abstract_len=%d",
+            ai_story_article["title"][:60], len(ai_abstract),
+        )
+    # Remaining AI headlines (2-3) without fetching — context from title only
+    ai_headlines = [
+        {"title": a["title"], "source": a["source"]}
+        for a in ai_deduped[1:4]
+    ]
 
     # ── Section: India Lens ─────────────────────────────────────────────────
-    # How the day's stories connect to India — nation news + India-relevant globals
     india_global = [a for a in world if any(kw in a["title"].lower()
                     for kw in ("india", "rupee", "rbi", "modi", "delhi", "mumbai",
                                "it sector", "outsourc", "gcc", "infosys", "wipro",
@@ -725,14 +820,15 @@ async def get_news_briefing(
     india_lens = [{"title": a["title"], "source": a["source"]}
                   for a in india_pool[:3]]
 
-    # ── Section: Tech & AI Radar ───────────────────────────────────────────
-    # Tech news framed as trends — what's shifting, not just what happened
+    # ── Section: Tech Radar (non-AI tech) ──────────────────────────────────
+    # General tech: exclude AI (has its own section) and phone gossip
     tech_pool = [
-        a for a in _dedup(tech[:8], seen)
-        if not _TECH_ANTI.search(a["title"])           # no phone leaks/hardware gossip
+        a for a in _dedup(tech[:10], seen)
+        if not _TECH_ANTI.search(a["title"])
+        and not _AI_KEYWORDS.search(a["title"])   # AI gets its own section
     ]
     tech_radar = [{"title": a["title"], "source": a["source"]}
-                  for a in tech_pool[:3]]
+                  for a in tech_pool[:2]]          # 2 items — AI section is richer
 
     # ── Section: What to Watch Today ───────────────────────────────────────
     # Forward-looking items across all feeds
@@ -754,9 +850,11 @@ async def get_news_briefing(
     result = {
         "snapshot":    snapshot,
         "changed":     changed,
-        "story":       story,        # raw article — insight generated in live_data.py
+        "story":       story,        # One Story with abstract for Gemini insight
+        "ai_story":    ai_story,     # Top AI story with abstract
+        "ai_headlines": ai_headlines, # 2-3 more AI headlines
         "india_lens":  india_lens,
-        "tech_radar":  tech_radar,
+        "tech_radar":  tech_radar,   # non-AI tech only
         "watch_today": watch_today,
         "local":       local_items,
         "sports":      sports_items,
@@ -765,8 +863,9 @@ async def get_news_briefing(
     }
 
     total = sum(len(v) for v in [snapshot, changed, india_lens, tech_radar,
-                                  watch_today, local_items, sports_items]
+                                  watch_today, local_items, sports_items, ai_headlines]
                 if isinstance(v, list))
+    total += (1 if story else 0) + (1 if ai_story else 0)
     if total >= 5:
         _cache_set(ck, result, _TTL_BRIEFING)
         logger.info("briefing.done  city=%r  sections=%d  total_items=%d",

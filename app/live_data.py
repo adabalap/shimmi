@@ -1,5 +1,5 @@
 """
-live_data.py — Shimmi v3.16.0
+live_data.py — Shimmi v3.17.0
 
 Changes vs v3.0.1:
   ARCH-1  All data fetching now routes through mcp_client → mcp_server (port 7000)
@@ -685,25 +685,46 @@ async def _rewrite_news_query(raw_query: str) -> str:
 
 
 
-async def _generate_story_insight(title: str, source: str) -> dict:
+async def _generate_story_insight(title: str, source: str,
+                                    article_abstract: str = "") -> dict:
     """
     Use Gemini to generate editorial insight for the 'One Story' section.
-    Returns dict with why, now, next, who, takeaway.
+
+    article_abstract: real article body (3 LexRank sentences) fetched from source.
+    When present, Gemini grounds its insight in actual journalism rather than
+    guessing from the headline alone. Quality difference is significant.
+
+    Returns dict with why, now, next, takeaway.
     Falls back to empty strings if Gemini is unavailable/quota-limited.
     """
     try:
         from .agent_engine import _groq_raw
-        prompt = (
-            f"News headline: \"{title}\" (Source: {source})\n\n"
-            "Write a concise WhatsApp-friendly editorial insight with EXACTLY these 4 fields:\n"
-            "WHY: One sentence — why this story matters right now (not what happened).\n"
-            "NOW: One sentence — the immediate context or trigger.\n"
-            "NEXT: One sentence — what to watch for / what happens next.\n"
-            "TAKEAWAY: One short sentence — the net implication for a professional reader.\n\n"
-            "Rules: Each answer is ONE sentence max. No bullet points. No markdown. "
-            "Be direct and intelligent — assume an above-average reader. "
-            "Output only the 4 labelled lines, nothing else."
-        )
+        if article_abstract and len(article_abstract) > 80:
+            # Grounded: real article content available
+            prompt = (
+                f"News headline: \"{title}\" (Source: {source})\n\n"
+                f"Article content:\n{article_abstract[:600]}\n\n"
+                "Based on the actual article above, write editorial insight with EXACTLY these 4 fields:\n"
+                "WHY: One sentence — why this story matters right now.\n"
+                "NOW: One sentence — the key fact or development from the article.\n"
+                "NEXT: One sentence — what to watch for next.\n"
+                "TAKEAWAY: One short sentence — net implication for a professional.\n\n"
+                "Rules: Each answer is ONE sentence. No bullets. No markdown. "
+                "Be specific — use facts from the article, not generic commentary. "
+                "Output only the 4 labelled lines."
+            )
+        else:
+            # Fallback: headline only
+            prompt = (
+                f"News headline: \"{title}\" (Source: {source})\n\n"
+                "Write a concise editorial insight with EXACTLY these 4 fields:\n"
+                "WHY: One sentence — why this story matters right now.\n"
+                "NOW: One sentence — the immediate context or trigger.\n"
+                "NEXT: One sentence — what to watch for next.\n"
+                "TAKEAWAY: One short sentence — net implication for a professional.\n\n"
+                "Rules: One sentence each. No bullets. No markdown. Be direct. "
+                "Output only the 4 labelled lines."
+            )
         raw = await _groq_raw(
             [
                 {
@@ -755,23 +776,26 @@ async def get_news_briefing(city: str = "Hyderabad") -> Optional[str]:
     if not data:
         return None
 
-    snapshot    = data.get("snapshot", [])
-    changed     = data.get("changed", [])
-    story_raw   = data.get("story")
-    india_lens  = data.get("india_lens", [])
-    tech_radar  = data.get("tech_radar", [])
-    watch_today = data.get("watch_today", [])
-    local       = data.get("local", [])
-    sports      = data.get("sports", [])
+    snapshot     = data.get("snapshot", [])
+    changed      = data.get("changed", [])
+    story_raw    = data.get("story")
+    ai_story_raw = data.get("ai_story")
+    ai_headlines = data.get("ai_headlines", [])
+    india_lens   = data.get("india_lens", [])
+    tech_radar   = data.get("tech_radar", [])
+    watch_today  = data.get("watch_today", [])
+    local        = data.get("local", [])
+    sports       = data.get("sports", [])
 
-    total = sum(len(x) for x in [snapshot, changed, india_lens, tech_radar]
+    total = sum(len(x) for x in [snapshot, changed, india_lens]
                 if isinstance(x, list))
-    if total < 4:
+    if total < 3:
         logger.info("📰 news_briefing.thin  total=%d  falling back", total)
         return None
 
-    # ── Parallel: fetch story insight + markets + weather ──────────────────
+    # ── Parallel: story insight + AI insight + markets + weather ───────────
     story_insight = {}
+    ai_insight    = {}
     markets_text  = ""
     weather_text  = ""
 
@@ -779,7 +803,18 @@ async def get_news_briefing(city: str = "Hyderabad") -> Optional[str]:
         nonlocal story_insight
         if story_raw and story_raw.get("title"):
             story_insight = await _generate_story_insight(
-                story_raw["title"], story_raw.get("source", "")
+                story_raw["title"],
+                story_raw.get("source", ""),
+                article_abstract=story_raw.get("abstract", ""),  # real article body
+            )
+
+    async def _get_ai_insight():
+        nonlocal ai_insight
+        if ai_story_raw and ai_story_raw.get("title"):
+            ai_insight = await _generate_story_insight(
+                ai_story_raw["title"],
+                ai_story_raw.get("source", ""),
+                article_abstract=ai_story_raw.get("abstract", ""),
             )
 
     async def _get_markets():
@@ -815,7 +850,7 @@ async def get_news_briefing(city: str = "Hyderabad") -> Optional[str]:
         except Exception as exc:
             logger.debug("briefing.weather_skip  err=%s", exc)
 
-    await asyncio.gather(_get_insight(), _get_markets(), _get_weather())
+    await asyncio.gather(_get_insight(), _get_ai_insight(), _get_markets(), _get_weather())
 
     # ── Format ─────────────────────────────────────────────────────────────
     now_ist = datetime.now(UTC)
@@ -883,9 +918,27 @@ async def get_news_briefing(city: str = "Hyderabad") -> Optional[str]:
         lines.append(f"• {city}: {weather_text}")
     lines.append("")
 
-    # ── 🤖 Tech & AI Radar ─────────────────────────────────────────────────
+    # ── 🤖 AI & the World ─────────────────────────────────────────────────
+    # Dedicated AI section — model releases, regulation, industry shifts
+    # Top AI story has a full editorial (like One Story), rest are headlines
+    has_ai = ai_story_raw or ai_headlines
+    if has_ai:
+        lines.append("🤖 *AI & the World*")
+        if ai_story_raw and ai_story_raw.get("title"):
+            src = f"  _({ai_story_raw['source']})_" if ai_story_raw.get("source") else ""
+            lines.append(f"*{ai_story_raw['title'][:110]}*{src}")
+            if ai_insight.get("why"):
+                lines.append(f"  _{ai_insight['why']}_")
+            if ai_insight.get("takeaway"):
+                lines.append(f"  👉 _{ai_insight['takeaway']}_")
+        for a in ai_headlines:
+            src = f"  _({a['source']})_" if a.get("source") else ""
+            lines.append(f"• {a['title'][:100]}{src}")
+        lines.append("")
+
+    # ── 💻 Tech Radar (non-AI) ─────────────────────────────────────────────
     if tech_radar:
-        lines.append("🤖 *Tech & AI Radar*")
+        lines.append("💻 *Tech*")
         for a in tech_radar:
             src = f"  _({a['source']})_" if a.get("source") else ""
             lines.append(f"• {a['title'][:100]}{src}")
