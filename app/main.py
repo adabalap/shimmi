@@ -1,5 +1,5 @@
 """
-main.py — Shimmi v3.17.0
+main.py — Shimmi v3.17.3
 
 Changes vs v3.8.0:
   FIX-TYPING  Reverted to exact original single-keepalive pattern (process_message only).
@@ -348,11 +348,34 @@ async def _ambient_extract_bg(*, chat_id: str, sender_key: str, text: str) -> No
                      sender_key, str(exc)[:80])
 
 
+# Patterns that should never be stored in ChromaDB ambient memory.
+# These match the NEVER_STORE_KEYS logic but at the message level.
+# Even if the fact is blocked in SQLite, we don't want the raw message
+# containing sensitive data in semantic memory. Evidence: v3.17.0 log —
+# "my social security number is 123-45-6789" was stored in ChromaDB
+# despite being blocked in SQLite.
+import re as _re_ambient
+_SENSITIVE_AMBIENT = _re_ambient.compile(
+    r"(social.?security|ssn|passport.?number|bank.?account|"
+    r"credit.?card|debit.?card|card.?number|cvv|pin.?number|"
+    r"password|secret.?key|private.?key|api.?key|access.?token)",
+    _re_ambient.IGNORECASE,
+)
+
+
 async def _ambient_store(*, chat_id, sender_key, text, event_id) -> None:
     if not chat_is_allowed(chat_id):
         return
     cleaned = strip_invocation((text or "").strip())
     if not cleaned:
+        return
+    # Privacy guard: skip chroma ambient store for sensitive data.
+    # SQLite fact write is blocked separately via NEVER_STORE_KEYS.
+    if _SENSITIVE_AMBIENT.search(cleaned):
+        logger.info(
+            "ambient.skip_sensitive  sender=%s  reason=sensitive_pattern  preview=%r",
+            sender_key, cleaned[:40],
+        )
         return
     ts_in = datetime.now(UTC).isoformat()
     stored_sqlite = stored_chroma = False

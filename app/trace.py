@@ -126,8 +126,8 @@ class Trace:
             outcome,
             self.event_id[:16],
             total_ms,
-            self._global_tags.get("agent_iterations", "?"),
-            self._global_tags.get("memory_updates", "?"),
-            self._global_tags.get("reply_len", "?"),
+            self._global_tags.get("agent_iterations", 0),
+            self._global_tags.get("memory_updates", 0),
+            self._global_tags.get("reply_len", 0),
             summary_extras,
         )

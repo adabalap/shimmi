@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.17.0
+agent_engine.py — Shimmi v3.17.4
 
 Changes vs v3.3.0:
 
@@ -1069,6 +1069,57 @@ def _try_facts_shortcut(user_text: str, facts: Dict[str, str]) -> Optional[str]:
     for phrase, key in _SPECIAL_RECALL_FORMS:
         if low.startswith(phrase):
             return _reply(key)
+
+    # Pattern 3: "what do you know about me" — enumerate all facts.
+    # This query always fails under LLM pressure (56 facts = ~2K input tokens,
+    # model truncates and returns garbage). Build the summary in Python: zero tokens,
+    # instant, always works. Evidence: failed 3x in v3.17.0 test session.
+    _KNOW_ABOUT_ME = frozenset({
+        "what do you know about me", "what do you know about me?",
+        "tell me what you know about me", "what have you learned about me",
+        "what do you remember about me", "what do you remember about me?",
+        "tell me everything you know about me",
+        "what information do you have about me",
+        "what's stored about me", "what facts do you have about me",
+    })
+    if low in _KNOW_ABOUT_ME or low.rstrip("?") in _KNOW_ABOUT_ME:
+        if not facts:
+            return "I don't have anything stored about you yet. Just start chatting and I'll learn! 😊"
+        clean = _clean_facts(facts)
+        if not clean:
+            return "I don't have anything meaningful stored about you yet."
+        # Group by category for readability
+        _IDENTITY = ("name","age","birthday","occupation","city","country")
+        _PREFS    = ("favorite_drink","favorite_food","favorite_color","favorite_genre",
+                     "favorite_trail","coffee_order","favorite_news_source","favorite_magazine")
+        _HEALTH   = ("allergies","fitness_goals","diet")
+        _STUFF    = ("car","pets","shopping_list","grocery_list","todo_list","travel_plans")
+        _PORTFOLIO= ("portfolio_holdings","portfolio_stocks")
+
+        parts = []
+        shown = set()
+
+        def _add_section(label, keys):
+            items = [(k, clean[k]) for k in keys if k in clean]
+            if items:
+                lines = ["• *" + k.replace("_"," ").title() + ":* " + v for k, v in items]
+                parts.append("*" + label + "*\n" + "\n".join(lines))
+                for k, _ in items: shown.add(k)
+
+        _add_section("About you",   _IDENTITY)
+        _add_section("Preferences", _PREFS)
+        _add_section("Health",      _HEALTH)
+        _add_section("Your stuff",  _STUFF)
+        _add_section("Portfolio",   _PORTFOLIO)
+
+        # Remaining keys not in any category
+        others = [(k, v) for k, v in clean.items() if k not in shown]
+        if others:
+            lines = ["\u2022 *" + k.replace("_"," ").title() + ":* " + v for k, v in others[:10]]
+            parts.append("*Other*\n" + "\n".join(lines))
+
+        summary = "\n\n".join(parts)
+        return "Here's everything I have on record about you:\n\n" + summary
 
     return None
 
@@ -2563,13 +2614,16 @@ async def run_agent(
                 "⚠️  orchestrate.bad_response  action=%r  text=%r  reasoning=%r",
                 orch.action, orch.text[:40], orch.reasoning[:40],
             )
-            # Only use text if it looks like a real reply (>20 chars, not internal)
+            # Guard: never expose internal debug strings to user.
+            # Checks BOTH orch.text and orch.reasoning — json.repair sets
+            # reasoning="best-effort reply" when it partially succeeds with
+            # an empty text field. Evidence: v3.17.0 log raw_len=13/26/36.
             _internal_markers = ("best-effort", "best_effort", "repair", "json", "{", "}")
-            safe_text = orch.text if (
-                orch.text
-                and len(orch.text) > 20
-                and not any(m in orch.text.lower() for m in _internal_markers)
-            ) else ""
+            def _is_safe(s):
+                return bool(s) and len(s) > 20 and not any(m in s.lower() for m in _internal_markers)
+            safe_text = orch.text if _is_safe(orch.text) else ""
+            if not safe_text and _is_safe(orch.reasoning):
+                safe_text = orch.reasoning   # reasoning is sometimes the real reply
             if not safe_text:
                 safe_text = "Sorry, I had trouble with that response. Could you try again?"
                 logger.info("ℹ️  orchestrate.fallback_reply  sent graceful error to user")
