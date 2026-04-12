@@ -1,5 +1,5 @@
 """
-main.py — Shimmi v3.16.1
+main.py — Shimmi v3.16.2
 
 Changes vs v3.8.0:
   FIX-TYPING  Reverted to exact original single-keepalive pattern (process_message only).
@@ -535,20 +535,40 @@ async def process_message(
                     )
 
             # ── 3. build context ────────────────────────────────────────────
+            # ChromaDB can spike to 18+ seconds under write pressure.
+            # Wrap with a 3s timeout and fall back to empty context if it spikes.
+            # Evidence: v3.16.1 log — context_build 18581ms → total 23320ms.
             context_items: List[Dict[str, Any]] = []
             with trace.step("context_build"):
                 if database.chroma_store:
-                    rel = await database.chroma_store.search(
-                        chat_id=chat_id, query=user_text, k=settings.chroma_top_k,
-                    )
-                    rec = await database.chroma_store.recent_window(
-                        chat_id=chat_id, k=settings.chroma_recent_k,
-                    )
-                    merged_ctx = {c.id: c for c in (rel + rec)}
-                    context_items = [
-                        {"id": c.id, "text": c.text, "metadata": c.metadata, "distance": c.distance}
-                        for c in list(merged_ctx.values())[:20]
-                    ]
+                    try:
+                        async def _build_chroma_context():
+                            rel = await database.chroma_store.search(
+                                chat_id=chat_id, query=user_text, k=settings.chroma_top_k,
+                            )
+                            rec = await database.chroma_store.recent_window(
+                                chat_id=chat_id, k=settings.chroma_recent_k,
+                            )
+                            merged = {c.id: c for c in (rel + rec)}
+                            return [
+                                {"id": c.id, "text": c.text, "metadata": c.metadata,
+                                 "distance": c.distance}
+                                for c in list(merged.values())[:20]
+                            ]
+                        context_items = await asyncio.wait_for(
+                            _build_chroma_context(),
+                            timeout=float(os.getenv("CHROMA_CONTEXT_TIMEOUT", "3.0")),
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "⚠️  context_build.timeout  chat=%s  "
+                            "chroma took >3s — using empty context",
+                            chat_id,
+                        )
+                        context_items = []
+                    except Exception as _ctx_err:
+                        logger.warning("⚠️  context_build.error  err=%s", str(_ctx_err)[:80])
+                        context_items = []
                 trace.tag(context_total=len(context_items))
                 logger.info("📚 context.built  total=%d", len(context_items))
 

@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.16.1
+agent_engine.py — Shimmi v3.16.2
 
 Changes vs v3.3.0:
 
@@ -893,6 +893,16 @@ def _register_pending_delete(sender_key: str, key: str, current_value: str) -> N
     logger.info("⏳ pending_delete.registered  sender=%s  key=%s", sender_key, key)
 
 
+def _pending_delete_keys(sender_key: str) -> set:
+    """Return the set of fact keys that have pending deletes for this sender."""
+    now = time.monotonic()
+    return {
+        k.split(":", 1)[1]
+        for k, (_, ts) in _PENDING_DELETES.items()
+        if k.startswith(f"{sender_key}:") and (now - ts) <= _PENDING_DELETE_TTL
+    }
+
+
 def _check_pending_delete(sender_key: str, user_text: str) -> Optional[tuple[str, str]]:
     """
     Check if the user's message is confirming or cancelling a pending delete.
@@ -1472,7 +1482,8 @@ async def _parse_with_repair(
         )
         return _parse_json(repaired_raw)
     except Exception as e:
-        logger.error("❌ json.repair_failed  label=%s  err=%s", label, str(e)[:120])
+        logger.error("❌ json.repair_failed  label=%s  raw=%r  err=%s",
+                     label, raw[:80], str(e)[:120])
         return {}
 
 
@@ -2217,6 +2228,43 @@ async def run_agent(
                     provider_used="pending_delete_cancel",
                 )
 
+    # ── 0b. Pending-delete query intercept ───────────────────────────────
+    # If user asks about a key that has a pending delete (e.g. "what's on my
+    # shopping list" while shopping_list delete is pending), surface the
+    # confirmation prompt instead of showing the old data.
+    # Evidence: v3.16.1 log — shopping_list delete pending at 14:17:31,
+    # user asked "what's on my shopping list" at 14:17:46, bot showed OLD data.
+    if sender_key:
+        pending_keys = _pending_delete_keys(sender_key)
+        if pending_keys and user_text:
+            low = user_text.lower()
+            # Use best-score matching: find the key whose words appear most in the query.
+            # This correctly distinguishes "grocery list" vs "shopping list" queries
+            # when both have pending deletes.
+            best_key, best_score = None, 0
+            for pk in sorted(pending_keys):  # sorted for determinism
+                key_words = [w for w in pk.replace("_", " ").split() if len(w) > 3]
+                score = sum(1 for w in key_words if w in low)
+                if score > best_score:
+                    best_score, best_key = score, pk
+            if best_key and best_score > 0:
+                pk_display = best_key.replace("_", " ")
+                logger.info(
+                    "⏳ pending_delete.query_intercept  sender=%s  key=%s",
+                    sender_key, best_key,
+                )
+                return AgentResult(
+                    reply=ReplyPayload(
+                        type="text",
+                        text=(
+                            f"⚠️ You asked me to delete your *{pk_display}* earlier. "
+                            f"Should I go ahead and clear it? Reply *yes* to confirm "
+                            f"or *no* to keep it."
+                        ),
+                    ),
+                    provider_used="pending_delete_query",
+                )
+
     # ── 1. Zero-token facts shortcut ──────────────────────────────────────
     shortcut = _try_facts_shortcut(user_text, facts)
     if shortcut:
@@ -2464,10 +2512,26 @@ async def run_agent(
                 iterations=iteration,
             )
         else:
-            logger.info("ℹ️  orchestrate.unknown_action  action=%s  (treating as answer)", orch.action)
-            text = orch.text or orch.reasoning or "I'm not sure how to help with that."
+            # Empty/garbage response — orch.action is blank or unrecognised,
+            # orch.text is empty. The reasoning field is an internal string,
+            # NEVER expose it to the user ("best-effort reply", partial JSON etc).
+            # Log it and return a clean retry message instead.
+            logger.warning(
+                "⚠️  orchestrate.bad_response  action=%r  text=%r  reasoning=%r",
+                orch.action, orch.text[:40], orch.reasoning[:40],
+            )
+            # Only use text if it looks like a real reply (>20 chars, not internal)
+            _internal_markers = ("best-effort", "best_effort", "repair", "json", "{", "}")
+            safe_text = orch.text if (
+                orch.text
+                and len(orch.text) > 20
+                and not any(m in orch.text.lower() for m in _internal_markers)
+            ) else ""
+            if not safe_text:
+                safe_text = "Sorry, I had trouble with that response. Could you try again?"
+                logger.info("ℹ️  orchestrate.fallback_reply  sent graceful error to user")
             return AgentResult(
-                reply=ReplyPayload(type="text", text=text),
+                reply=ReplyPayload(type="text", text=safe_text),
                 iterations=iteration,
             )
 
