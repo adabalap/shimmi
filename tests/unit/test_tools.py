@@ -87,7 +87,7 @@ class TestParseToolCall:
         tc = parse_tool_call({"tool": "stocks", "symbols": "INFY, WIPRO"})
         assert isinstance(tc, StocksTool)
         assert "INFY.NS" in tc.symbols  # .NS auto-appended for NSE
-        assert "WIPRO" in tc.symbols
+        assert "WIPRO.NS" in tc.symbols  # .NS auto-appended for NSE
 
     def test_stocks_empty_symbols(self):
         tc = parse_tool_call({"tool": "stocks", "symbols": []})

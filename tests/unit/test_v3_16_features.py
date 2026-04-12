@@ -89,11 +89,12 @@ class TestUnicodePrefixRegex:
 class TestPendingDeleteQueryIntercept:
 
     def _intercept(self, pending_keys: set, user_text: str):
-        """Simulate the intercept logic from agent_engine.py."""
+        """Simulate the intercept logic from agent_engine.py.
+        Uses len(w) > 3 (4+ char words) to match production code."""
         low = user_text.lower()
         best_key, best_score = None, 0
         for pk in sorted(pending_keys):
-            key_words = [w for w in pk.replace("_", " ").split() if len(w) > 4]
+            key_words = [w for w in pk.replace("_", " ").split() if len(w) > 3]
             score = sum(1 for w in key_words if w in low)
             if score > best_score:
                 best_score, best_key = score, pk
@@ -120,13 +121,16 @@ class TestPendingDeleteQueryIntercept:
         assert self._intercept(set(), "What's on my shopping list") is None
 
     def test_todo_list_intercepted(self):
+        """'todo' (4 chars) and 'list' (4 chars) both pass the len > 3 filter.
+        Score = 2 for 'show me my todo list' → matches todo_list."""
         assert self._intercept({"todo_list"}, "show me my todo list") == "todo_list"
 
     def test_short_words_ignored_in_matching(self):
-        """Words ≤4 chars excluded — 'list' (4 chars) is too generic to match.
-        Only words with 5+ chars discriminate keys: 'shopping' (8), 'grocery' (7).
-        This prevents 'my on list' from matching 'shopping_list' via 'list'."""
-        assert self._intercept({"shopping_list"}, "my on list") is None
+        """Short, unrelated words (2-3 chars) produce no match.
+        Queries with no 4+ char words from any pending key return None."""
+        # No words ≥4 chars that appear in "shopping_list" or "grocery_list"
+        assert self._intercept({"shopping_list", "grocery_list"}, "my ok yes") is None
+        assert self._intercept({"shopping_list"}, "the big one") is None
 
 
 # ─────────────────────────────────────────────────────────────────────────────

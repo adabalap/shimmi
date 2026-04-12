@@ -164,6 +164,25 @@ def test_settings(tmp_path, monkeypatch):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# Provider lock — forces groq_8b for ALL tests (autouse)
+# ─────────────────────────────────────────────────────────────────────────────
+# Settings() is instantiated at module import time, so monkeypatch.setenv for
+# GEMINI_API_KEY has no effect on already-loaded settings.gemini_api_key.
+# Instead we patch _pick_provider_and_model directly so every run_agent()
+# call gets groq_8b regardless of which LLM fixture the test uses.
+# This prevents "Gemini client not initialised" in all integration tests.
+
+@pytest.fixture(autouse=True)
+def force_groq_provider():
+    """Force all LLM calls to use groq_8b — no Gemini/Mistral clients needed."""
+    with patch(
+        "app.agent_engine._pick_provider_and_model",
+        return_value=("groq_8b", "llama-3.1-8b-instant"),
+    ):
+        yield
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # LLM mock fixture — makes _groq_raw() return canned responses
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -187,8 +206,7 @@ def mock_llm_answer():
             return CANNED_FORMAT_RESULT
         return CANNED_EMPTY_EXTRACT
 
-    with patch("app.agent_engine._groq_raw", side_effect=_fake_groq_raw) as mock,          patch("app.agent_engine._pick_provider_and_model",
-               return_value=("groq_8b", "llama-3.1-8b-instant")):
+    with patch("app.agent_engine._groq_raw", side_effect=_fake_groq_raw) as mock:
         mock.call_count_ref = call_count
         yield mock
 
@@ -216,8 +234,7 @@ def mock_llm_search():
             return CANNED_FORMAT_RESULT
         return CANNED_EMPTY_EXTRACT
 
-    with patch("app.agent_engine._groq_raw", side_effect=_fake_groq_raw),          patch("app.agent_engine._pick_provider_and_model",
-               return_value=("groq_8b", "llama-3.1-8b-instant")):
+    with patch("app.agent_engine._groq_raw", side_effect=_fake_groq_raw):
         yield
 
 

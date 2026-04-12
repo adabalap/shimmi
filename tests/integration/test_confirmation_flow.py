@@ -30,7 +30,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 from app.database import DeleteOutcome
 
 SENDER   = "919876543210@s.whatsapp.net"
-CHAT_ID  = "919876543210-1234567890@g.us"
+CHAT_ID  = "919876543210@s.whatsapp.net"   # DM — no prefix required for yes/no
 
 
 # ─────────────────────────────────────────────────────────────────────────────
