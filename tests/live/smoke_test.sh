@@ -44,8 +44,18 @@ skip() { echo -e "${YELLOW}  ⏭️  SKIP${NC}: $*"; ((SKIP++)); }
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
+# BOT_PREFIX: first configured prefix (default: shimmi)
+# All test messages must contain this or the bot will silently drop them.
+BOT_PREFIX="${BOT_PREFIX:-shimmi}"
+
 send_msg() {
     local text="$1"
+    # Safety guard: warn if message has no bot prefix
+    # (bot will silently drop prefixless messages via has_prefix() check)
+    if ! echo "$text" | grep -qiE "(${BOT_PREFIX}|చిట్టి|chitti|spock)"; then
+        echo "  ⚠️  WARNING: message has no bot prefix — bot will drop it: ${text:0:60}"
+        echo "     Prefix with \"${BOT_PREFIX}\" to ensure bot processes it."
+    fi
     curl -s -X POST \
         -H "Content-Type: application/json" \
         -H "X-Api-Key: ${WAHA_KEY}" \

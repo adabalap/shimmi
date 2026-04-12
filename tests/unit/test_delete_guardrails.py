@@ -32,7 +32,7 @@ from app.database import (
 
 ALICE = "911111111111@s.whatsapp.net"
 BOB   = "922222222222@s.whatsapp.net"
-CHAT  = "9190000000-group@g.us"
+CHAT  = "919876543210@s.whatsapp.net"  # DM chat — no prefix required for yes/no
 
 
 # ─────────────────────────────────────────────────────────────────────────────

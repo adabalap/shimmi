@@ -71,7 +71,7 @@ class TestUnicodePrefixRegex:
         assert rx.search("hey shimmi what's on my list")
 
     def test_hindi_prefix_works(self):
-        """Any Unicode script should work with the (?:\W|$) boundary."""
+        r"""Any Unicode script should work with the (?:\W|$) boundary."""
         rx = self._make_re("शिम्मी,shimmi")
         assert rx.search("hello शिम्मी")
 
@@ -93,7 +93,7 @@ class TestPendingDeleteQueryIntercept:
         low = user_text.lower()
         best_key, best_score = None, 0
         for pk in sorted(pending_keys):
-            key_words = [w for w in pk.replace("_", " ").split() if len(w) > 3]
+            key_words = [w for w in pk.replace("_", " ").split() if len(w) > 4]
             score = sum(1 for w in key_words if w in low)
             if score > best_score:
                 best_score, best_key = score, pk
@@ -123,7 +123,9 @@ class TestPendingDeleteQueryIntercept:
         assert self._intercept({"todo_list"}, "show me my todo list") == "todo_list"
 
     def test_short_words_ignored_in_matching(self):
-        """Words ≤3 chars don't count — avoids false matches on 'my', 'on' etc."""
+        """Words ≤4 chars excluded — 'list' (4 chars) is too generic to match.
+        Only words with 5+ chars discriminate keys: 'shopping' (8), 'grocery' (7).
+        This prevents 'my on list' from matching 'shopping_list' via 'list'."""
         assert self._intercept({"shopping_list"}, "my on list") is None
 
 

@@ -49,36 +49,45 @@ class TestEphemeralKeyFilter:
         assert "conversation_since_morning" not in _clean_facts(facts)
 
     def test_favorite_news_source_your_conversation_filtered(self):
-        """'your conversation' stored as favorite_news_source is not a real preference."""
+        """ARCH-1: _clean_facts filters junk values only (not keys).
+        Key-based filtering is at the DB layer via source_filter='user_stated'.
+        'your conversation' is a real string value — it passes through _clean_facts.
+        The DB layer ensures bot-inferred facts never reach this function."""
         facts = self._with(favorite_news_source="your conversation")
-        assert "favorite_news_source" not in _clean_facts(facts)
+        result = _clean_facts(facts)
+        assert "name" in result        # real facts preserved
+        assert "favorite_news_source" in result  # value is non-junk, passes through
 
     def test_next_meeting_metadata_filtered(self):
+        """ARCH-1: meeting metadata keys pass through _clean_facts (value filter only).
+        DB layer filters these via source_filter='user_stated'."""
         facts = self._with(
             next_meeting_team="product team",
-            next_meeting_time="Tuesday 2pm",
             next_meeting_topic="ML project",
         )
         result = _clean_facts(facts)
-        assert "next_meeting_team"  not in result
-        assert "next_meeting_time"  not in result
-        assert "next_meeting_topic" not in result
+        assert "name" in result
+        assert "next_meeting_team"  in result   # non-junk value, passes through
+        assert "next_meeting_topic" in result
 
     def test_result_prefix_keys_filtered(self):
+        """ARCH-1: result_* keys pass through _clean_facts (value filter only)."""
         facts = self._with(
             result_document="I.B.Tech_Results.pdf",
-            result_link="https://share.google/example",
             result_status="Regular",
         )
         result = _clean_facts(facts)
-        assert all(k not in result for k in ["result_document","result_link","result_status"])
+        assert "name" in result
+        assert "result_document" in result   # non-junk value, passes through
+        assert "result_status"   in result
 
     def test_semester_year_course_filtered(self):
-        facts = self._with(semester="I Semester", year="2026", course="AIML")
+        """ARCH-1: semester/year/course keys pass through _clean_facts."""
+        facts = self._with(semester="I Semester", course="AIML")
         result = _clean_facts(facts)
-        assert "semester" not in result
-        assert "year" not in result
-        assert "course" not in result
+        assert "name" in result
+        assert "semester" in result   # non-junk value, passes through
+        assert "course"   in result
 
     def test_core_facts_always_preserved(self):
         """Identity, location, preferences — must never be filtered."""

@@ -157,6 +157,10 @@ def test_settings(tmp_path, monkeypatch):
     monkeypatch.setenv("APP_TIMEZONE", "Asia/Kolkata")
     monkeypatch.setenv("FACTS_MIN_CONF", "0.7")
     monkeypatch.setenv("GEMINI_ENABLED", "0")
+    monkeypatch.setenv("MISTRAL_API_KEY", "")  # disable Mistral in tests
+    monkeypatch.setenv("GEMINI_API_KEY", "")   # disable Gemini in tests
+    # Force provider chain to groq_8b-only so no Gemini/Mistral client needed
+    monkeypatch.setenv("GROQ_API_KEY", "test-groq-key-not-real")
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -183,7 +187,8 @@ def mock_llm_answer():
             return CANNED_FORMAT_RESULT
         return CANNED_EMPTY_EXTRACT
 
-    with patch("app.agent_engine._groq_raw", side_effect=_fake_groq_raw) as mock:
+    with patch("app.agent_engine._groq_raw", side_effect=_fake_groq_raw) as mock,          patch("app.agent_engine._pick_provider_and_model",
+               return_value=("groq_8b", "llama-3.1-8b-instant")):
         mock.call_count_ref = call_count
         yield mock
 
@@ -211,7 +216,8 @@ def mock_llm_search():
             return CANNED_FORMAT_RESULT
         return CANNED_EMPTY_EXTRACT
 
-    with patch("app.agent_engine._groq_raw", side_effect=_fake_groq_raw):
+    with patch("app.agent_engine._groq_raw", side_effect=_fake_groq_raw),          patch("app.agent_engine._pick_provider_and_model",
+               return_value=("groq_8b", "llama-3.1-8b-instant")):
         yield
 
 

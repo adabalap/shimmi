@@ -80,13 +80,13 @@ class TestParseToolCall:
     def test_stocks_with_symbols_list(self):
         tc = parse_tool_call({"tool": "stocks", "symbols": ["RELIANCE", "TCS"]})
         assert isinstance(tc, StocksTool)
-        assert tc.symbols == ["RELIANCE", "TCS"]
+        assert tc.symbols == ["RELIANCE.NS", "TCS.NS"]  # .NS auto-appended for NSE
 
     def test_stocks_with_symbols_string(self):
         # LLM might pass a comma-separated string
         tc = parse_tool_call({"tool": "stocks", "symbols": "INFY, WIPRO"})
         assert isinstance(tc, StocksTool)
-        assert "INFY" in tc.symbols
+        assert "INFY.NS" in tc.symbols  # .NS auto-appended for NSE
         assert "WIPRO" in tc.symbols
 
     def test_stocks_empty_symbols(self):
