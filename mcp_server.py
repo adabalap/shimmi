@@ -59,8 +59,26 @@ try:
 except ImportError:
     pass
 
-logger = logging.getLogger("mcp_server")
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s mcp:%(message)s")
+# ── Logging — aligned with bot log format for consistent grep/analysis ──────
+# Format: "TIMESTAMP LEVEL  logger_name         message"
+# Matches shimmi-bot.log: "%(asctime)s %(levelname)-8s %(name)-18s %(message)s"
+# This lets grep/jq work consistently across both logs.
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)-8s %(name)-18s %(message)s",
+    force=True,
+)
+# Silence noisy uvicorn access log — keep errors/lifecycle
+logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+# Sub-loggers per domain — use mcp.<domain> so grep patterns are consistent
+logger         = logging.getLogger("mcp")          # general / startup
+logger_news    = logging.getLogger("mcp.news")
+logger_stocks  = logging.getLogger("mcp.stocks")
+logger_weather = logging.getLogger("mcp.weather")
+logger_fetch   = logging.getLogger("mcp.fetch")
 
 app = FastAPI(title="Shimmi MCP Server", version="3.0.0")
 
@@ -118,7 +136,7 @@ async def _startup():
             "yf.session  curl_cffi not installed — Yahoo Finance may rate-limit. "
             "Fix: pip install curl-cffi  (yfinance uses it automatically)"
         )
-    logger.info("🚀 MCP server v3.16.2 ready on :7000")
+    logger.info("🚀 MCP server v3.16.4 ready on :7000")
 
 @app.on_event("shutdown")
 async def _shutdown():

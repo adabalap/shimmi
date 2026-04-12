@@ -1,5 +1,5 @@
 """
-main.py — Shimmi v3.16.2
+main.py — Shimmi v3.16.4
 
 Changes vs v3.8.0:
   FIX-TYPING  Reverted to exact original single-keepalive pattern (process_message only).
@@ -535,26 +535,78 @@ async def process_message(
                     )
 
             # ── 3. build context ────────────────────────────────────────────
-            # ChromaDB can spike to 18+ seconds under write pressure.
-            # Wrap with a 3s timeout and fall back to empty context if it spikes.
-            # Evidence: v3.16.1 log — context_build 18581ms → total 23320ms.
+            # Two-tier context strategy:
+            #
+            # DM chat: standard — recent window + semantic search, up to 20 items.
+            #
+            # Group chat: curated — group messages have a lot of noise ("ok",
+            #   "thanks", "seen"). We apply two tiers:
+            #   Tier 1: bot↔this-user exchanges in this group (direction filter)
+            #           These are the user's personal bot interactions — always include.
+            #   Tier 2: semantically relevant group messages, filtered for quality:
+            #           - length > 20 chars (excludes "ok", "sure", "👍")
+            #           - semantic distance < 0.7 (genuinely relevant, not noise)
+            #   Total: up to 20 items, tier 1 prioritised.
+            #
+            # ChromaDB timeout: fall back to empty context if >3s (write pressure).
             context_items: List[Dict[str, Any]] = []
+            _is_group_ctx = chat_id.endswith("@g.us") if chat_id else False
+
             with trace.step("context_build"):
                 if database.chroma_store:
                     try:
                         async def _build_chroma_context():
-                            rel = await database.chroma_store.search(
-                                chat_id=chat_id, query=user_text, k=settings.chroma_top_k,
-                            )
-                            rec = await database.chroma_store.recent_window(
-                                chat_id=chat_id, k=settings.chroma_recent_k,
-                            )
-                            merged = {c.id: c for c in (rel + rec)}
-                            return [
-                                {"id": c.id, "text": c.text, "metadata": c.metadata,
-                                 "distance": c.distance}
-                                for c in list(merged.values())[:20]
-                            ]
+                            if not _is_group_ctx:
+                                # DM: standard strategy
+                                rel = await database.chroma_store.search(
+                                    chat_id=chat_id, query=user_text,
+                                    k=settings.chroma_top_k,
+                                )
+                                rec = await database.chroma_store.recent_window(
+                                    chat_id=chat_id, k=settings.chroma_recent_k,
+                                )
+                                merged = {c.id: c for c in (rel + rec)}
+                                return [
+                                    {"id": c.id, "text": c.text,
+                                     "metadata": c.metadata, "distance": c.distance}
+                                    for c in list(merged.values())[:20]
+                                ]
+                            else:
+                                # Group: two-tier curated strategy
+                                # Tier 1: bot↔this-user exchanges (no noise filter needed)
+                                all_items = await database.chroma_store.recent_window(
+                                    chat_id=chat_id, k=60,  # fetch more to filter down
+                                )
+                                bot_id = BOT_IDENTITY  # the bot's own whatsapp_id
+                                tier1 = [
+                                    c for c in all_items
+                                    if (
+                                        c.metadata.get("whatsapp_id") == sender_key
+                                        or c.metadata.get("direction") == "out"
+                                    )
+                                ][:10]
+
+                                # Tier 2: semantically relevant group messages, quality filtered
+                                sem = await database.chroma_store.search(
+                                    chat_id=chat_id, query=user_text,
+                                    k=settings.chroma_top_k,
+                                )
+                                tier1_ids = {c.id for c in tier1}
+                                tier2 = [
+                                    c for c in sem
+                                    if c.id not in tier1_ids
+                                    and len(c.text.strip()) > 20   # exclude "ok", "thanks", "👍"
+                                    and (c.distance is None or c.distance < 0.75)
+                                ][:10]
+
+                                merged = {c.id: c for c in (tier1 + tier2)}
+                                return [
+                                    {"id": c.id, "text": c.text,
+                                     "metadata": c.metadata,
+                                     "distance": getattr(c, "distance", None)}
+                                    for c in list(merged.values())[:20]
+                                ]
+
                         context_items = await asyncio.wait_for(
                             _build_chroma_context(),
                             timeout=float(os.getenv("CHROMA_CONTEXT_TIMEOUT", "3.0")),
@@ -569,8 +621,9 @@ async def process_message(
                     except Exception as _ctx_err:
                         logger.warning("⚠️  context_build.error  err=%s", str(_ctx_err)[:80])
                         context_items = []
-                trace.tag(context_total=len(context_items))
-                logger.info("📚 context.built  total=%d", len(context_items))
+                ctx_type = "group" if _is_group_ctx else "dm"
+                trace.tag(context_total=len(context_items), context_type=ctx_type)
+                logger.info("📚 context.built  total=%d  type=%s", len(context_items), ctx_type)
 
             # ── 4. run agentic loop ─────────────────────────────────────────
             with trace.step("agent_run"):
@@ -904,12 +957,17 @@ async def webhook(request: Request):
         return JSONResponse({"status": "ok", "message": "echo ignored"})
 
     sender_key = canonical_user_key(sender_id) or sender_id or ""
-    await _ambient_store(chat_id=chat_id, sender_key=sender_key, text=text or "", event_id=event_id)
 
-    # FIX-P0-3: reject duplicate event_ids (WAHA retries same event on delivery failure)
+    # FIX: dedup check BEFORE ambient_store so duplicate webhook events
+    # (WAHA fires both "message" and "message.any" for the same message)
+    # don't cause ambient.stored to log + write to ChromaDB twice.
+    # Evidence: v3.16.1 log — ambient.stored fired twice 100ms apart for
+    # every group message.
     if event_id and _inbound_seen_check(event_id):
         logger.debug("webhook.dedup  event=%s  chat=%s  (already seen)", event_id, chat_id)
         return JSONResponse({"status": "ok", "message": "duplicate"})
+
+    await _ambient_store(chat_id=chat_id, sender_key=sender_key, text=text or "", event_id=event_id)
 
     if from_me and not settings.allow_fromme:
         logger.debug("webhook.skip  reason=fromMe  event=%s", event_id)

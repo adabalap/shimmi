@@ -1,5 +1,5 @@
 """
-agent_engine.py — Shimmi v3.16.2
+agent_engine.py — Shimmi v3.16.4
 
 Changes vs v3.3.0:
 
@@ -903,15 +903,29 @@ def _pending_delete_keys(sender_key: str) -> set:
     }
 
 
-def _check_pending_delete(sender_key: str, user_text: str) -> Optional[tuple[str, str]]:
+def _check_pending_delete(
+    sender_key: str,
+    user_text: str,
+    is_group: bool = False,
+) -> Optional[tuple[str, str]]:
     """
     Check if the user's message is confirming or cancelling a pending delete.
+
+    In group chats, requires the bot prefix before yes/no to prevent other
+    members' unrelated "yes" responses from triggering a deletion.
+    In DMs, plain yes/no is sufficient.
 
     Returns:
         ("confirm", key) — user said yes to deleting key
         ("cancel",  key) — user said no
         None             — not a pending-delete response
     """
+    # In group chats, require bot prefix so stray "yes" from other members
+    # doesn't accidentally trigger a pending delete confirmation.
+    if is_group:
+        from .utils import has_prefix
+        if not has_prefix(user_text):
+            return None
     now = time.monotonic()
     # Prune expired entries
     expired = [
@@ -2196,11 +2210,23 @@ async def run_agent(
                     confirmation matching; all DB writes in main.py use their own
                     sender_key derived from the same source.
     """
+    # ── -1. Set MCP trace ID for cross-log correlation ───────────────────
+    # Every MCP HTTP call this message triggers will carry X-Shimmi-Trace-ID.
+    # Grep one short ID across shimmi-bot.log and shimmi-mcp.log to see the
+    # full picture of a single message without timestamp matching.
+    _trace_short = (chat_id or "")[-16:].replace("@", "").replace(".", "")
+    try:
+        from .mcp_client import set_trace_id as _set_tid
+        _set_tid(_trace_short)
+    except Exception:
+        pass
+
     # ── 0. Pending-delete intercept (P1-GUARD) ────────────────────────────
     # Check if this message is a yes/no response to a queued list-delete confirmation.
     # This runs BEFORE the LLM to avoid burning tokens on a one-word confirm/cancel.
     if sender_key:
-        pending = _check_pending_delete(sender_key, user_text)
+        _is_group_chat = chat_id.endswith("@g.us") if chat_id else False
+        pending = _check_pending_delete(sender_key, user_text, is_group=_is_group_chat)
         if pending:
             action, key = pending
             if action == "confirm":
@@ -2235,8 +2261,15 @@ async def run_agent(
     # Evidence: v3.16.1 log — shopping_list delete pending at 14:17:31,
     # user asked "what's on my shopping list" at 14:17:46, bot showed OLD data.
     if sender_key:
+        _is_group_chat = chat_id.endswith("@g.us") if chat_id else False
         pending_keys = _pending_delete_keys(sender_key)
         if pending_keys and user_text:
+            # In group chats, only intercept if message has bot prefix
+            # so stray queries from other members don't get the confirm prompt
+            if _is_group_chat:
+                from .utils import has_prefix
+                if not has_prefix(user_text):
+                    pending_keys = set()  # ignore pending state for unprefixed group msgs
             low = user_text.lower()
             # Use best-score matching: find the key whose words appear most in the query.
             # This correctly distinguishes "grocery list" vs "shopping list" queries
@@ -2253,13 +2286,23 @@ async def run_agent(
                     "⏳ pending_delete.query_intercept  sender=%s  key=%s",
                     sender_key, best_key,
                 )
+                # In group chats, instruct user to use the bot prefix so
+                # other members' replies don't accidentally trigger the delete
+                if _is_group_chat:
+                    from .utils import prefixes as _get_prefixes
+                    _prefix = next(
+                        (p.lstrip("@") for p in _get_prefixes() if p),
+                        "shimmi"
+                    )
+                    confirm_hint = f"Reply *{_prefix} yes* to confirm or *{_prefix} no* to keep it."
+                else:
+                    confirm_hint = "Reply *yes* to confirm or *no* to keep it."
                 return AgentResult(
                     reply=ReplyPayload(
                         type="text",
                         text=(
                             f"⚠️ You asked me to delete your *{pk_display}* earlier. "
-                            f"Should I go ahead and clear it? Reply *yes* to confirm "
-                            f"or *no* to keep it."
+                            f"Should I go ahead and clear it? {confirm_hint}"
                         ),
                     ),
                     provider_used="pending_delete_query",

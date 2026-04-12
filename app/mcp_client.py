@@ -1,5 +1,5 @@
 """
-mcp_client.py — Shimmi v3.15.6
+mcp_client.py — Shimmi v3.16.4
 
 Changes vs v3.2.0:
   FIX-STOCKS  Per-endpoint timeouts: stocks=20s, news=10s, weather=10s (was 8s flat).
@@ -20,11 +20,19 @@ from __future__ import annotations
 
 import logging
 import os
+from contextvars import ContextVar
 from typing import Optional
 
 import httpx
 
 logger = logging.getLogger("app.mcp")
+
+# Context variable: set once per message, read by every _get() call.
+# Attaches X-Shimmi-Trace-ID to MCP requests for cross-log correlation.
+_current_trace_id: ContextVar[str] = ContextVar("shimmi_trace_id", default="")
+
+def set_trace_id(trace_id: str) -> None:
+    _current_trace_id.set(trace_id[:16] if trace_id else "")
 
 _MCP_BASE = os.getenv("MCP_SERVER_URL", "http://localhost:7000")
 _TIMEOUT  = float(os.getenv("MCP_TIMEOUT", "12"))
@@ -49,17 +57,29 @@ def _client() -> httpx.AsyncClient:
     return _CLIENT
 
 
-async def _get(path: str, timeout: Optional[float] = None, **params) -> Optional[dict]:
+async def _get(
+    path: str,
+    timeout: Optional[float] = None,
+    trace_id: Optional[str] = None,
+    **params,
+) -> Optional[dict]:
+    """
+    HTTP GET to MCP server.
+    trace_id: if provided, sent as X-Shimmi-Trace-ID header so MCP logs
+              can be correlated with bot logs by grepping one ID.
+    """
+    _tid = (trace_id or _current_trace_id.get() or "").strip()
+    headers = {"X-Shimmi-Trace-ID": _tid} if _tid else {}
     try:
         resp = await _client().get(
             path,
             params={k: v for k, v in params.items() if v is not None},
-            timeout=timeout,   # None → use client default
+            headers=headers,
+            timeout=timeout,
         )
         resp.raise_for_status()
         return resp.json()
     except Exception as exc:
-        # httpx.HTTPStatusError.str() is often empty — repr() always has context
         detail = str(exc).strip() or repr(exc)
         logger.warning(
             "mcp.error  path=%s  type=%s  err=%s",
