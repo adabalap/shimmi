@@ -2,6 +2,71 @@
 
 ---
 
+## v3.17.5 — 2026-09-03
+
+### 🟢 Features
+
+**FEAT-METRICS — `GET /metrics` (Prometheus text exposition)**
+
+Closes the long-standing roadmap item. Counters live in the new
+`app/metrics.py`; live state (workers, queue depth, circuit breakers, token
+budget) is snapshotted per scrape by `_collect_gauges()` in `app/main.py`.
+
+Stdlib only — no `prometheus_client` dependency, since the exposition format is
+a few dozen lines and this project already carries a heavy install. Output is
+verified against the official `prometheus_client` parser in development, and
+`tests/unit/test_metrics.py` covers the format, escaping, and zero-seeding.
+
+Every counter is seeded at zero on startup so dashboards show a real `0`
+instead of a gap before the first occurrence. Queue depth is exposed as a sum
+and a max rather than per-chat, and no metric is ever labelled with a chat,
+sender, or event id — those are unbounded and would blow up scrape cardinality.
+
+### 🔴 Critical Bug Fixes
+
+**FIX-DEPS — App could not start from a clean install**
+
+`app/agent_engine.py` imports `AsyncOpenAI` unconditionally at module level for
+the Gemini/Mistral OpenAI-compatible endpoints, but `openai` was absent from
+`requirements.txt` — which actively claimed "No extra SDK". A fresh
+`pip install -r requirements.txt` produced an app that died on import with
+`ModuleNotFoundError: No module named 'openai'`. Now declared.
+
+**FIX-COOLDOWN — Fact consolidation never ran for an hour after every boot**
+
+`consolidate_user_facts()` used `0.0` as its "never run" sentinel and compared
+it against `time.monotonic()`, which counts from system boot. For the first
+hour of uptime, `now - 0.0 < 3600` held for *every* user, so LLM-driven key
+deduplication was silently skipped after every restart — on a container or
+rebooted VM, after every deploy. The sentinel is now `None`.
+
+The existing `test_consolidation_cooldown_prevents_frequent_runs` had been
+failing on this all along; it now passes without being weakened.
+
+### 🟠 Test Suite
+
+**FIX-TESTS — 10 integration tests were erroring, not running**
+
+`test_memory_deletion.py` and `test_confirmation_flow.py` seeded fixtures with
+`asyncio.get_event_loop().run_until_complete(...)`, which raises
+`RuntimeError: There is no current event loop` under modern pytest-asyncio
+(and is deprecated from Python 3.10). Switched to `asyncio.run()` — the same
+migration the app code already made.
+
+Added `requirements-dev.txt` declaring `pytest` / `pytest-asyncio`, which were
+previously undeclared anywhere.
+
+Suite goes from 1 failure + 10 errors to **385 passing, 0 failures**.
+
+### 📝 Documentation
+
+- Documented `/metrics` and corrected the `/healthz` response shape in README.
+- Removed the documented `GET /status` endpoint: it does not exist in the code
+  (its content was folded into `/healthz`).
+- Documented how to run the test suite.
+
+---
+
 ## v3.17.4 — 2026-09-03
 
 > **Note:** this changelog was not kept up to date between v3.2.0 and v3.17.3

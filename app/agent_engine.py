@@ -2829,9 +2829,13 @@ async def consolidate_user_facts(whatsapp_id: str) -> None:
       2. Delete all absorbed (alias) keys that differ from canonical
     """
     # ── Cooldown gate: skip if run recently ──────────────────────────────────
+    # FIX-COOLDOWN: "never run" must be None, not 0.0. time.monotonic() counts
+    # from boot, so a 0.0 default made `now - 0.0 < 3600` true for the first
+    # hour of uptime — consolidation was silently skipped for every user after
+    # every restart, which on a container or a rebooted VM is every deploy.
     now_mono = time.monotonic()
-    last_run = _CONSOLIDATION_LAST_RUN.get(whatsapp_id, 0.0)
-    if now_mono - last_run < _CONSOLIDATION_COOLDOWN_SEC:
+    last_run = _CONSOLIDATION_LAST_RUN.get(whatsapp_id)
+    if last_run is not None and now_mono - last_run < _CONSOLIDATION_COOLDOWN_SEC:
         logger.debug(
             "consolidate.skipped  sender=%s  next_in=%.0fs",
             whatsapp_id, _CONSOLIDATION_COOLDOWN_SEC - (now_mono - last_run),

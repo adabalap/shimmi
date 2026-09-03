@@ -1,5 +1,14 @@
 """
-main.py — Shimmi v3.17.4
+main.py — Shimmi v3.17.5
+
+Changes vs v3.17.4:
+  FEAT-METRICS  GET /metrics — Prometheus text exposition (roadmap item).
+                Counters live in app/metrics.py (stdlib only, no new
+                dependency); live state (workers, queue depth, circuit
+                breakers, token budget) is collected per-scrape by
+                _collect_gauges(). Queue depth is exposed as sum + max rather
+                than per-chat: chat_id is unbounded and would blow up scrape
+                cardinality.
 
 Changes vs v3.17.3:
   FIX-DEBOUNCE  CHAT_LAST_MSG_TS was keyed by chat_id alone and re-armed on
@@ -47,8 +56,9 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 
+from . import metrics
 from .logging_setup import setup_logging
 from .config import settings
 from .utils import (
@@ -73,7 +83,7 @@ from .scheduler import run_reminder_loop
 setup_logging()
 logger = logging.getLogger("app")
 UTC    = timezone.utc
-APP_VERSION = "3.17.4"
+APP_VERSION = "3.17.5"
 
 CHAT_QUEUES:      Dict[str, asyncio.Queue] = {}
 CHAT_WORKERS:     Dict[str, asyncio.Task]  = {}
@@ -694,6 +704,7 @@ async def process_message(
                             "⚡ rate_limit.user_reply  chat=%s  err=%s",
                             chat_id, exc_str[:200],
                         )
+                        metrics.inc("shimmi_rate_limit_replies_total")
                         try:
                             await send_text(chat_id, friendly)
                         except Exception:
@@ -751,6 +762,7 @@ async def process_message(
                                         "🗑️  memory.deleted  sender=%s  key=%s  confirmed=%s",
                                         sender_key, mu.key, confirmed,
                                     )
+                                    metrics.inc("shimmi_memory_facts_total", op="deleted")
                                     saved += 1
 
                                 elif outcome == DeleteOutcome.NEEDS_CONFIRM:
@@ -794,6 +806,7 @@ async def process_message(
                                 if status == "created":
                                     created += 1
                                     saved += 1
+                                    metrics.inc("shimmi_memory_facts_total", op="created")
                                     logger.info(
                                         "🧠 memory.new      sender=%s  key=%s  value=%r",
                                         sender_key, mu.key, mu.value,
@@ -801,12 +814,14 @@ async def process_message(
                                 elif status == "updated":
                                     updated += 1
                                     saved += 1
+                                    metrics.inc("shimmi_memory_facts_total", op="updated")
                                     logger.info(
                                         "🧠 memory.updated  sender=%s  key=%s  value=%r",
                                         sender_key, mu.key, mu.value,
                                     )
                                 else:  # "unchanged"
                                     unchanged += 1
+                                    metrics.inc("shimmi_memory_facts_total", op="unchanged")
                         except Exception as exc:
                             err_msg = f"{type(exc).__name__}: {exc}"
                             save_errors.append(f"{mu.key}: {err_msg}")
@@ -845,6 +860,8 @@ async def process_message(
                 from .waha_provider import _extract_msg_id
                 msg_id   = _extract_msg_id(send_res)
                 trace.tag(sent=bool(send_res), msg_id=msg_id[:40] if msg_id else "")
+                if send_res:
+                    metrics.inc("shimmi_replies_sent_total")
                 logger.info(
                     "📤 msg.sent  chat=%s  msg_id=%s  len=%d",
                     chat_id,
@@ -889,7 +906,9 @@ async def _chat_worker(chat_id: str, q: asyncio.Queue) -> None:
                     event_id=item["event_id"],
                     from_me=item["from_me"],
                 )
+                metrics.inc("shimmi_messages_processed_total", outcome="ok")
             except Exception:
+                metrics.inc("shimmi_messages_processed_total", outcome="error")
                 # FIX-7b: process_message only sends a user-facing reply for
                 # rate-limit failures (handled internally). Any other unhandled
                 # exception here — a DB error, a WAHA outage, a bug — previously
@@ -988,27 +1007,33 @@ async def webhook(request: Request):
     )
     if not verify_signature(raw, sig):
         logger.warning("webhook.auth_fail  ip=%s", request.client.host if request.client else "?")
+        metrics.inc("shimmi_webhook_auth_failures_total")
         return JSONResponse({"status": "error", "message": "Invalid signature"}, status_code=401)
 
     try:
         body = await request.json()
     except Exception:
+        metrics.inc("shimmi_webhook_invalid_payload_total")
         return JSONResponse({"status": "error", "message": "Invalid JSON"}, status_code=400)
 
     sender_id, chat_id, text, from_me, event_id = normalize_event(body)
+    metrics.inc("shimmi_messages_received_total")
 
     if not chat_is_allowed(chat_id):
         logger.debug("webhook.skip  reason=allowlist  chat=%s", chat_id)
+        metrics.inc("shimmi_messages_skipped_total", reason="allowlist")
         return JSONResponse({"status": "ok", "message": "chat not allowed"})
 
     if not (text or "").strip():
         logger.debug("webhook.skip  reason=empty  event=%s", event_id)
+        metrics.inc("shimmi_messages_skipped_total", reason="empty")
         return JSONResponse({"status": "ok", "message": "empty"})
 
     _purge_outbound_caches()
 
     if chat_id and _is_echo(chat_id, canonical_text(text or ""), event_id):
         logger.debug("webhook.skip  reason=echo  event=%s", event_id)
+        metrics.inc("shimmi_messages_skipped_total", reason="echo")
         return JSONResponse({"status": "ok", "message": "echo ignored"})
 
     sender_key = canonical_user_key(sender_id) or sender_id or ""
@@ -1020,16 +1045,19 @@ async def webhook(request: Request):
     # every group message.
     if event_id and _inbound_seen_check(event_id):
         logger.debug("webhook.dedup  event=%s  chat=%s  (already seen)", event_id, chat_id)
+        metrics.inc("shimmi_messages_skipped_total", reason="duplicate")
         return JSONResponse({"status": "ok", "message": "duplicate"})
 
     await _ambient_store(chat_id=chat_id, sender_key=sender_key, text=text or "", event_id=event_id)
 
     if from_me and not settings.allow_fromme:
         logger.debug("webhook.skip  reason=fromMe  event=%s", event_id)
+        metrics.inc("shimmi_messages_skipped_total", reason="from_me")
         return JSONResponse({"status": "ok", "message": "fromMe ignored"})
 
     if (not settings.allow_nlp_without_prefix) and not has_prefix(text):
         logger.debug("webhook.skip  reason=no_prefix  event=%s", event_id)
+        metrics.inc("shimmi_messages_skipped_total", reason="no_prefix")
         return JSONResponse({"status": "ok", "message": "no prefix"})
 
     debounce_key = (chat_id, sender_key)
@@ -1037,6 +1065,7 @@ async def webhook(request: Request):
     nowp = time.perf_counter()
     if (nowp - last) * 1000.0 < settings.message_debounce_ms:
         logger.debug("webhook.skip  reason=debounced  event=%s", event_id)
+        metrics.inc("shimmi_messages_skipped_total", reason="debounced")
         return JSONResponse({"status": "ok", "message": "debounced"})
     # Only advance the timestamp on acceptance — advancing it on every check
     # (even a debounced one) turns this into a sliding window that can
@@ -1058,8 +1087,10 @@ async def webhook(request: Request):
     except asyncio.TimeoutError:
         await send_text(chat_id, "I'm busy right now — try again in a moment.")
         logger.warning("⏳ queue.timeout  chat=%s  event=%s", chat_id, event_id)
+        metrics.inc("shimmi_messages_dropped_total", reason="queue_timeout")
         return JSONResponse({"status": "ok", "message": "queue timeout"})
 
+    metrics.inc("shimmi_messages_enqueued_total")
     logger.info(
         "✅ webhook.enqueued  event=%s  chat=%s  depth=%d",
         event_id, chat_id, q.qsize(),
@@ -1111,5 +1142,103 @@ async def health():
         "model_circuits":    model_circuits,
         "provider_circuits": provider_circuits,
         "token_budget":      budget,
-        "reminder_task":     _REMINDER_TASK is not None and not (_REMINDER_TASK.done() if _REMINDER_TASK else True),
+        "reminder_task":     _reminder_task_up(),
     }
+
+
+# ---------------------------------------------------------------------------
+# Metrics (Prometheus text exposition)
+# ---------------------------------------------------------------------------
+
+def _reminder_task_up() -> bool:
+    """True when the background reminder scheduler task is alive."""
+    return _REMINDER_TASK is not None and not _REMINDER_TASK.done()
+
+
+def _collect_gauges() -> List[metrics.MetricFamily]:
+    """
+    Snapshot live process state as Prometheus gauges at scrape time.
+
+    Deliberately aggregate: queue depth is exposed as a sum and a max rather
+    than per-chat, because chat_id is unbounded and would blow up scrape
+    cardinality. Model/provider names are bounded by config, so they are safe
+    to use as labels.
+    """
+    from .agent_engine import _budget_fraction
+
+    now        = time.monotonic()
+    queue_sizes = [q.qsize() for q in CHAT_QUEUES.values()]
+
+    return [
+        metrics.MetricFamily(
+            "shimmi_build_info",
+            "Build metadata; always 1, the version rides on the label.",
+            "gauge",
+            [({"version": APP_VERSION}, 1)],
+        ),
+        metrics.MetricFamily(
+            "shimmi_active_workers",
+            "Per-chat worker tasks currently alive.",
+            "gauge",
+            [({}, len(CHAT_WORKERS))],
+        ),
+        metrics.MetricFamily(
+            "shimmi_queue_depth_total",
+            "Messages queued across all per-chat workers.",
+            "gauge",
+            [({}, sum(queue_sizes))],
+        ),
+        metrics.MetricFamily(
+            "shimmi_queue_depth_max",
+            "Deepest single per-chat queue — the one closest to backpressure.",
+            "gauge",
+            [({}, max(queue_sizes) if queue_sizes else 0)],
+        ),
+        metrics.MetricFamily(
+            "shimmi_model_circuit_tripped",
+            "1 when a model's circuit breaker is tripped, 0 when it is open.",
+            "gauge",
+            [({"model": m}, 1 if now < ts else 0) for m, ts in sorted(MODEL_CIRCUIT.items())],
+        ),
+        metrics.MetricFamily(
+            "shimmi_provider_circuit_tripped",
+            "1 when a provider's circuit breaker is tripped, 0 when it is open.",
+            "gauge",
+            [({"provider": p}, 1 if now < ts else 0) for p, ts in sorted(PROVIDER_CIRCUIT.items())],
+        ),
+        metrics.MetricFamily(
+            "shimmi_provider_circuit_cooldown_seconds",
+            "Seconds until a tripped provider circuit reopens (0 when open).",
+            "gauge",
+            [
+                ({"provider": p}, max(0.0, ts - now))
+                for p, ts in sorted(PROVIDER_CIRCUIT.items())
+            ],
+        ),
+        metrics.MetricFamily(
+            "shimmi_token_budget_fraction",
+            "Fraction of the provider's daily token budget consumed (1.0 = exhausted).",
+            "gauge",
+            [
+                ({"provider": "groq_70b"},
+                 _budget_fraction("groq_70b", settings.groq_70b_daily_limit)),
+                ({"provider": "groq_8b"},
+                 _budget_fraction("groq_8b", 500_000)),
+            ],
+        ),
+        metrics.MetricFamily(
+            "shimmi_reminder_task_up",
+            "1 when the background reminder scheduler task is alive.",
+            "gauge",
+            [({}, 1 if _reminder_task_up() else 0)],
+        ),
+    ]
+
+
+@app.get("/metrics")
+async def prometheus_metrics() -> Response:
+    """Prometheus scrape endpoint (roadmap item)."""
+    return Response(
+        content=metrics.render(_collect_gauges()),
+        media_type=metrics.CONTENT_TYPE,
+    )

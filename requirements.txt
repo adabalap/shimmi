@@ -16,8 +16,11 @@ python-multipart>=0.0.12
 
 # LLM providers
 groq>=0.12.0                  # Groq async client (primary)
-# Google Gemini uses the OpenAI-compatible REST endpoint via httpx.
-# No extra SDK — just set GEMINI_API_KEY in .env.
+# Gemini and Mistral are reached through their OpenAI-compatible endpoints.
+# agent_engine.py imports AsyncOpenAI unconditionally at module level, so this
+# is required for the app to start at all — not optional, despite only being
+# used when GEMINI_API_KEY / MISTRAL_API_KEY are set.
+openai>=1.40.0
 
 # HTTP
 httpx>=0.27.0,<1.0            # MCP client + Gemini REST calls

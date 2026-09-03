@@ -40,7 +40,11 @@ CHAT_ID  = "919876543210@s.whatsapp.net"   # DM — no prefix required for yes/n
 @pytest.fixture
 def db_with_list(tmp_db):
     """SQLiteMemory with shopping_list pre-seeded."""
-    asyncio.get_event_loop().run_until_complete(
+    # asyncio.run() rather than get_event_loop().run_until_complete(): there is
+    # no current loop in a sync fixture under modern pytest-asyncio, and
+    # get_event_loop() no longer creates one (deprecated in 3.10, raises here).
+    # Same migration the app code already made.
+    asyncio.run(
         tmp_db.upsert_fact(SENDER, "shopping_list", "milk, bread, eggs")
     )
     return tmp_db

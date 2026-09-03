@@ -1,0 +1,13 @@
+# Shimmi — test/development requirements.
+#
+# The test suite needs these; the app itself does not. Install alongside the
+# runtime requirements:
+#   pip install -r requirements.txt -r requirements-dev.txt
+#
+# Then run the offline suite (no network, no LLM quota):
+#   pytest
+
+-r requirements.txt
+
+pytest>=8.0
+pytest-asyncio>=0.23         # pytest.ini sets asyncio_mode = auto

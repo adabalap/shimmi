@@ -195,6 +195,16 @@ cp .env.example .env
 python -m uvicorn app.main:app --host 0.0.0.0 --port 6000
 ```
 
+### Running the tests
+
+Test-only dependencies live in `requirements-dev.txt` (which includes the
+runtime ones):
+
+```bash
+pip install -r requirements-dev.txt
+pytest                # offline suite — no network, no LLM quota
+```
+
 ### systemd (production)
 
 ```bash
@@ -306,17 +316,73 @@ Incoming message
 
 ### Health & Status Endpoints
 
-```
-GET /healthz   → { "status": "ok" }
+The app serves three routes: `POST /webhook`, `GET /healthz`, and `GET /metrics`.
+(Earlier revisions of this README documented a `GET /status` endpoint — it does
+not exist; its content was folded into `/healthz`.)
 
-GET /status    → {
-  "active_workers": 2,
-  "workers": { "<chat_id>": { "queue_depth": 0, "task_done": false } },
-  "open_circuits": { "llama-3.1-8b-instant": 8.3 },   // seconds remaining
-  "sqlite_enabled": true,
-  "chroma_enabled": true,
-  "allowlist_count": 8
+```
+GET /healthz   → {
+  "status":  "ok",
+  "version": "3.17.5",
+  "workers": 2,
+  "queues":  { "<chat_id>": 0 },
+  "providers": {
+    "gemini": { "enabled": true, "orchestrator": "...", "extraction": "..." },
+    "groq":   { "orchestrator": "...", "extraction": "...", "pool": [...] }
+  },
+  "live_search":       true,
+  "chroma":            true,
+  "model_circuits":    { "llama-3.1-8b-instant": "tripped (8s remaining)" },
+  "provider_circuits": { "groq_70b": "open" },
+  "token_budget":      { "groq_70b": "12.4% of 100,000/day", "groq_8b": "…" },
+  "reminder_task":     true
 }
+```
+
+### Prometheus Metrics
+
+```
+GET /metrics   → text/plain; version=0.0.4
+```
+
+Counters live in `app/metrics.py` (stdlib only — no `prometheus_client`
+dependency); live state is snapshotted per scrape. Every counter is seeded at
+zero on startup, so a dashboard shows a real `0` rather than a gap before the
+first occurrence.
+
+| Metric | Type | Labels |
+|---|---|---|
+| `shimmi_messages_received_total` | counter | — |
+| `shimmi_messages_skipped_total` | counter | `reason` (allowlist, empty, echo, duplicate, from_me, no_prefix, debounced) |
+| `shimmi_messages_enqueued_total` | counter | — |
+| `shimmi_messages_dropped_total` | counter | `reason` (queue_timeout) |
+| `shimmi_messages_processed_total` | counter | `outcome` (ok, error) |
+| `shimmi_replies_sent_total` | counter | — |
+| `shimmi_rate_limit_replies_total` | counter | — |
+| `shimmi_memory_facts_total` | counter | `op` (created, updated, unchanged, deleted) |
+| `shimmi_reminders_total` | counter | `outcome` (sent, retry, failed, stale, bad_trigger) |
+| `shimmi_webhook_auth_failures_total` | counter | — |
+| `shimmi_webhook_invalid_payload_total` | counter | — |
+| `shimmi_active_workers` | gauge | — |
+| `shimmi_queue_depth_total` / `_max` | gauge | — |
+| `shimmi_model_circuit_tripped` | gauge | `model` |
+| `shimmi_provider_circuit_tripped` | gauge | `provider` |
+| `shimmi_provider_circuit_cooldown_seconds` | gauge | `provider` |
+| `shimmi_token_budget_fraction` | gauge | `provider` |
+| `shimmi_reminder_task_up` | gauge | — |
+| `shimmi_build_info` | gauge | `version` |
+
+Queue depth is deliberately exposed as a sum and a max rather than per-chat:
+`chat_id` is unbounded and would blow up scrape cardinality. For the same
+reason no metric is ever labelled with a chat, sender, or event id.
+
+Example scrape config:
+
+```yaml
+scrape_configs:
+  - job_name: shimmi
+    static_configs:
+      - targets: ["<shimmi-host>:6000"]
 ```
 
 ### Structured Logging
@@ -432,6 +498,26 @@ any unhandled exception.
 `GET /healthz` reported a hardcoded `"3.3.0"` unrelated to the code actually
 running. Added `APP_VERSION` in `app/main.py` as the single source of truth.
 
+#### 🔴 FIXED IN v3.17.5 — App Could Not Start From A Clean Install
+
+`app/agent_engine.py` imports `AsyncOpenAI` unconditionally at module level
+(the Gemini/Mistral OpenAI-compatible endpoints), but `openai` was missing from
+`requirements.txt` — which actively stated "No extra SDK". A fresh
+`pip install -r requirements.txt` therefore produced an app that died on import
+with `ModuleNotFoundError: No module named 'openai'`. Added to requirements.
+
+#### 🔴 FIXED IN v3.17.5 — Fact Consolidation Never Ran For An Hour After Boot
+
+**Location:** `app/agent_engine.py` `consolidate_user_facts()`
+
+The cooldown gate used `0.0` as the "never run" sentinel and compared it
+against `time.monotonic()`, which counts from system boot. For the first hour
+of uptime `now - 0.0 < 3600` was true for *every* user, so LLM-driven key
+deduplication was silently skipped after every restart — on a container or a
+rebooted VM, after every deploy. `None` is now the sentinel. The existing test
+`test_consolidation_cooldown_prevents_frequent_runs` had been failing on this
+the whole time; it passes now without being weakened.
+
 ---
 
 #### 🟡 MEDIUM — Groq Daily Token Limit (100K TPD on Free Tier)
@@ -483,7 +569,7 @@ Installing `sentence-transformers` pulls in PyTorch (~2GB on CPU). On memory-con
 - [x] Re-add proactive reminder scheduler
 - [x] Memory deletion support (`delete_fact` / `delete_facts_batch` + confirmation flow)
 - [x] User-facing error message on total LLM failure (rate-limit path; v3.17.4 closed the remaining gap for other failure types)
-- [ ] `/metrics` endpoint (Prometheus-compatible)
+- [x] `/metrics` endpoint (Prometheus-compatible)
 - [ ] Multi-language support (currently Telugu prefixes already supported)
 - [ ] Group chat support (two-tier context strategy already implemented — see `app/main.py` `context_build`; needs broader real-world testing)
 - [ ] Voice message transcription (Groq Whisper)

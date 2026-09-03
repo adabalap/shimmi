@@ -119,7 +119,7 @@ async def run_reminder_loop(check_interval_sec: int = 60) -> None:
 
 
 async def _fire_due_reminders() -> None:
-    from . import database
+    from . import database, metrics
     from .waha_provider import send_text
 
     if not database.sqlite_store:
@@ -138,6 +138,7 @@ async def _fire_due_reminders() -> None:
         trigger_dt = _parse_iso(r.trigger_iso)
         if trigger_dt is None:
             logger.warning("scheduler.bad_trigger  id=%d  iso=%r", r.id, r.trigger_iso)
+            metrics.inc("shimmi_reminders_total", outcome="bad_trigger")
             await database.sqlite_store.mark_reminder_failed(r.id)
             continue
 
@@ -147,6 +148,7 @@ async def _fire_due_reminders() -> None:
                 "scheduler.stale  id=%d  trigger=%s  (>%dh overdue — dropped)",
                 r.id, r.trigger_iso[:16], _MAX_OVERDUE_HOURS,
             )
+            metrics.inc("shimmi_reminders_total", outcome="stale")
             await database.sqlite_store.mark_reminder_failed(r.id)
             continue
 
@@ -174,6 +176,7 @@ async def _fire_due_reminders() -> None:
         try:
             await send_text(r.chat_id, msg)
             await database.sqlite_store.mark_reminder_sent(r.id)
+            metrics.inc("shimmi_reminders_total", outcome="sent")
             logger.info(
                 "🔔 reminder.sent  id=%d  chat=%s  text=%.60s",
                 r.id, r.chat_id, r.reminder_text,
@@ -193,6 +196,7 @@ async def _fire_due_reminders() -> None:
             _MAX_RETRIES = 3
             if retry_count >= _MAX_RETRIES:
                 await database.sqlite_store.mark_reminder_failed(r.id)
+                metrics.inc("shimmi_reminders_total", outcome="failed")
                 logger.warning(
                     "🔔 reminder.failed_permanent  id=%d  chat=%s  retries=%d  err=%s",
                     r.id, r.chat_id, retry_count, str(exc)[:120],
@@ -202,6 +206,7 @@ async def _fire_due_reminders() -> None:
                 backoff_sec = 30 * (2 ** retry_count)
                 next_retry = (datetime.now(UTC) + timedelta(seconds=backoff_sec)).isoformat()
                 await database.sqlite_store.mark_reminder_retry(r.id, next_retry)
+                metrics.inc("shimmi_reminders_total", outcome="retry")
                 logger.warning(
                     "🔔 reminder.retry_scheduled  id=%d  attempt=%d/%d  "
                     "next_retry_in=%ds  err=%s",
