@@ -2,6 +2,43 @@
 
 ---
 
+## v3.17.4 — 2026-09-03
+
+> **Note:** this changelog was not kept up to date between v3.2.0 and v3.17.3
+> (the code advanced through ~15 versions — see each module's own header
+> comment for its version, e.g. `app/agent_engine.py`, `app/main.py` — without
+> a matching entry here). This entry resumes changelog tracking; the gap
+> itself was not reconstructed since the intermediate change history wasn't
+> available to fill in accurately.
+
+### 🟠 Bugs Fixed
+
+**FIX-DEBOUNCE — Chat-wide debounce could silently starve busy chats**
+
+`CHAT_LAST_MSG_TS` (`app/main.py`) was keyed by `chat_id` alone and the
+timestamp was advanced on *every* check, including a debounced one. In a
+group chat busier than `MESSAGE_DEBOUNCE_MS` (or any chat with
+`ALLOW_NLP_WITHOUT_PREFIX=1`), this degenerated into a sliding window that
+could suppress every message indefinitely — not just genuine duplicate
+resends. Now keyed by `(chat_id, sender_key)` and only advanced when a
+message is actually accepted.
+
+**FIX-7b — Non-rate-limit worker errors left the user with total silence**
+
+`process_message` only sends a user-facing reply when the failure is a
+rate-limit (handled internally); any other unhandled exception (a DB error,
+a WAHA outage, a bug) was caught in `_chat_worker`, logged, and otherwise
+silently dropped — no reply at all. The worker now sends a best-effort
+"something went wrong" message on any unhandled exception.
+
+**FIX-VERSION — `/healthz` reported a stale hardcoded version**
+
+`GET /healthz` returned `"version": "3.3.0"` regardless of the code actually
+running (every module header was already at v3.17.x). Added `APP_VERSION` in
+`app/main.py` as the single source of truth for the reported version.
+
+---
+
 ## v3.2.0 — 2026-03-15
 
 ### 🔴 Critical Bug Fix

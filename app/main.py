@@ -1,5 +1,21 @@
 """
-main.py — Shimmi v3.17.3
+main.py — Shimmi v3.17.4
+
+Changes vs v3.17.3:
+  FIX-DEBOUNCE  CHAT_LAST_MSG_TS was keyed by chat_id alone and re-armed on
+                every check (including a debounced one). In a busy group chat
+                (or with ALLOW_NLP_WITHOUT_PREFIX=1) this degraded into a
+                sliding window that could suppress every message once traffic
+                ran faster than MESSAGE_DEBOUNCE_MS apart. Now keyed by
+                (chat_id, sender_key) and only advanced on acceptance.
+  FIX-7b        _chat_worker swallowed any exception from process_message that
+                wasn't a rate-limit (already handled inside process_message)
+                with no reply to the user at all — a DB error or WAHA outage
+                left the chat silent. Worker now sends a best-effort "something
+                went wrong" reply on any unhandled exception.
+  FIX-VERSION   /healthz reported a hardcoded "3.3.0" unrelated to the actual
+                running version. Added APP_VERSION as the single source of
+                truth, read from /healthz.
 
 Changes vs v3.8.0:
   FIX-TYPING  Reverted to exact original single-keepalive pattern (process_message only).
@@ -57,10 +73,14 @@ from .scheduler import run_reminder_loop
 setup_logging()
 logger = logging.getLogger("app")
 UTC    = timezone.utc
+APP_VERSION = "3.17.4"
 
 CHAT_QUEUES:      Dict[str, asyncio.Queue] = {}
 CHAT_WORKERS:     Dict[str, asyncio.Task]  = {}
-CHAT_LAST_MSG_TS: Dict[str, float]          = {}
+# BUG-DEBOUNCE fix: keyed by (chat_id, sender_key), not chat_id alone — a
+# chat-wide key meant that in a busy group chat, messages from different
+# senders arriving <MESSAGE_DEBOUNCE_MS apart would suppress each other.
+CHAT_LAST_MSG_TS: Dict[Tuple[str, str], float] = {}
 _WORKER_IDLE_TIMEOUT_SEC: float = 3_600.0
 BOT_IDENTITY = "shimmi-bot"
 _REMINDER_TASK: Optional[asyncio.Task] = None
@@ -870,7 +890,19 @@ async def _chat_worker(chat_id: str, q: asyncio.Queue) -> None:
                     from_me=item["from_me"],
                 )
             except Exception:
+                # FIX-7b: process_message only sends a user-facing reply for
+                # rate-limit failures (handled internally). Any other unhandled
+                # exception here — a DB error, a WAHA outage, a bug — previously
+                # left the user with total silence and no indication anything
+                # went wrong. Best-effort notify, never let this raise further.
                 logger.exception("worker.msg_error  chat=%s", chat_id)
+                try:
+                    await send_text(
+                        chat_id,
+                        "⚠️ Something went wrong on my end — please try again in a moment.",
+                    )
+                except Exception:
+                    logger.exception("worker.msg_error.notify_failed  chat=%s", chat_id)
             finally:
                 q.task_done()
     except asyncio.CancelledError:
@@ -1000,12 +1032,16 @@ async def webhook(request: Request):
         logger.debug("webhook.skip  reason=no_prefix  event=%s", event_id)
         return JSONResponse({"status": "ok", "message": "no prefix"})
 
-    last = CHAT_LAST_MSG_TS.get(chat_id, 0.0)
+    debounce_key = (chat_id, sender_key)
+    last = CHAT_LAST_MSG_TS.get(debounce_key, 0.0)
     nowp = time.perf_counter()
-    CHAT_LAST_MSG_TS[chat_id] = nowp
     if (nowp - last) * 1000.0 < settings.message_debounce_ms:
         logger.debug("webhook.skip  reason=debounced  event=%s", event_id)
         return JSONResponse({"status": "ok", "message": "debounced"})
+    # Only advance the timestamp on acceptance — advancing it on every check
+    # (even a debounced one) turns this into a sliding window that can
+    # suppress every message in a chat busier than the debounce interval.
+    CHAT_LAST_MSG_TS[debounce_key] = nowp
 
     q      = CHAT_QUEUES.get(chat_id)
     worker = CHAT_WORKERS.get(chat_id)
@@ -1055,7 +1091,7 @@ async def health():
     }
     return {
         "status":            "ok",
-        "version":           "3.3.0",
+        "version":           APP_VERSION,
         "workers":           len(CHAT_WORKERS),
         "queues":            {cid: q.qsize() for cid, q in CHAT_QUEUES.items()},
         "providers": {

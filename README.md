@@ -378,105 +378,59 @@ All 13 bugs observed in the prior production log have been resolved in v3.0.0:
 
 ---
 
-### Remaining Issues in v3.0.0 *(open — PRs welcome)*
+### Remaining Issues *(open — PRs welcome)*
 
-#### 🔴 HIGH — Memory Deletion Not Supported
+> ⚠️ This section previously described v3.0.0. The code has since moved on to
+> v3.17.4 (`CHANGELOG.md`) without this section being refreshed, so it was
+> understating three items as unimplemented that had actually been built
+> (memory deletion, the reminder scheduler, and `asyncio.get_running_loop()`)
+> and was missing three real, currently-open bugs. Corrected below.
 
-**Location:** `app/database.py` `upsert_fact()` · `app/agent_engine.py` `MemoryUpdate`
+#### ✅ RESOLVED — Memory Deletion
 
-When a user says *"Delete my shopping list"* the agent acknowledges it, but the fact is never removed because:
-1. `MemoryUpdate.value` has `min_length=1` — the LLM cannot express a deletion intent
-2. `upsert_fact()` silently no-ops if `value` is empty
-3. There is no `delete_fact()` method
+Implemented: `delete_fact()` / `delete_facts_batch()` in `app/database.py`,
+with a `DeleteOutcome` enum (`DELETED` / `NEEDS_CONFIRM` / `NOT_FOUND` /
+`BLOCKED` / `EMPTY_KEY`) and a confirmation flow for high-stakes keys
+(shopping/grocery/todo lists) handled in `app/main.py`'s `memory_save` step.
 
-**Recommended fix:**
+#### ✅ RESOLVED — Proactive Reminder Delivery
 
-```python
-# agent_engine.py — extend MemoryUpdate
-class MemoryUpdate(BaseModel):
-    key: str = Field(..., min_length=1)
-    value: Optional[str] = None          # None signals deletion
-    op: Literal["upsert", "delete"] = "upsert"
+Implemented in `app/scheduler.py`: a 60s asyncio poll loop
+(`run_reminder_loop`) with a `reminders` table, missed-reminder handling
+(dropped if >2h overdue), and retry with exponential backoff (30s/60s/120s,
+max 3 attempts) on send failure. Note this is a hand-rolled asyncio loop, not
+APScheduler — the Tech Stack table below has been corrected to match.
 
-# database.py — add delete method
-async def delete_fact(self, whatsapp_id: str, key: str) -> str:
-    async with self._write_lock:
-        def _do() -> str:
-            with sqlite3.connect(self.path, check_same_thread=False) as conn:
-                conn.execute(
-                    "DELETE FROM user_memory WHERE whatsapp_id=? AND fact_key=?",
-                    (whatsapp_id, key),
-                )
-                conn.commit()
-                return "deleted"
-        return await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _do)
-```
+#### ✅ RESOLVED — `asyncio.get_event_loop()` Deprecation
 
-Update `SYSTEM_PROMPT` and `MEMORY_EXTRACTOR_PROMPT` to instruct the LLM:
-```
-To delete a fact: {"key": "shopping_list", "value": null, "op": "delete"}
-```
+No occurrences remain in `app/*.py`; all executor calls use
+`asyncio.get_running_loop()`.
 
----
+#### 🟠 FIXED IN v3.17.4 — Debounce Could Silently Starve Busy Chats
 
-#### 🔴 HIGH — Proactive Reminder Delivery Removed
+**Location:** `app/main.py` `CHAT_LAST_MSG_TS`
 
-**Location:** `scheduler.py` was removed in v3.0.0 with no replacement.
+Keyed by `chat_id` alone and re-armed on every check (even a debounced one).
+In a group chat busier than `MESSAGE_DEBOUNCE_MS`, or with
+`ALLOW_NLP_WITHOUT_PREFIX=1`, this became a sliding window that could
+suppress every message indefinitely rather than just deduping genuine
+resends. Fixed by keying on `(chat_id, sender_key)` and only advancing the
+timestamp when a message is accepted. See `CHANGELOG.md`.
 
-Reminders are stored as memory facts (`reminder_notes`) but are never proactively delivered. The old scheduler (60s poll interval) is gone.
+#### 🟠 FIXED IN v3.17.4 — No User-Facing Error on Non-Rate-Limit Failures
 
-**Recommended fix:** Add a lightweight APScheduler-based poller:
+**Location:** `app/main.py` `_chat_worker()`
 
-```python
-# app/scheduler.py
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from .database import sqlite_store
-from .waha_provider import send_text
+`process_message` only sent a user-facing reply for rate-limit failures
+(handled internally); any other unhandled exception — a DB error, a WAHA
+outage, a bug — was caught in the worker, logged, and the user got no reply
+at all. The worker now sends a best-effort "something went wrong" message on
+any unhandled exception.
 
-scheduler = AsyncIOScheduler()
+#### 🟢 FIXED IN v3.17.4 — Stale `/healthz` Version
 
-@scheduler.scheduled_job("interval", seconds=60)
-async def fire_reminders():
-    due = await sqlite_store.get_due_reminders()
-    for r in due:
-        await send_text(r.chat_id, f"⏰ Reminder: {r.text}")
-        await sqlite_store.mark_reminder_fired(r.id)
-```
-
-Also requires adding a `reminders` table to SQLite:
-```sql
-CREATE TABLE IF NOT EXISTS reminders (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    chat_id TEXT NOT NULL,
-    whatsapp_id TEXT NOT NULL,
-    trigger_at TEXT NOT NULL,
-    text TEXT NOT NULL,
-    fired INTEGER DEFAULT 0
-);
-```
-
----
-
-#### 🟡 MEDIUM — No User-Facing Error on Total LLM Failure
-
-**Location:** `app/main.py` `_worker()`
-
-When all models are rate-limited (Groq 429) or in circuit-breaker cooldown simultaneously, the user receives **no reply at all** — the message is silently lost.
-
-**Recommended fix:**
-
-```python
-# In _worker(), inside the except block:
-except Exception as exc:
-    logger.exception("worker.error chat=%s", chat_id)
-    try:
-        await send_text(
-            chat_id,
-            "⚠️ I'm temporarily overloaded — please try again in a few minutes!"
-        )
-    except Exception:
-        pass
-```
+`GET /healthz` reported a hardcoded `"3.3.0"` unrelated to the code actually
+running. Added `APP_VERSION` in `app/main.py` as the single source of truth.
 
 ---
 
@@ -489,22 +443,6 @@ The free Groq tier allows only 100,000 tokens/day per model. With a full pipelin
 - Set `FACTS_VERIFICATION=0` to skip the verifier call when not needed
 - Set `HISTORY_TURNS=5` to reduce context size
 - Add `compound-beta-mini` as a third model in `GROQ_MODEL_POOL` as emergency fallback
-
----
-
-#### 🟢 LOW — `asyncio.get_event_loop()` Deprecation
-
-**Location:** `app/database.py` (multiple `run_in_executor` calls)
-
-Python 3.10+ deprecates `asyncio.get_event_loop()` inside a running coroutine in favour of `asyncio.get_running_loop()`.
-
-**Fix:** Replace all occurrences:
-```python
-# Before
-await asyncio.get_event_loop().run_in_executor(_DB_EXECUTOR, _do)
-# After
-await asyncio.get_running_loop().run_in_executor(_DB_EXECUTOR, _do)
-```
 
 ---
 
@@ -536,19 +474,20 @@ Installing `sentence-transformers` pulls in PyTorch (~2GB on CPU). On memory-con
 | Embeddings | sentence-transformers/all-MiniLM-L6-v2 | 2.7.0 |
 | Data validation | Pydantic v2 | 2.9.2 |
 | Config | python-dotenv | 1.0.1 |
-| Scheduler *(needed)* | APScheduler | ≥3.10 |
+| Scheduler | hand-rolled `asyncio` poll loop (`app/scheduler.py`) | — |
 
 ---
 
 ## 🗺️ Roadmap
 
-- [ ] Re-add proactive reminder scheduler (APScheduler)
-- [ ] Memory deletion support (`delete_fact` + null value semantics)
-- [ ] User-facing error message on total LLM failure
+- [x] Re-add proactive reminder scheduler
+- [x] Memory deletion support (`delete_fact` / `delete_facts_batch` + confirmation flow)
+- [x] User-facing error message on total LLM failure (rate-limit path; v3.17.4 closed the remaining gap for other failure types)
 - [ ] `/metrics` endpoint (Prometheus-compatible)
 - [ ] Multi-language support (currently Telugu prefixes already supported)
-- [ ] Group chat support (partial — JID allowlist already supports group JIDs)
+- [ ] Group chat support (two-tier context strategy already implemented — see `app/main.py` `context_build`; needs broader real-world testing)
 - [ ] Voice message transcription (Groq Whisper)
+- [ ] Backfill `CHANGELOG.md` history between v3.2.0 and v3.17.3, or otherwise reconcile version numbering
 
 ---
 
